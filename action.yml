@@ -13,16 +13,20 @@ inputs:
   github-token:
     description: |
       GitHub token used for git push, PR / Issue creation, and the
-      existing-PR dedup check. Defaults to the workflow's built-in
-      `${{ github.token }}` which has write access to the repo the
-      workflow runs in — that's the right token for the standard
-      same-repo install.
+      existing-PR dedup check. Leave empty for the standard same-repo
+      install — the action falls back to `${{ github.token }}` (the
+      workflow's built-in token, which has write access to the repo
+      the workflow runs in).
 
       Override with a PAT only for cross-repo controller patterns
       (action runs in repo A but writes PRs to repo B). The PAT
       needs `repo` scope on the target.
+
+      (Empty default rather than `${{ github.token }}` because action
+      metadata input defaults don't have access to the `github`
+      context; the fallback happens in the step env instead.)
     required: false
-    default: ${{ github.token }}
+    default: ''
   min-confidence:
     description: |
       Tier gate. Recommendations below this confidence are skipped.
@@ -108,7 +112,7 @@ runs:
       shell: bash
       env:
         TARGET_REPO: ${{ github.repository }}
-        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_TOKEN: ${{ inputs.github-token || github.token }}
         INPUT_INTEREST_ID: ${{ inputs.interest-id }}
         INPUT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
         INPUT_DRAFT_MODE: ${{ inputs.draft-mode }}
