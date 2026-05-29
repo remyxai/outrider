@@ -853,6 +853,48 @@ def existing_pr_for(target: Target, branch: str) -> dict | None:
     return prs[0] if prs else None
 
 
+def open_remyx_issues(target: Target) -> list[dict]:
+    """Open Remyx Recommendation Issues on the target repo.
+
+    GitHub's /issues endpoint also returns PRs (they carry a
+    'pull_request' key) — those are filtered out; PRs are deduped
+    separately by existing_pr_for. We keep only items that look like one
+    of ours: the title carries the PR_TITLE_PREFIX or the body has the
+    orchestrator's attribution footer. Bounded to the first 100 open
+    issues (same pragmatic cap as recent_pr_within_rate_limit)."""
+    issues = gh_api(
+        "GET", f"/repos/{target.repo}/issues?state=open&per_page=100"
+    ) or []
+    ours = []
+    for it in issues:
+        if it.get("pull_request"):
+            continue
+        title = it.get("title") or ""
+        body = it.get("body") or ""
+        if title.startswith(PR_TITLE_PREFIX) or "Remyx Recommendation" in body:
+            ours.append(it)
+    return ours
+
+
+def issue_for_paper(open_issues: list[dict], rec: Recommendation) -> dict | None:
+    """Return an already-open Remyx Issue for this paper, if any.
+
+    Matched on the arxiv_id in the issue body — every Remyx issue links
+    ``arxiv.org/abs/<id>``, and that survives the OPEN_AS_ISSUE path where
+    the title is Claude-authored rather than ``<prefix> <paper_title>``.
+    Falls back to an exact title match when the recommendation carries no
+    arxiv_id. Pure (no network) so the matching is unit-testable; the
+    fetch lives in open_remyx_issues."""
+    needle = f"arxiv.org/abs/{rec.arxiv_id}" if rec.arxiv_id else None
+    title_match = f"{PR_TITLE_PREFIX} {rec.paper_title}"
+    for it in open_issues:
+        if needle and needle in (it.get("body") or ""):
+            return it
+        if not rec.arxiv_id and (it.get("title") or "") == title_match:
+            return it
+    return None
+
+
 def recent_pr_within_rate_limit(target: Target) -> bool:
     """Return True if a Remyx Recommendation PR was opened on the target
     repo within `rate_limit_days`."""
@@ -1908,7 +1950,10 @@ def process_target(target: Target) -> dict:
 
         skipped_low_confidence            — tier below min_confidence
         skipped_rate_limit                — recent PR within rate-limit-days
-        skipped_pr_exists                 — open PR already exists for paper
+        skipped_pr_exists                 — every candidate already has an
+                                            open PR (or a mix of open PRs/Issues)
+        skipped_issue_exists              — every candidate already has an
+                                            open Remyx Issue
 
         issue_opened_preflight            — pre-flight (§6) routed to Issue
                                             before invoking implementation
@@ -1943,14 +1988,21 @@ def process_target(target: Target) -> dict:
     result["candidates_returned"] = len(candidates)
 
     # 3. Per-candidate gates. Drop anything below the confidence tier or
-    #    already in flight (an open PR for its branch) so the selection
-    #    pass only sees viable candidates. Running this BEFORE the clone
+    #    already in flight — an open PR for its branch, OR an open Remyx
+    #    Issue for the paper. The Issue check matters with a longer
+    #    lookback: a sticky top candidate that keeps routing to Issue would
+    #    otherwise be re-selected every run and reopen a duplicate Issue.
+    #    Treating an open Issue as "in flight" drops it from the pool so
+    #    selection advances to the next-best candidate; closing the Issue
+    #    makes the paper eligible again. Running this BEFORE the clone
     #    preserves the "don't check out the repo if nothing is actionable"
     #    optimization the single-pick flow had.
     min_required = TIER_RANK.get(target.min_confidence.lower(), 2)
+    open_issues = open_remyx_issues(target)
     viable: list[Recommendation] = []
     dropped_low_conf = 0
     dropped_pr_exists = 0
+    dropped_issue_exists = 0
     for c in candidates:
         if TIER_RANK.get(c.tier.lower(), 0) < min_required:
             dropped_low_conf += 1
@@ -1959,25 +2011,33 @@ def process_target(target: Target) -> dict:
         if existing_pr_for(target, c_branch):
             dropped_pr_exists += 1
             continue
+        if issue_for_paper(open_issues, c):
+            dropped_issue_exists += 1
+            continue
         viable.append(c)
 
     if not viable:
-        # Nothing actionable. Prefer the more specific skip reason: if the
-        # only thing stopping us is dedup, say so; otherwise it's the tier.
-        if dropped_pr_exists and not dropped_low_conf:
-            result["status"] = "skipped_pr_exists"
-            log.info(f"  ✗ all {dropped_pr_exists} candidate(s) already "
-                     f"have open PRs; skipping")
-        else:
+        # Nothing actionable. Prefer the most specific skip reason.
+        if dropped_low_conf and not dropped_pr_exists and not dropped_issue_exists:
             result["status"] = "skipped_low_confidence"
-            log.info(f"  ✗ no candidate at/above min {target.min_confidence} "
-                     f"({dropped_low_conf} below tier, "
-                     f"{dropped_pr_exists} already in flight); skipping")
+            log.info(f"  ✗ no candidate at/above min {target.min_confidence}; "
+                     f"skipping")
+        elif dropped_issue_exists and not dropped_pr_exists:
+            result["status"] = "skipped_issue_exists"
+            log.info(f"  ✗ all {dropped_issue_exists} candidate(s) already "
+                     f"have open Remyx Issues; skipping")
+        else:
+            # PR dedup, or a mix of open PRs and Issues.
+            result["status"] = "skipped_pr_exists"
+            log.info(f"  ✗ all candidates already in flight "
+                     f"({dropped_pr_exists} open PRs, "
+                     f"{dropped_issue_exists} open Issues); skipping")
         return result
 
     log.info(f"  ✓ {len(viable)} viable candidate(s) "
              f"(dropped {dropped_low_conf} low-confidence, "
-             f"{dropped_pr_exists} already in flight)")
+             f"{dropped_pr_exists} open PRs, "
+             f"{dropped_issue_exists} open Issues)")
 
     # 4. Workdir + selection. Clone first (the selection pass needs the
     #    repo's module layout), then let Claude pick the candidate most

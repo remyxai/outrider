@@ -74,8 +74,8 @@ outputs:
     description: |
       Run outcome: "pr_opened" | "pr_opened_draft" | "issue_opened" |
       "skipped_low_confidence" | "skipped_rate_limit" | "skipped_pr_exists" |
-      "skipped_test_failure" | "claude_failed" | "rejected_path_violations" |
-      "error".
+      "skipped_issue_exists" | "skipped_test_failure" | "claude_failed" |
+      "rejected_path_violations" | "error".
     value: ${{ steps.recommend.outputs.status }}
   pr_url:
     description: 'URL of the opened PR (set when status starts with "pr_opened").'

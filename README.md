@@ -121,7 +121,8 @@ Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflo
 | `issue_opened_self_review` | Second Claude pass judged the new code an **orphan** — unreachable from any production path (at most its own tests call it). This is a reachability check, not a triviality one (stub density covers triviality) |
 | `skipped_low_confidence` | Recommendation below `min-confidence` |
 | `skipped_rate_limit` | A previous Remyx PR was opened within `rate-limit-days` |
-| `skipped_pr_exists` | An open PR for this exact paper already exists |
+| `skipped_pr_exists` | Every candidate in the pool already has an open PR (or a mix of open PRs and Issues) |
+| `skipped_issue_exists` | Every candidate in the pool already has an open Remyx Issue — nothing new to surface. Close an Issue to make that paper eligible again |
 | `skipped_test_failure` | Tests failed AND `draft-mode: never` |
 | `claude_failed` | Claude CLI exited non-zero |
 | `rejected_path_violations` | Claude touched files outside the guardrails allowlist; no PR opened |
