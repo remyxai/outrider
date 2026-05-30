@@ -1956,13 +1956,32 @@ def run_tests(workdir: Path, timeout_s: int = 300) -> tuple[str, str]:
 # ─── PR opening ────────────────────────────────────────────────────────────
 
 
-def open_pr(target: Target, branch: str, title: str, body: str, draft: bool) -> str:
+def detect_default_branch(workdir: Path) -> str:
+    """The repo's default branch — the branch HEAD points at right after a
+    fresh clone (e.g. `main` or `master`). Falls back to `main`.
+
+    Hardcoding `main` failed on `master`-default repos: the PR base 404'd
+    and the commit_and_push sanity check saw `origin/main` MISSING and
+    aborted. Detect it once and thread it through.
+    """
+    r = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip() or "main"
+
+
+def open_pr(
+    target: Target, branch: str, title: str, body: str, draft: bool,
+    base: str = "main",
+) -> str:
     """Open a PR on the target repo; returns the PR URL."""
-    log.info(f"  → opening {'draft' if draft else ''} PR on {target.repo}")
+    log.info(f"  → opening {'draft' if draft else ''} PR on {target.repo} "
+             f"(base={base})")
     pr = gh_api("POST", f"/repos/{target.repo}/pulls", {
         "title": title,
         "head": branch,
-        "base": "main",
+        "base": base,
         "body": body,
         "draft": draft,
     })
@@ -2027,7 +2046,9 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
     return title, body
 
 
-def commit_and_push(workdir: Path, branch: str, title: str) -> None:
+def commit_and_push(
+    workdir: Path, branch: str, title: str, base_branch: str = "main",
+) -> None:
     """Stage all changes, commit, and push the branch to origin.
 
     Two classes of files are scrubbed before staging so they don't end
@@ -2043,30 +2064,31 @@ def commit_and_push(workdir: Path, branch: str, title: str) -> None:
         duplicate content already in the PR body and add noise to the
         diff.
     """
-    # Sanity check: make sure local HEAD still equals origin/main before
-    # we branch. If Claude (or pytest) disturbed the git state during the
-    # session — `git checkout --orphan`, `rm -rf .git`, `git init`,
-    # whatever — local main can diverge from remote main, and the
-    # subsequent `git checkout -b branch` produces a root-commit branch
-    # with no history in common with main. The PR-creation API then
-    # rejects with HTTP 422. Fail fast with a clear error instead.
+    # Sanity check: make sure local HEAD still equals origin/<base_branch>
+    # before we branch. If Claude (or pytest) disturbed the git state during
+    # the session — `git checkout --orphan`, `rm -rf .git`, `git init`,
+    # whatever — local HEAD can diverge from the remote default, and the
+    # subsequent `git checkout -b branch` produces a root-commit branch with
+    # no history in common with it. The PR-creation API then rejects with
+    # HTTP 422. Fail fast with a clear error instead. (base_branch is the
+    # repo's real default — `main` or `master` — not a hardcoded `main`.)
     head_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=workdir, capture_output=True, text=True, check=True,
     ).stdout.strip()
     try:
         remote_sha = subprocess.run(
-            ["git", "rev-parse", "origin/main"],
+            ["git", "rev-parse", f"origin/{base_branch}"],
             cwd=workdir, capture_output=True, text=True, check=True,
         ).stdout.strip()
     except subprocess.CalledProcessError:
         remote_sha = ""
     if not remote_sha or head_sha != remote_sha:
         raise RuntimeError(
-            f"local HEAD ({head_sha[:8]}) doesn't match origin/main "
-            f"({(remote_sha or 'MISSING')[:8]}) — git state was disturbed "
-            f"during the session. Refusing to commit; would produce a "
-            f"root-commit branch and fail at PR creation."
+            f"local HEAD ({head_sha[:8]}) doesn't match "
+            f"origin/{base_branch} ({(remote_sha or 'MISSING')[:8]}) — git "
+            f"state was disturbed during the session. Refusing to commit; "
+            f"would produce a root-commit branch and fail at PR creation."
         )
 
     subprocess.run(["git", "checkout", "-b", branch], cwd=workdir, check=True)
@@ -2259,7 +2281,8 @@ def process_target(target: Target) -> dict:
     workdir = prepare_workdir(target)
     try:
         package = detect_package_name(workdir)
-        log.info(f"  detected package: {package}")
+        default_branch = detect_default_branch(workdir)
+        log.info(f"  detected package: {package}  default branch: {default_branch}")
 
         pinned_idx = None
         if target.pin_arxiv:
@@ -2524,8 +2547,10 @@ def process_target(target: Target) -> dict:
             review_section=review_section,
             selection_note=result.get("selection_reasoning", ""),
         )
-        commit_and_push(workdir, branch, pr_title)
-        pr_url = open_pr(target, branch, pr_title, pr_body, draft=draft)
+        commit_and_push(workdir, branch, pr_title, base_branch=default_branch)
+        pr_url = open_pr(
+            target, branch, pr_title, pr_body, draft=draft, base=default_branch
+        )
         result["status"] = "pr_opened_draft" if draft else "pr_opened"
         result["pr_url"] = pr_url
         log.info(f"  ✓ {result['status']}: {pr_url}")

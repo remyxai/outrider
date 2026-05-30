@@ -211,6 +211,16 @@ def test_test_gate_rejects_orphan_self_test():
 
 # ── 5. F6: pytest outcome classification ───────────────────────────────────
 
+def test_detect_default_branch():
+    # F12: PR base + the commit sanity check must use the repo's real
+    # default branch, not a hardcoded "main" (broke master-default repos).
+    wd = _base_repo()
+    _git(wd, "branch", "-M", "master")
+    assert run.detect_default_branch(wd) == "master"
+    _git(wd, "branch", "-M", "main")
+    assert run.detect_default_branch(wd) == "main"
+
+
 def test_classify_pytest():
     assert run._classify_pytest(0, "5 passed in 0.1s") == "passed"
     # Missing-dep collection error is an env limitation, not a code failure.
