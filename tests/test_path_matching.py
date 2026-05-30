@@ -38,14 +38,40 @@ def test_bundle_and_readme_allowed():
 
 
 def test_out_of_allowlist_paths_rejected():
+    # Non-.py infra files aren't covered by the default allowlist globs.
     assert not run.path_matches_glob(".github/workflows/x.yml", ALLOW)
-    assert not run.path_matches_glob("setup.py", ALLOW)
     assert not run.path_matches_glob("Dockerfile", ALLOW)
+    # `*.py` is intentionally broad (a wiring edit reaches the call site
+    # wherever it lives); files like setup.py match the allowlist but are
+    # protected by ALWAYS_BLOCKED precedence in validate_changes instead.
+    assert run.path_matches_glob("setup.py", ALLOW)
 
 
 def test_always_blocked_still_matches():
-    # The fix must not weaken the never-touch list.
+    # The never-touch list is role-based (filename/type), not directory-based.
     assert run.path_matches_glob(".github/workflows/ci.yml", run.ALWAYS_BLOCKED)
     assert run.path_matches_glob("docker/eval/Dockerfile", run.ALWAYS_BLOCKED)
     assert run.path_matches_glob("requirements.txt", run.ALWAYS_BLOCKED)
-    assert run.path_matches_glob("pipelines/spatialvqa.yaml", run.ALWAYS_BLOCKED)
+    assert run.path_matches_glob("setup.py", run.ALWAYS_BLOCKED)
+    assert run.path_matches_glob("deep/nested/poetry.lock", run.ALWAYS_BLOCKED)
+
+
+def test_case_insensitive_readme():
+    # README.MD (uppercase) must match the README.md allowlist entry — the
+    # case-sensitive matcher threw away an otherwise-valid PR over this.
+    assert run.path_matches_glob("README.MD", ALLOW)
+    assert run.path_matches_glob("readme.md", ALLOW)
+
+
+def test_effective_allowlist_extends_defaults():
+    base = [g.format(package="pkg") for g in run.DEFAULT_ALLOWLIST_GLOBS]
+    t = run.Target(repo="o/r", guardrails_allowlist=["docs/**", "*.cfg"])
+    eff = run.effective_allowlist(t, "pkg")
+    for g in base:                 # defaults preserved...
+        assert g in eff
+    assert "docs/**" in eff and "*.cfg" in eff   # ...extras appended, not replacing
+
+
+def test_effective_allowlist_empty_is_defaults():
+    base = [g.format(package="pkg") for g in run.DEFAULT_ALLOWLIST_GLOBS]
+    assert run.effective_allowlist(run.Target(repo="o/r"), "pkg") == base

@@ -176,3 +176,49 @@ def test_changed_files_expands_new_directory():
     (wd / "brand_new_dir").mkdir()
     (wd / "brand_new_dir" / "probe.py").write_text("x = 1\n")
     assert "brand_new_dir/probe.py" in run.changed_files(wd)
+
+
+# ── 4. F7: test-integration gate accepts public-API wiring ─────────────────
+
+def test_test_gate_passes_when_wired_into_existing_module():
+    # New capability module exported from the pre-existing __init__.py; the
+    # new test only self-tests the new module. The capability IS wired into
+    # the package's surface, so the gate should pass (was demoted to Issue).
+    wd = _base_repo()
+    (wd / "vqasynth" / "bcos_layer.py").write_text("def bcos(x):\n    return x\n")
+    (wd / "vqasynth" / "__init__.py").write_text(
+        "from vqasynth.bcos_layer import bcos\n"
+    )
+    (wd / "tests" / "test_bcos.py").write_text(
+        "from vqasynth.bcos_layer import bcos\n"
+        "def test_b():\n    assert bcos(1) == 1\n"
+    )
+    ok, _ = run.check_tests_touch_existing_modules(wd, "vqasynth")
+    assert ok
+
+
+def test_test_gate_rejects_orphan_self_test():
+    # New module + self-test only, nothing existing imports it → still gated.
+    wd = _base_repo()
+    (wd / "vqasynth" / "bcos_layer.py").write_text("def bcos(x):\n    return x\n")
+    (wd / "tests" / "test_bcos.py").write_text(
+        "from vqasynth.bcos_layer import bcos\n"
+        "def test_b():\n    assert bcos(1) == 1\n"
+    )
+    ok, _ = run.check_tests_touch_existing_modules(wd, "vqasynth")
+    assert not ok
+
+
+# ── 5. F6: pytest outcome classification ───────────────────────────────────
+
+def test_classify_pytest():
+    assert run._classify_pytest(0, "5 passed in 0.1s") == "passed"
+    # Missing-dep collection error is an env limitation, not a code failure.
+    assert run._classify_pytest(
+        2, "E   ModuleNotFoundError: No module named 'torch'\nERROR collecting"
+    ) == "unvalidated"
+    assert run._classify_pytest(5, "no tests ran") == "unvalidated"
+    # Genuine failure → failed.
+    assert run._classify_pytest(1, "1 failed, 2 passed\nE  AssertionError") == "failed"
+    # A real failure alongside an import error must NOT be masked.
+    assert run._classify_pytest(1, "1 failed\nModuleNotFoundError: x") == "failed"

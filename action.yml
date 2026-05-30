@@ -45,9 +45,10 @@ inputs:
     default: '7'
   guardrails-allowlist:
     description: |
-      Comma-separated extra path globs Claude Code may touch on top of
-      the defaults ({package}/*_integration.py, tests/test_*.py,
-      .remyx-recommendation/**, README.md). Most repos won't need this.
+      Comma-separated extra path globs Claude Code may touch, ADDED ON TOP
+      OF the defaults (`*.py`, `.remyx-recommendation/**`, `README.md`).
+      Extends the defaults — it does not replace them. Matching is
+      case-insensitive. Most repos won't need this.
     required: false
     default: ''
   lookback:
@@ -68,6 +69,20 @@ inputs:
       a larger pool just widens the window the selection pass sees).
     required: false
     default: '25'
+  claude-timeout:
+    description: |
+      Wall-clock seconds for the Claude Code implementation step. Large
+      repos can exceed the old 600s; default is 900. Bump it for very large
+      codebases, lower it to cap cost.
+    required: false
+    default: '900'
+  pin-arxiv:
+    description: |
+      Optional arxiv_id. When set and present in the candidate pool, the
+      action implements that exact paper and skips the LLM selection pass —
+      use it for reproducible eval re-runs. Empty = normal selection.
+    required: false
+    default: ''
 
 outputs:
   status:
@@ -138,6 +153,8 @@ runs:
         INPUT_DRAFT_MODE: ${{ inputs.draft-mode }}
         INPUT_RATE_LIMIT_DAYS: ${{ inputs.rate-limit-days }}
         INPUT_GUARDRAILS_ALLOWLIST: ${{ inputs.guardrails-allowlist }}
+        INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
+        INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         # Lookback window + pool size for the candidate selection pass.
         # run.py reads these directly (not via INPUT_*) — they default to
         # week / 10 in run.py too, so omitting them is safe.
