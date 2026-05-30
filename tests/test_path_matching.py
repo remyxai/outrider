@@ -56,6 +56,12 @@ def test_always_blocked_still_matches():
     assert run.path_matches_glob("deep/nested/poetry.lock", run.ALWAYS_BLOCKED)
 
 
+def test_nested_readme_allowed():
+    # `**/README.md` covers READMEs at any depth (top-level + nested docs).
+    assert run.path_matches_glob("examples/agent_patterns/README.md", ALLOW)
+    assert run.path_matches_glob("README.md", ALLOW)
+
+
 def test_case_insensitive_readme():
     # README.MD (uppercase) must match the README.md allowlist entry — the
     # case-sensitive matcher threw away an otherwise-valid PR over this.

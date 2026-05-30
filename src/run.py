@@ -103,7 +103,7 @@ TIER_RANK = {"high": 3, "moderate": 2, "low": 1, "noise": 0, "near-random": 0}
 DEFAULT_ALLOWLIST_GLOBS = [
     "*.py",
     ".remyx-recommendation/**",
-    "README.md",
+    "**/README.md",          # READMEs at any depth (top-level + nested docs)
 ]
 
 # Cap on additions+deletions per pre-existing file. Keeps wiring edits
@@ -520,10 +520,13 @@ Output a single JSON object. Start with `{` and end with `}`. No
 Markdown fences, no prose before or after. Schema:
 
 {
-  "implemented": [<bullets describing what from the paper's method is
-                   concretely implemented in your diff>],
-  "stubbed":     [<bullets describing what from the paper is left out,
-                   with required infra noted in parentheses>],
+  "delivered":   [<bullets: the paper's insight/result this diff delivers
+                   to the repo — the concrete value, at the call site>],
+  "scoped_out":  [<bullets: parts of the paper intentionally NOT built
+                   because they aren't needed for that value (note any
+                   required infra in parentheses). These are scoping
+                   decisions, not shortfalls — a focused slice that
+                   delivers the result is the goal.>],
   "call_site":   "<which existing entry point the new code is invoked
                    from, or '(none)' if nothing in the product calls it>",
   "is_orphan":   <true if the new code is NOT reached from any pre-existing
@@ -534,17 +537,19 @@ Markdown fences, no prose before or after. Schema:
                    is still an orphan. Do NOT use this field to judge
                    whether the code is "too simple" — triviality is scored
                    separately by stub density.>,
-  "honest_summary": "<one short paragraph: what you actually built,
-                     what's missing, whether the paper's primary
-                     contribution is really present>"
+  "honest_summary": "<one short paragraph: the value this delivers in the
+                     paper's direction, and what you intentionally scoped
+                     out as unnecessary for it. Frame scoped-out parts as
+                     deliberate boundaries, not as what you 'failed' to do.>"
 }
 
 Be ruthless about reachability. If the only thing that calls your new code
 is a test you added (or nothing at all), set is_orphan=true — the product
 never exercises it. If a pre-existing entry point (a pipeline/stage driver,
 a CLI, an existing module) now invokes your new code, set is_orphan=false.
-Separately, if you only implemented the plumbing around the paper's
-contribution but not the contribution itself, list those parts as stubbed.
+Separately, list under scoped_out the parts of the paper you deliberately
+left for later (e.g. a trainer/model the repo can't host) — you are not
+required to reproduce the paper's full method, only to deliver its result.
 
 --- Diff ---
 
@@ -1417,8 +1422,10 @@ def _render_self_review_section(review: dict) -> str:
     """Render the self-review JSON into a PR-body section prepended above
     the test results. Always returns a complete Markdown block ending
     in a blank line."""
-    impl = review.get("implemented") or []
-    stubbed = review.get("stubbed") or []
+    # Prefer the value-first keys; fall back to the legacy ones so an older
+    # model response still renders.
+    delivered = review.get("delivered") or review.get("implemented") or []
+    scoped_out = review.get("scoped_out") or review.get("stubbed") or []
     call_site = review.get("call_site") or "(unspecified)"
     summary = (review.get("honest_summary") or "").strip()
 
@@ -1428,15 +1435,15 @@ def _render_self_review_section(review: dict) -> str:
         return "\n".join(f"- {x}" for x in items)
 
     parts = [
-        "## What this PR actually does",
+        "## What this PR delivers",
         "",
         f"**Call site**: `{call_site}`",
         "",
-        "**Implemented from the paper**:",
-        _bullets(impl),
+        "**Delivers (from the paper)**:",
+        _bullets(delivered),
         "",
-        "**Stubbed / left out**:",
-        _bullets(stubbed),
+        "**Intentionally out of scope** (not needed for this contribution):",
+        _bullets(scoped_out),
     ]
     if summary:
         parts += ["", f"_{summary}_"]

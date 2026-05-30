@@ -211,6 +211,23 @@ def test_test_gate_rejects_orphan_self_test():
 
 # ── 5. F6: pytest outcome classification ───────────────────────────────────
 
+def test_self_review_renders_value_first():
+    # F10: the PR-body section reads as a contribution, not an apology.
+    md = run._render_self_review_section({
+        "delivered": ["a scorer wired into eval.py"],
+        "scoped_out": ["the trained model (needs a trainer)"],
+        "call_site": "eval.py:run",
+        "honest_summary": "Delivers the metric.",
+    })
+    assert "What this PR delivers" in md
+    assert "Delivers (from the paper)" in md
+    assert "Intentionally out of scope" in md
+    assert "Stubbed" not in md and "left out" not in md
+    # Legacy keys still render via the fallback.
+    md2 = run._render_self_review_section({"implemented": ["x"], "stubbed": ["y"]})
+    assert "- x" in md2 and "- y" in md2
+
+
 def test_detect_default_branch():
     # F12: PR base + the commit sanity check must use the repo's real
     # default branch, not a hardcoded "main" (broke master-default repos).

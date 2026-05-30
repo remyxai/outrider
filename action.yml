@@ -46,7 +46,7 @@ inputs:
   guardrails-allowlist:
     description: |
       Comma-separated extra path globs Claude Code may touch, ADDED ON TOP
-      OF the defaults (`*.py`, `.remyx-recommendation/**`, `README.md`).
+      OF the defaults (`*.py`, `.remyx-recommendation/**`, `**/README.md`).
       Extends the defaults — it does not replace them. Matching is
       case-insensitive. Most repos won't need this.
     required: false
