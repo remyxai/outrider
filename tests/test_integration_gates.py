@@ -249,3 +249,33 @@ def test_classify_pytest():
     assert run._classify_pytest(1, "1 failed, 2 passed\nE  AssertionError") == "failed"
     # A real failure alongside an import error must NOT be masked.
     assert run._classify_pytest(1, "1 failed\nModuleNotFoundError: x") == "failed"
+
+
+# ── 6. REMYX-64: per-run token/cost accumulation ───────────────────────────
+
+def test_cost_accumulation():
+    run._reset_run_cost()
+    run._record_claude_usage({
+        "total_cost_usd": 0.05, "num_turns": 3,
+        "usage": {"input_tokens": 1000, "output_tokens": 200,
+                  "cache_read_input_tokens": 500},
+    })
+    run._record_claude_usage({
+        "total_cost_usd": 0.01, "num_turns": 1,
+        "usage": {"input_tokens": 300, "output_tokens": 50},
+    })
+    assert abs(run._RUN_COST["cost_usd"] - 0.06) < 1e-9
+    assert run._RUN_COST["input_tokens"] == 1300
+    assert run._RUN_COST["output_tokens"] == 250
+    assert run._RUN_COST["cache_read_input_tokens"] == 500
+    assert run._RUN_COST["claude_calls"] == 2
+    run._reset_run_cost()
+    assert run._RUN_COST["cost_usd"] == 0.0 and run._RUN_COST["claude_calls"] == 0
+
+
+def test_record_usage_tolerates_missing_fields():
+    run._reset_run_cost()
+    run._record_claude_usage({})       # no cost / usage keys at all
+    assert run._RUN_COST["claude_calls"] == 1
+    assert run._RUN_COST["cost_usd"] == 0.0
+    assert run._RUN_COST["input_tokens"] == 0

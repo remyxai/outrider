@@ -1160,6 +1160,80 @@ def write_spec_bundle(
 # ─── Claude Code invocation ────────────────────────────────────────────────
 
 
+# Per-run token/cost totals, accumulated across every `claude` call in a
+# run (pre-flight, selection, implementation, self-review) and surfaced in
+# the RUN SUMMARY + $GITHUB_OUTPUT. (REMYX-64)
+_RUN_COST = {
+    "cost_usd": 0.0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "num_turns": 0,
+    "claude_calls": 0,
+}
+
+
+def _reset_run_cost() -> None:
+    _RUN_COST.update(
+        cost_usd=0.0, input_tokens=0, output_tokens=0,
+        cache_read_input_tokens=0, num_turns=0, claude_calls=0,
+    )
+
+
+def _record_claude_usage(env: dict) -> None:
+    """Accumulate one `claude --output-format json` envelope's usage."""
+    _RUN_COST["claude_calls"] += 1
+    _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
+    _RUN_COST["num_turns"] += int(env.get("num_turns") or 0)
+    u = env.get("usage") or {}
+    _RUN_COST["input_tokens"] += int(u.get("input_tokens") or 0)
+    _RUN_COST["output_tokens"] += int(u.get("output_tokens") or 0)
+    _RUN_COST["cache_read_input_tokens"] += int(
+        u.get("cache_read_input_tokens") or 0
+    )
+
+
+def _run_claude_json(
+    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
+) -> tuple[bool, str]:
+    """Run `claude … --output-format json -p <prompt>`, accumulate token/cost
+    usage into _RUN_COST (REMYX-64), and return (ok, model_text).
+
+    With --output-format json the CLI prints a single envelope object
+    ({result, total_cost_usd, usage, num_turns, is_error, …}); the model's
+    actual answer is in `result`, so callers that parse a JSON decision out
+    of the answer get the inner text, not the envelope. Falls back to raw
+    stdout (no usage recorded) if the envelope doesn't parse.
+    """
+    cmd = [*cmd_prefix, "--output-format", "json", "-p", prompt]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"claude CLI timed out after {timeout_s}s"
+    except FileNotFoundError:
+        return False, ("claude CLI not found on PATH "
+                       "(install: npm install -g @anthropic-ai/claude-code)")
+    raw = (proc.stdout or "").strip()
+    try:
+        env = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        env = None
+    if isinstance(env, dict):
+        _record_claude_usage(env)
+        text = env.get("result") or ""
+        is_error = bool(env.get("is_error")) or proc.returncode != 0
+        if not text and proc.stderr:
+            text = proc.stderr
+        return (not is_error), text
+    # Envelope didn't parse — preserve old behavior, no usage recorded.
+    output = (proc.stdout or "") + (
+        "\n--- STDERR ---\n" + proc.stderr if proc.stderr else ""
+    )
+    return proc.returncode == 0, output
+
+
 def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     """Invoke the Claude Code CLI in headless mode with the workdir as context.
 
@@ -1175,23 +1249,8 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
     if max_turns:
         cmd += ["--max-turns", max_turns]
-    cmd += ["-p", invocation]
-    try:
-        # `claude` CLI: -p for prompt, --dangerously-skip-permissions for CI
-        result = subprocess.run(
-            cmd,
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-        ok = result.returncode == 0
-        output = (result.stdout or "") + ("\n--- STDERR ---\n" + result.stderr if result.stderr else "")
-        return ok, output[-4000:]   # last 4KB for log brevity
-    except subprocess.TimeoutExpired:
-        return False, f"claude CLI timed out after {timeout_s}s"
-    except FileNotFoundError:
-        return False, "claude CLI not found on PATH (install: npm install -g @anthropic-ai/claude-code)"
+    ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
+    return ok, text[-4000:]   # last 4KB for log brevity
 
 
 # ─── Pre-flight routing + self-review (§4, §6) ─────────────────────────────
@@ -1207,16 +1266,9 @@ def _run_claude_oneshot(
     Failures here are non-fatal: the orchestrator falls through to the
     normal implementation flow.
     """
-    try:
-        result = subprocess.run(
-            ["claude", "--dangerously-skip-permissions", "-p", prompt],
-            cwd=workdir, capture_output=True, text=True, timeout=timeout_s,
-        )
-        return result.returncode == 0, (result.stdout or "")
-    except subprocess.TimeoutExpired:
-        return False, f"claude CLI timed out after {timeout_s}s"
-    except FileNotFoundError:
-        return False, "claude CLI not found on PATH"
+    return _run_claude_json(
+        ["claude", "--dangerously-skip-permissions"], prompt, workdir, timeout_s
+    )
 
 
 def _extract_json_object(s: str) -> dict | None:
@@ -2709,11 +2761,23 @@ def main():
              f"draft_mode={target.draft_mode}  "
              f"rate_limit_days={target.rate_limit_days}")
 
+    _reset_run_cost()
     try:
         result = process_target(target)
     except Exception as e:
         log.exception(f"  ✗ unhandled error: {e}")
         result = {"repo": target.repo, "status": "error", "error": str(e)}
+
+    # Token/cost totals across every Claude pass this run, captured even when
+    # process_target raised (REMYX-64).
+    result["cost_usd"] = round(_RUN_COST["cost_usd"], 4)
+    result["input_tokens"] = _RUN_COST["input_tokens"]
+    result["output_tokens"] = _RUN_COST["output_tokens"]
+    result["cache_read_input_tokens"] = _RUN_COST["cache_read_input_tokens"]
+    result["claude_calls"] = _RUN_COST["claude_calls"]
+    log.info(f"  cost: ${result['cost_usd']} "
+             f"({result['input_tokens']} in / {result['output_tokens']} out "
+             f"tokens, {result['claude_calls']} claude calls)")
 
     print("\n=== RUN SUMMARY ===")
     print(json.dumps(result, indent=2))
@@ -2738,6 +2802,9 @@ def main():
                     f.write(f"candidates_considered={result['candidates_considered']}\n")
                 if "selection_rejected" in result:
                     f.write(f"selection_rejected={len(result['selection_rejected'])}\n")
+                f.write(f"cost_usd={result.get('cost_usd', 0)}\n")
+                f.write(f"input_tokens={result.get('input_tokens', 0)}\n")
+                f.write(f"output_tokens={result.get('output_tokens', 0)}\n")
         except OSError as e:
             log.warning(f"Could not write to $GITHUB_OUTPUT: {e}")
 

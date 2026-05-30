@@ -104,6 +104,15 @@ outputs:
   tier:
     description: 'Confidence tier of the recommendation (high / moderate / low / noise).'
     value: ${{ steps.recommend.outputs.tier }}
+  cost_usd:
+    description: 'Total Anthropic cost (USD) across all Claude passes this run.'
+    value: ${{ steps.recommend.outputs.cost_usd }}
+  input_tokens:
+    description: 'Total input tokens across all Claude passes this run.'
+    value: ${{ steps.recommend.outputs.input_tokens }}
+  output_tokens:
+    description: 'Total output tokens across all Claude passes this run.'
+    value: ${{ steps.recommend.outputs.output_tokens }}
 
 runs:
   using: 'composite'
