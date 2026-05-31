@@ -314,7 +314,7 @@ implementable.)
 ```
 
 The orchestrator detects this file and opens an Issue instead of a PR.
-This is the HONEST outcome when the paper doesn't fit, not a failure.
+This is the HONEST outcome when a PR would be premature, not a failure.
 
 # Step 2 — only if you're proceeding with PR: implement an INTEGRATION
 
@@ -364,7 +364,7 @@ Required outputs:
   instead — the orchestrator will reject the run anyway.
 - If your new module would import cleanly but never be called by
   anything else in the repo, STOP and write the Issue file instead.
-- The Issue-mode path is the correct route when the paper doesn't fit.
+- The Issue-mode path is the correct route when a PR would be premature.
   It is NOT a failure mode.
 
 Run pytest before declaring done. If tests fail, fix them or scope down

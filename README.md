@@ -1,6 +1,6 @@
 # Outrider — GitHub Action
 
-Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider picks the next paper most implementable against your codebase and either opens a draft PR wiring it into an existing call site, or opens a discussion Issue when the paper doesn't fit cleanly.
+Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider picks the next paper most implementable against your codebase and either opens a draft PR wiring it into an existing call site, or starts a discussion Issue when a PR would be premature.
 
 ```yaml
 - uses: remyxai/outrider@v1
@@ -11,7 +11,7 @@ Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider pick
 ## What you get
 
 - **Draft PRs** that wire a paper's contribution into an existing module, with a self-review section in the body honestly noting what was implemented vs. left out
-- **Issues** when the paper doesn't fit — pre-flight, validators, or self-review route it to discussion instead of scaffold-shaped PRs
+- **Issues** when a PR would be premature — pre-flight, validators, or self-review route the paper to discussion instead of scaffold-shaped PRs
 - **One artifact per `rate-limit-days`** by default — no Issue spam
 
 The orchestrator defaults to opening Issues. A PR ships only when new code is actually wired into an existing call site, passes a stub-density check, has a test that imports from a pre-existing module, and survives a Claude self-review pass.
