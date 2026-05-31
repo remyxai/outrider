@@ -211,6 +211,17 @@ arxiv: https://arxiv.org/abs/{arxiv_id}
 {paper_abstract}
 """
 
+_CONTEXT_MD_TEMPLATE = """\
+# Team's recent shipping history
+
+These are experiments the team has actually shipped — ground your
+implementation in this trajectory. Don't propose ideas duplicating what
+the team has already built; consider whether the new paper extends an
+existing iteration_chain or starts a new one.
+
+{experiment_history}
+"""
+
 _GUARDRAILS_MD_TEMPLATE = """\
 # Path guardrails for this PR
 
@@ -639,7 +650,6 @@ class Recommendation:
     spec_md: str                      # legacy; PR body now sources from
                                       # reasoning + suggested_experiment instead
     paper_abstract: str
-    team_context: str
     domain_summary: str
     raw_paper_md: str
     # New fields populated by query_remyx_recommendation() — match the Remyx
@@ -653,6 +663,11 @@ class Recommendation:
     interest_context: str = ""        # rich text body the customer wrote
                                       # on engine.remyx.ai (research focus,
                                       # current goals, what they care about)
+    experiment_history: str = ""      # LLM-ready bullets from
+                                      # ExperimentHistory (REMYX-58 format),
+                                      # fetched from the research-interests
+                                      # endpoint. Empty when the interest
+                                      # has no linked history.
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
@@ -825,30 +840,36 @@ def _relevance_to_tier(score: float) -> str:
     return "noise"
 
 
-def _fetch_interest_context(interest_id: str) -> tuple[str, str]:
-    """Fetch the interest's name + rich-text focus body once per run.
+def _fetch_interest_context(interest_id: str) -> tuple[str, str, str]:
+    """Fetch the interest's name + rich-text focus body + experiment-history
+    bullets once per run.
 
-    Returns (interest_name, interest_context). The context body is the
-    rich text the customer wrote on engine.remyx.ai about their research
-    focus / goals — it gives Claude Code a far better picture of what to
-    build than the paper abstract + reasoning alone. Best-effort: on any
-    failure we return empty strings and fall back to the reasoning-only
-    brief.
+    Returns (interest_name, interest_context, experiment_history). The
+    context body is the rich text the customer wrote on engine.remyx.ai
+    about their research focus / goals. The experiment_history is the
+    LLM-ready bullet summary of the team's shipping trajectory (REMYX-58
+    format) — empty string when the interest has no linked
+    ExperimentHistory or when the engine hasn't deployed the field yet.
+
+    Best-effort: on any failure we return empty strings and fall back to
+    the reasoning-only brief.
     """
     try:
         interest = _remyx_get(f"/api/v1.0/research-interests/{interest_id}")
         return (
             (interest.get("name") or ""),
             (interest.get("context") or "").strip(),
+            (interest.get("experiment_history") or "").strip(),
         )
     except Exception as e:
         log.warning(f"    (interest context fetch failed: {e}; "
                     f"continuing with reasoning-only brief)")
-        return "", ""
+        return "", "", ""
 
 
 def _paper_to_recommendation(
-    paper: dict, fallback_interest_name: str, interest_context: str
+    paper: dict, fallback_interest_name: str, interest_context: str,
+    experiment_history: str,
 ) -> Recommendation:
     """Map one /papers/recommended envelope entry to a Recommendation."""
     relevance = float(paper.get("relevance_score") or 0.0)
@@ -862,7 +883,6 @@ def _paper_to_recommendation(
         z_score=0.0,                       # legacy field, unused
         spec_md="",                        # legacy; rendered from fields below
         paper_abstract=abstract,
-        team_context="",                   # Remyx keeps team context server-side
         domain_summary="",
         raw_paper_md="",
         relevance_score=relevance,
@@ -871,6 +891,7 @@ def _paper_to_recommendation(
         recommendation_id=paper.get("recommendation_id") or "",
         interest_name=paper.get("interest_name") or fallback_interest_name,
         interest_context=interest_context,
+        experiment_history=experiment_history,
     )
 
 
@@ -932,9 +953,13 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
             f"in this window."
         )
 
-    interest_name, interest_context = _fetch_interest_context(target.interest_id)
+    interest_name, interest_context, experiment_history = (
+        _fetch_interest_context(target.interest_id)
+    )
     candidates = [
-        _paper_to_recommendation(p, interest_name, interest_context)
+        _paper_to_recommendation(
+            p, interest_name, interest_context, experiment_history,
+        )
         for p in papers
     ]
     for i, c in enumerate(candidates):
@@ -1169,11 +1194,14 @@ def write_spec_bundle(
         paper_abstract=rec.paper_abstract,
     ))
 
-    if rec.team_context:
-        (bundle / "CONTEXT.md").write_text(
-            f"# Team context (Gemini-extracted from {target.repo} merge history)\n\n"
-            f"{rec.team_context}\n"
-        )
+    # CONTEXT.md — team's shipping history bullets (REMYX-58 format),
+    # fetched from the research-interests endpoint. Skipped entirely
+    # when no history is linked, so INVOCATION.md's "if Remyx returned
+    # any" caveat continues to hold.
+    if rec.experiment_history:
+        (bundle / "CONTEXT.md").write_text(_CONTEXT_MD_TEMPLATE.format(
+            experiment_history=rec.experiment_history,
+        ))
 
     allowlist = effective_allowlist(target, package)
     (bundle / "GUARDRAILS.md").write_text(_GUARDRAILS_MD_TEMPLATE.format(
