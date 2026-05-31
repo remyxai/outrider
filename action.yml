@@ -49,11 +49,32 @@ inputs:
   guardrails-allowlist:
     description: |
       Comma-separated extra path globs Claude Code may touch, ADDED ON TOP
-      OF the defaults (`*.py`, `.remyx-recommendation/**`, `**/README.md`).
+      OF the defaults (`*.py`, `.remyx-recommendation/**`, `**/*.md`).
       Extends the defaults — it does not replace them. Matching is
       case-insensitive. Most repos won't need this.
     required: false
     default: ''
+  test-integration-policy:
+    description: |
+      How to handle the test-integration gate, which requires that new
+      tests import from a pre-existing module (or that an existing
+      package module imports the new module). One of:
+
+        strict (default) — if the gate fails, route the run to an Issue
+                           instead of opening a PR. Best for application/
+                           pipeline repos where standalone-module
+                           contributions are usually scaffold-shaped.
+        soft             — if the gate fails, still open the PR as a
+                           draft and add a warning section to the body
+                           noting the missing integration. Best for
+                           layer/component repos (graph NN, kernels)
+                           where a new standalone module IS the
+                           contribution.
+        off              — skip the gate entirely. Relies on the other
+                           validators (path allowlist, integration check,
+                           stub density, self-review) to keep PRs honest.
+    required: false
+    default: 'strict'
   lookback:
     description: |
       Recommendation lookback window. The action pulls the candidate pool
@@ -165,6 +186,7 @@ runs:
         INPUT_DRAFT_MODE: ${{ inputs.draft-mode }}
         INPUT_RATE_LIMIT_DAYS: ${{ inputs.rate-limit-days }}
         INPUT_GUARDRAILS_ALLOWLIST: ${{ inputs.guardrails-allowlist }}
+        INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         # Lookback window + pool size for the candidate selection pass.

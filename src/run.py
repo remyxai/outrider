@@ -102,7 +102,11 @@ TIER_RANK = {"high": 3, "moderate": 2, "low": 1, "noise": 0, "near-random": 0}
 DEFAULT_ALLOWLIST_GLOBS = [
     "*.py",
     ".remyx-recommendation/**",
-    "**/README.md",          # READMEs at any depth (top-level + nested docs)
+    "**/*.md",               # Markdown anywhere (README, CHANGELOG, docs/,
+                             # ADR notes). Diff is text-only and reviewable.
+                             # The 50-line edit cap still applies to existing
+                             # files; new docs files are uncapped but still
+                             # need to be referenced somewhere to land in a PR.
 ]
 
 # Cap on additions+deletions per pre-existing file. Keeps wiring edits
@@ -588,6 +592,9 @@ _Opened by the [Remyx Recommendation]({attribution_url}) orchestrator._
 
 DRAFT_MODES = ("always", "on_test_failure", "never")
 
+# Test-integration gate policy values. See Target.test_integration_policy.
+TEST_INTEGRATION_POLICIES = ("strict", "soft", "off")
+
 # Terminal statuses that should make the workflow step exit non-zero (red
 # in CI). Everything else — Issues, skips, PRs — is a legitimate green
 # outcome. `claude_failed` used to exit 0, so a run that produced no PR/Issue
@@ -620,6 +627,15 @@ class Target:
     #                       draft_on_test_failure=False behavior.
     draft_mode: str = "always"
     guardrails_allowlist: list[str] = field(default_factory=list)
+    # Test-integration gate policy:
+    #   "strict" (default) — gate failure routes to Issue (current behavior)
+    #   "soft"             — gate failure opens draft PR with warning section
+    #   "off"              — skip the gate entirely
+    # See `check_tests_touch_existing_modules`. Repos where standalone-module
+    # contributions ARE the contribution shape (graph NN, kernels, layer
+    # libraries) benefit from "soft"; application/pipeline repos should
+    # keep "strict".
+    test_integration_policy: str = "strict"
     # Per-run wall-clock budget for the Claude Code implementation step.
     # 600s was too tight on large repos; configurable via `claude-timeout`.
     claude_timeout_s: int = 900
@@ -2568,31 +2584,49 @@ def process_target(target: Target) -> dict:
         # modules were added, at least one new test must import from a
         # non-new module in the package — otherwise tests are pure
         # self-tests and don't prove integration.
-        tests_touch_existing, existing_imports = (
-            check_tests_touch_existing_modules(workdir, package)
-        )
-        result["tests_touch_existing"] = tests_touch_existing
-        if not tests_touch_existing:
-            log.warning(
-                "  ✗ no new test imports from an existing module — "
-                "tests only self-test the new file"
+        #
+        # Behavior is controlled by `target.test_integration_policy`:
+        #   - "off"    → skip the gate entirely (relies on the other
+        #                validators to keep PRs honest)
+        #   - "soft"   → gate failure annotates the PR body with a
+        #                warning section but does NOT demote to Issue
+        #   - "strict" → (default) gate failure demotes to Issue, as before
+        if target.test_integration_policy == "off":
+            result["tests_touch_existing"] = True   # vacuous: gate skipped
+            result["test_integration_gate"] = "skipped"
+        else:
+            tests_touch_existing, existing_imports = (
+                check_tests_touch_existing_modules(workdir, package)
             )
-            issue_url = _open_downgrade_issue(
-                target, rec,
-                reason=(
-                    "New tests don't touch any pre-existing module"
-                ),
-                detail=(
-                    "A new module was added, but none of the new test "
-                    "files import from a pre-existing module in "
-                    f"`{package}/`. Pure self-tests of the new file "
-                    "don't prove the integration runs against existing "
-                    "pipeline outputs."
-                ),
-            )
-            result["status"] = "issue_opened_no_test_integration"
-            result["issue_url"] = issue_url
-            return result
+            result["tests_touch_existing"] = tests_touch_existing
+            if not tests_touch_existing:
+                if target.test_integration_policy == "soft":
+                    log.warning(
+                        "  ⚠ no new test imports from an existing module — "
+                        "policy=soft, opening PR with a warning"
+                    )
+                    result["test_integration_gate"] = "soft_failed"
+                else:  # "strict"
+                    log.warning(
+                        "  ✗ no new test imports from an existing module — "
+                        "tests only self-test the new file"
+                    )
+                    issue_url = _open_downgrade_issue(
+                        target, rec,
+                        reason=(
+                            "New tests don't touch any pre-existing module"
+                        ),
+                        detail=(
+                            "A new module was added, but none of the new test "
+                            "files import from a pre-existing module in "
+                            f"`{package}/`. Pure self-tests of the new file "
+                            "don't prove the integration runs against existing "
+                            "pipeline outputs."
+                        ),
+                    )
+                    result["status"] = "issue_opened_no_test_integration"
+                    result["issue_url"] = issue_url
+                    return result
 
         # 9. Self-review (§4). Second Claude pass over the diff. Renders
         # a "What this PR actually does" section into the PR body; if the
@@ -2645,6 +2679,9 @@ def process_target(target: Target) -> dict:
             target, rec, tests_status, test_output,
             review_section=review_section,
             selection_note=result.get("selection_reasoning", ""),
+            test_integration_warning=(
+                result.get("test_integration_gate") == "soft_failed"
+            ),
         )
         commit_and_push(workdir, branch, pr_title, base_branch=default_branch)
         pr_url = open_pr(
@@ -2668,6 +2705,7 @@ def build_pr_body(
     test_output: str,
     review_section: str = "",
     selection_note: str = "",
+    test_integration_warning: bool = False,
 ) -> str:
     tier_emoji = {"high": "🟢", "moderate": "🟡", "low": "🟠", "noise": "🔴"}.get(rec.tier, "⚪")
     if tests_status == "passed":
@@ -2684,13 +2722,30 @@ def build_pr_body(
             "### Test results\n\n⚠️ Tests did not pass. PR opened as draft "
             f"for review.\n\n```\n{test_output[-1000:]}\n```\n"
         )
+    # Soft-mode test-integration warning, rendered when the gate failed
+    # but the run was kept as a PR per `test-integration-policy: soft`.
+    # Sits above the test section so reviewers see the integration caveat
+    # before the green checkmark.
+    if test_integration_warning:
+        warning_block = (
+            "### ⚠️ Test integration not validated\n\n"
+            "New tests only self-test the new module — no new test imports "
+            "from a pre-existing module in the package. This is typically "
+            "fine for standalone-module contributions (new layer, kernel, "
+            "component), but if a clear integration path exists, consider "
+            "adding a test that exercises the wiring edit.\n\n"
+            "_PR opened via `test-integration-policy: soft`._\n"
+        )
+    else:
+        warning_block = ""
+
     # Self-review section (§4) goes ABOVE the test section so reviewers
     # see "what this PR actually does vs. what's stubbed" before the
     # green checkmark.
     test_section = (
-        f"{review_section}\n{test_section_inner}"
+        f"{warning_block}{review_section}\n{test_section_inner}"
         if review_section else
-        test_section_inner
+        f"{warning_block}{test_section_inner}"
     )
     # Selection rationale: why this candidate was picked from the lookback
     # pool over higher-ranked ones. Empty (just the section break) when the
@@ -2773,6 +2828,16 @@ def build_target_from_env() -> Target:
         else []
     )
 
+    test_integration_policy = _optional_env(
+        "INPUT_TEST_INTEGRATION_POLICY", "strict"
+    ).strip().lower()
+    if test_integration_policy not in TEST_INTEGRATION_POLICIES:
+        log.error(
+            f"INPUT_TEST_INTEGRATION_POLICY={test_integration_policy!r} "
+            f"is invalid. Must be one of {TEST_INTEGRATION_POLICIES}."
+        )
+        sys.exit(2)
+
     timeout_raw = _optional_env("INPUT_CLAUDE_TIMEOUT", "900")
     try:
         claude_timeout_s = int(timeout_raw)
@@ -2787,6 +2852,7 @@ def build_target_from_env() -> Target:
         rate_limit_days=rate_limit_days,
         draft_mode=draft_mode,
         guardrails_allowlist=guardrails_allowlist,
+        test_integration_policy=test_integration_policy,
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
         notes="",
