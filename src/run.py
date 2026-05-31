@@ -2243,6 +2243,9 @@ def process_target(target: Target) -> dict:
 
         skipped_low_confidence            — tier below min_confidence
         skipped_rate_limit                — recent PR within rate-limit-days
+                                            AND pre-flight routed this
+                                            candidate to PR (Issues are
+                                            never rate-limited)
         skipped_pr_exists                 — every candidate already has an
                                             open PR (or a mix of open PRs/Issues)
         skipped_issue_exists              — every candidate already has an
@@ -2267,11 +2270,15 @@ def process_target(target: Target) -> dict:
     """
     result: dict = {"repo": target.repo, "status": "unknown"}
 
-    # 1. Rate-limit (per-repo) — cheapest gate, before any candidate work
-    #    or checkout.
-    if recent_pr_within_rate_limit(target):
-        result["status"] = "skipped_rate_limit"
-        return result
+    # 1. (was: rate-limit pre-check) — moved to §5.7. The old §1 ran
+    #    recent_pr_within_rate_limit() before any candidate work, which
+    #    blocked Issue-track activity too. It now fires AFTER pre-flight
+    #    decides PR-vs-Issue, so it only gates PR-track candidates.
+    #    Issues are cheap discussion surfaces that don't add to the
+    #    team's review queue — gating them was overcautious. The
+    #    trade-off: ~$0.10-0.20 spent on pre-flight + selection per
+    #    rate-limited day, in exchange for daily Issue-track scouting
+    #    and a more accurate cadence guard.
 
     # 2. Query the candidate pool over the lookback window (default: the
     #    past week). The old flow took only papers[0], wasting the
@@ -2416,6 +2423,20 @@ def process_target(target: Target) -> dict:
             result["status"] = "issue_opened_preflight"
             result["issue_url"] = issue_url
             log.info(f"  ✓ issue_opened_preflight: {issue_url}")
+            return result
+
+        # 5.7. Rate-limit (PR-cadence guard). Now that pre-flight has
+        # decided this candidate is PR-track, check whether a recent
+        # Remyx PR was opened within rate-limit-days. If so, skip
+        # implementation. Issue-track candidates already returned above
+        # — Issues are cheap discussion surfaces that don't add to the
+        # team's review queue, so they aren't gated.
+        if recent_pr_within_rate_limit(target):
+            result["status"] = "skipped_rate_limit"
+            log.info(
+                f"  ✗ rate-limit hit before PR-track implementation; "
+                f"would have implemented {rec.arxiv_id}"
+            )
             return result
 
         # 6. Claude Code

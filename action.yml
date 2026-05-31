@@ -38,9 +38,12 @@ inputs:
     default: 'always'
   rate-limit-days:
     description: |
-      Skip the run if a previous Remyx Recommendation PR was opened
-      within this many days. Default 7 (weekly cadence). Set to 0 to
-      disable the rate limit and rely only on per-paper dedup.
+      PR-cadence guard: skip the implementation pass if a Remyx
+      Recommendation PR was opened within this many days. Applies only
+      to PR-track candidates — pre-flight Issues continue to flow daily
+      even during PR throttle, since Issues are cheap discussion
+      surfaces that don't add to the review queue. Default 7 (weekly
+      PR cadence). Set to 0 to disable.
     required: false
     default: '7'
   guardrails-allowlist:
