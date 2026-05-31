@@ -2753,6 +2753,117 @@ def build_target_from_env() -> Target:
     )
 
 
+def _write_step_summary(result: dict) -> None:
+    """Render the run outcome as Markdown into $GITHUB_STEP_SUMMARY.
+
+    GitHub Actions pins this panel at the top of every workflow run
+    page — it's the most visible surface and the only one that shows
+    cost telemetry to a customer without them having to wire
+    downstream consuming steps.
+
+    Sections (only what applies given the result's shape):
+      - Headline: status + paper link
+      - PR / Issue link if one was opened
+      - Why-this-paper reasoning (collapsed by default for brevity)
+      - Cost + tokens
+      - Selection rejected candidates (collapsed) for "what else did
+        Remyx consider"
+      - Error trace if status == error
+    """
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+
+    status = result.get("status", "unknown")
+    paper = result.get("paper")
+    arxiv = result.get("arxiv")
+    tier = result.get("tier")
+    pr_url = result.get("pr_url")
+    issue_url = result.get("issue_url")
+    reasoning = result.get("reasoning") or ""
+    cost = result.get("cost_usd", 0)
+    in_tok = result.get("input_tokens", 0)
+    out_tok = result.get("output_tokens", 0)
+    cache_in_tok = result.get("cache_read_input_tokens", 0)
+    claude_calls = result.get("claude_calls", 0)
+    rejected = result.get("selection_rejected") or []
+    err = result.get("error")
+
+    # Headline emoji conveys outcome at a glance.
+    emoji = {
+        "pr_opened":               "🟢",
+        "pr_opened_draft":         "🟢",
+        "issue_opened":            "🟡",
+        "issue_opened_preflight":  "🟡",
+        "issue_opened_no_integration":     "🟡",
+        "issue_opened_stub_density":       "🟡",
+        "issue_opened_no_test_integration": "🟡",
+        "issue_opened_self_review":        "🟡",
+        "skipped_low_confidence":  "⏭️",
+        "skipped_rate_limit":      "⏭️",
+        "skipped_pr_exists":       "⏭️",
+        "skipped_issue_exists":    "⏭️",
+        "skipped_test_failure":    "⏭️",
+        "claude_failed":           "❌",
+        "rejected_path_violations":"❌",
+        "error":                   "❌",
+    }.get(status, "ℹ️")
+
+    lines: list[str] = []
+    lines.append(f"## {emoji} Remyx Recommendation — `{status}`\n")
+
+    if paper and arxiv:
+        tier_str = f" ({tier})" if tier else ""
+        lines.append(
+            f"**Paper**: [{paper}](https://arxiv.org/abs/{arxiv}){tier_str}\n"
+        )
+    if pr_url:
+        lines.append(f"**PR**: {pr_url}\n")
+    if issue_url:
+        lines.append(f"**Issue**: {issue_url}\n")
+
+    if reasoning:
+        # Collapse long reasoning into a <details> so the cost line
+        # stays above the fold.
+        lines.append("<details><summary>Why this paper</summary>\n")
+        lines.append(f"\n{reasoning}\n")
+        lines.append("\n</details>\n")
+
+    # Cost telemetry — the headline reason this summary exists.
+    token_line = f"{in_tok:,} in / {out_tok:,} out"
+    if cache_in_tok:
+        token_line += f" ({cache_in_tok:,} cache-read)"
+    lines.append("\n**Cost & tokens this run**\n")
+    lines.append(f"- **Cost**: `${cost:.4f}`")
+    lines.append(f"- **Tokens**: {token_line}")
+    if claude_calls:
+        lines.append(f"- **Claude calls**: {claude_calls}")
+    lines.append("")
+
+    if rejected:
+        lines.append(f"<details><summary>Selection: {len(rejected)} other candidate(s) considered</summary>\n")
+        for r in rejected[:10]:
+            r_arxiv = r.get("arxiv_id", "?")
+            r_title = (r.get("title") or "")[:120]
+            r_reason = (r.get("reason") or "")[:200]
+            lines.append(f"- [`{r_arxiv}`](https://arxiv.org/abs/{r_arxiv}) — {r_title}")
+            if r_reason:
+                lines.append(f"  - _{r_reason}_")
+        if len(rejected) > 10:
+            lines.append(f"- _…and {len(rejected) - 10} more_")
+        lines.append("\n</details>\n")
+
+    if err:
+        lines.append("\n**Error**\n")
+        lines.append(f"```\n{err[:2000]}\n```\n")
+
+    try:
+        with open(summary_path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        log.warning(f"Could not write to $GITHUB_STEP_SUMMARY: {e}")
+
+
 def main():
     target = build_target_from_env()
     log.info(f"=== {target.repo} ===")
@@ -2807,6 +2918,12 @@ def main():
                 f.write(f"output_tokens={result.get('output_tokens', 0)}\n")
         except OSError as e:
             log.warning(f"Could not write to $GITHUB_OUTPUT: {e}")
+
+    # Render a human-readable summary into $GITHUB_STEP_SUMMARY. This is
+    # the markdown panel GitHub pins at the top of every workflow run
+    # page — by far the most visible surface, and the one place
+    # customers see cost telemetry without wiring downstream steps.
+    _write_step_summary(result)
 
     # Non-zero exit on genuine failures so the workflow step fails visibly
     # (a green run with no PR/Issue previously masked claude_failed). Issues,
