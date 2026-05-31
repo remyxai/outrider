@@ -1,6 +1,6 @@
 # Outrider — GitHub Action
 
-A composite GitHub Action that scouts the arXiv frontier for your team — on a schedule you choose, it picks the next paper to integrate (via the Remyx engine API) and either opens a draft pull request that wires the paper's contribution into an existing call site in your codebase, or opens a discussion Issue when the paper doesn't fit.
+Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider picks the next paper most implementable against your codebase and either opens a draft PR wiring it into an existing call site, or opens a discussion Issue when the paper doesn't fit cleanly.
 
 ```yaml
 - uses: remyxai/outrider@v1
@@ -10,193 +10,166 @@ A composite GitHub Action that scouts the arXiv frontier for your team — on a 
 
 ## What you get
 
-Each scheduled run:
+- **Draft PRs** that wire a paper's contribution into an existing module, with a self-review section in the body honestly noting what was implemented vs. left out
+- **Issues** when the paper doesn't fit — pre-flight, validators, or self-review route it to discussion instead of scaffold-shaped PRs
+- **One artifact per `rate-limit-days`** by default — no Issue spam
 
-1. Queries `engine.remyx.ai` for the candidate pool against your team's configured `ResearchInterest` over the `lookback` window (default: the past week), then runs a Claude **selection pass** that picks the candidate most directly implementable against *your* repo. Relevance rank alone often surfaces a model-architecture or training-method paper with no call site in a data/inference pipeline, while a lower-ranked candidate is a clean drop-in — the selection pass reads your repo's module layout and chooses accordingly (Remyx already knows your repo's commit history and codifies what your team has been building).
-2. Either:
-   - Opens a **draft pull request** that adds a small capability-named module AND wires it into an existing call site in your package, with a self-review section in the PR body honestly noting what was implemented vs. left out, OR
-   - Opens an **Issue** with the paper's details and a discussion of what would block a clean integration — when the paper doesn't fit (pre-flight, validators, or self-review route it to discussion instead of a PR).
-3. Reports outputs (`status`, `pr_url`, `issue_url`, `arxiv`, `tier`) you can chain into downstream steps.
-
-The orchestrator defaults to opening Issues, not PRs. A PR is only opened when the implementation wires new code into an existing module, passes a stub-density check, has at least one test that imports from a pre-existing module, and survives a self-review pass over the diff. This makes PRs ready-to-ship rather than scaffold-shaped.
-
-The selection pass only chooses *which* candidate to implement — it never decides PR vs Issue. The selected candidate still runs the full pre-flight + integration / stub / test / self-review gate chain, so if even the best-fit candidate can't be cleanly implemented, it's routed to an Issue exactly as before.
+The orchestrator defaults to opening Issues. A PR ships only when new code is actually wired into an existing call site, passes a stub-density check, has a test that imports from a pre-existing module, and survives a Claude self-review pass.
 
 ## Setup (5 minutes)
 
-### 1. Configure your interest at engine.remyx.ai
+1. **Sign up at [engine.remyx.ai](https://engine.remyx.ai)** and connect your repo. Remyx ingests your commit history and creates a `ResearchInterest`. Edit its context body to sharpen the framing.
 
-Sign up at [engine.remyx.ai](https://engine.remyx.ai). Connect your GitHub repo — Remyx ingests your commit history and creates a `ResearchInterest` that captures your team's research focus. Edit the interest's context body to sharpen the framing.
+2. **Generate a `REMYX_API_KEY`** from the engine.remyx.ai Settings page.
 
-### 2. Get your `REMYX_API_KEY`
+3. **Add two secrets** in your repo's *Settings → Secrets and variables → Actions*:
+   - `REMYX_API_KEY` — from step 2
+   - `ANTHROPIC_API_KEY` — your key from [console.anthropic.com](https://console.anthropic.com)
 
-From the engine.remyx.ai Settings page, generate a long-lived API key for this repo's automation. Copy it.
+4. **Allow Actions to open PRs**: *Settings → Actions → General → Workflow permissions* → ☑ *Allow GitHub Actions to create and approve pull requests*. (Without this, the action returns `HTTP 403` at PR creation.)
 
-### 3. Add secrets to your repo
+5. **Add the workflow** at `.github/workflows/outrider.yml`:
 
-In your repo's **Settings → Secrets and variables → Actions**, add:
+   ```yaml
+   name: Outrider
+   on:
+     schedule:
+       - cron: '0 6 * * 1'   # Mondays 06:00 UTC; pick any cadence
+     workflow_dispatch:
+   jobs:
+     recommend:
+       runs-on: ubuntu-latest
+       permissions:
+         contents: write
+         pull-requests: write
+         issues: write
+       env:
+         REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+       steps:
+         - uses: remyxai/outrider@v1
+           with:
+             interest-id: 'YOUR-INTEREST-UUID-HERE'
+   ```
 
-| Secret | Source |
-|---|---|
-| `REMYX_API_KEY` | the key from step 2 |
-| `ANTHROPIC_API_KEY` | your Anthropic key from [console.anthropic.com](https://console.anthropic.com) — used to invoke Claude Code |
+   (Tip: the engine.remyx.ai UI has a "copy workflow snippet" button that emits this pre-filled.)
 
-### 3b. Allow Actions to open pull requests
-
-In **Settings → Actions → General → Workflow permissions**, enable:
-
-> ☑ Allow GitHub Actions to create and approve pull requests
-
-This is disabled by default at the org level for new repos. Without it, the action runs to completion but the final PR-creation step returns `HTTP 403: GitHub Actions is not permitted to create or approve pull requests`. The setting can be enabled per-repo without changing org defaults.
-
-### 4. Add the workflow
-
-Create `.github/workflows/outrider.yml`:
-
-```yaml
-name: Outrider
-
-on:
-  schedule:
-    - cron: '0 6 * * 1'        # Mondays at 06:00 UTC; pick whatever cadence suits you
-  workflow_dispatch:            # also lets you trigger manually
-
-jobs:
-  recommend:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-    env:
-      # Inherited by the composite action's subprocesses.
-      REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-    steps:
-      - uses: remyxai/outrider@v1
-        with:
-          interest-id: 'YOUR-INTEREST-UUID-HERE'
-```
-
-Replace `YOUR-INTEREST-UUID-HERE` with the UUID from engine.remyx.ai. (Tip: the engine UI offers a "copy workflow snippet" button that emits this YAML pre-filled.)
-
-### 5. First run
-
-Visit your repo's **Actions** tab → **Outrider** → **Run workflow**. The first run takes 4-6 minutes; subsequent scheduled runs are identical. A draft PR appears in your **Pull Requests** tab when it completes.
+6. **First run**: *Actions tab → Outrider → Run workflow*. Takes 4–6 minutes. A draft PR or Issue appears when complete.
 
 ## Inputs
 
 | Input | Default | Description |
 |---|---|---|
-| `interest-id` | *(required)* | Remyx ResearchInterest UUID. |
-| `github-token` | *(empty — falls back to `${{ github.token }}`)* | Token used for git push + PR/Issue creation. Leave unset for the standard same-repo install; the action will use the workflow's built-in `GITHUB_TOKEN`. Override with a PAT (`${{ secrets.MY_PAT }}`) only for cross-repo controller patterns. |
-| `min-confidence` | `moderate` | Tier gate: `high` / `moderate` / `low`. Recommendations below this are skipped. |
-| `draft-mode` | `always` | PR-draft policy: `always` (default), `on_test_failure`, or `never`. |
-| `rate-limit-days` | `7` | Cadence guard: skip the run if any Remyx artifact (PR **or** Issue) was opened within this window. Customers see at most one Remyx artifact per `rate-limit-days` regardless of route. Set `0` to disable and rely only on per-paper dedup. |
-| `guardrails-allowlist` | `''` | Comma-separated extra path globs Claude Code may modify (most repos don't need this). |
-| `lookback` | `week` | Recommendation lookback window: `today` / `week` / `month`. The candidate pool is pulled over this window before the selection pass. |
-| `candidate-pool` | `25` | How many recommendations to pull into the selection pool. The selection pass picks the most implementable one; the rest are recorded as rejected with a reason. |
+| `interest-id` | *(required)* | Remyx ResearchInterest UUID |
+| `github-token` | `${{ github.token }}` | Override only for cross-repo controller patterns |
+| `min-confidence` | `moderate` | Tier gate: `high` / `moderate` / `low` |
+| `draft-mode` | `always` | `always` / `on_test_failure` / `never` |
+| `rate-limit-days` | `7` | Cadence guard. Skip the run if any Remyx artifact (PR **or** Issue) was opened within this window. Set `0` to disable. |
+| `guardrails-allowlist` | `''` | Extra path globs Claude Code may modify (rarely needed) |
+| `lookback` | `week` | Candidate pool window: `today` / `week` / `month` |
+| `candidate-pool` | `25` | How many candidates the selection pass picks from |
 
 ## Outputs
 
-| Output | When set | Description |
+| Output | When | Description |
 |---|---|---|
-| `status` | always | Run outcome (see status table below) |
-| `pr_url` | when status starts with `pr_opened` | URL of the opened PR |
-| `issue_url` | when status starts with `issue_opened` | URL of the opened Issue |
-| `arxiv` | when a recommendation was fetched | arxiv_id of the picked paper |
-| `tier` | when a recommendation was fetched | Confidence tier (`high` / `moderate` / `low` / `noise`) |
+| `status` | always | Run outcome — see status codes below |
+| `pr_url` | `pr_opened*` | URL of the opened PR |
+| `issue_url` | `issue_opened*` | URL of the opened Issue |
+| `arxiv` | when a paper was picked | arxiv_id |
+| `tier` | when a paper was picked | `high` / `moderate` / `low` / `noise` |
+| `cost_usd` | always | Claude spend for this run |
+| `input_tokens` / `output_tokens` | always | Token usage |
 
-## Status codes
+## Costs
+
+- **Claude Code**: ~$0.40–0.70 per PR-track run, less for Issue-track (no implementation pass). You bring `ANTHROPIC_API_KEY`.
+- **Remyx API**: included in your engine.remyx.ai subscription.
+- **GitHub Actions**: ~5 min on `ubuntu-latest` per run.
+
+At weekly cadence (default `rate-limit-days: 7`), expect ~$1–3/mo Claude.
+
+<details>
+<summary><b>Status codes</b> (15 outcomes)</summary>
 
 | Status | Meaning |
 |---|---|
 | `pr_opened` | PR opened ready-for-review (tests passed, `draft-mode != always`) |
-| `pr_opened_draft` | PR opened as draft (the default under `draft-mode: always`, or when tests failed under `draft-mode: on_test_failure`) |
-| `issue_opened_preflight` | Pre-flight Claude pass routed to Issue **before** spending the implementation budget (paper needs infra the repo lacks, or no clear call site) |
-| `issue_opened` | Claude elected Issue-mode during implementation (wrote `OPEN_AS_ISSUE.md` instead of code) |
-| `issue_opened_no_integration` | The diff adds functions/methods/classes that nothing invokes — code defined but never called from any other changed file (an import alone doesn't count) |
-| `issue_opened_stub_density` | New module's public surface is dominated by `pass` / `raise NotImplementedError` / empty bodies (≥50% of function bodies are stubs) |
-| `issue_opened_no_test_integration` | New tests only self-test the new file; no new test imports from a pre-existing module |
-| `issue_opened_self_review` | Second Claude pass judged the new code an **orphan** — unreachable from any production path (at most its own tests call it). This is a reachability check, not a triviality one (stub density covers triviality) |
+| `pr_opened_draft` | PR opened as draft |
+| `issue_opened_preflight` | Pre-flight Claude pass routed to Issue before implementation |
+| `issue_opened` | Claude elected Issue-mode (wrote `OPEN_AS_ISSUE.md` instead of code) |
+| `issue_opened_no_integration` | Diff adds code that nothing invokes |
+| `issue_opened_stub_density` | New module is ≥50% stubs (`pass` / `NotImplementedError` / empty bodies) |
+| `issue_opened_no_test_integration` | New tests don't import from any pre-existing module |
+| `issue_opened_self_review` | Self-review judged the new code an orphan, unreachable from production |
 | `skipped_low_confidence` | Recommendation below `min-confidence` |
-| `skipped_rate_limit` | A previous Remyx PR was opened within `rate-limit-days` |
-| `skipped_pr_exists` | Every candidate in the pool already has an open PR (or a mix of open PRs and Issues) |
-| `skipped_issue_exists` | Every candidate in the pool already has an open Remyx Issue — nothing new to surface. Close an Issue to make that paper eligible again |
+| `skipped_rate_limit` | A Remyx PR or Issue was opened within `rate-limit-days` |
+| `skipped_pr_exists` | Every candidate already has an open PR |
+| `skipped_issue_exists` | Every candidate already has an open Remyx Issue — close one to retry that paper |
 | `skipped_test_failure` | Tests failed AND `draft-mode: never` |
 | `claude_failed` | Claude CLI exited non-zero |
-| `rejected_path_violations` | Claude touched files outside the guardrails allowlist; no PR opened |
-| `error` | Unhandled exception (action step exits 1) |
+| `rejected_path_violations` | Claude touched files outside the guardrails allowlist |
+| `error` | Unhandled exception |
 
-## Guardrails — what Claude can and can't modify
+</details>
 
-Allowed paths (defaults):
-- `*.py` — any Python source anywhere in the repo (new or existing). The wiring edit has to reach the *real* call site, which often lives outside the target package — a pipeline/stage driver, an entrypoint module, etc. — so the allowlist isn't tied to one repo's directory layout.
-- `.remyx-recommendation/**` — the spec bundle (scrubbed before commit, never lands in the PR)
+<details>
+<summary><b>Guardrails</b> — what Claude can and can't modify</summary>
+
+**Allowed paths** (defaults):
+- `*.py` — any Python source, anywhere in the repo
+- `.remyx-recommendation/**` — the spec bundle (scrubbed before commit)
 - `README.md` — append-only attribution section
 
-Always blocked — by **role** (filename/type), not by directory, so the policy doesn't encode any one repo's tree. `*` crosses `/`, so each pattern matches at the repo root and nested at any depth:
+**Always blocked** by *role* (filename/type), not directory:
 - `.github/**` — CI / workflow config
-- `*Dockerfile`, `*Dockerfile.*`, `*.dockerfile`, `*.sh` — container builds and shell scripts, wherever they live
+- `*Dockerfile`, `*Dockerfile.*`, `*.dockerfile`, `*.sh` — container builds and shell scripts
 - `*requirements*.txt`, `setup.py`, `setup.cfg`, `pyproject.toml`, `MANIFEST.in`, `*.lock` — dependency / build manifests
 
-This block list takes precedence over the allowlist, so even though `*.py` is allowed, infra stays protected. Non-`.py` config that isn't on the block list (e.g. `pipelines/*.yaml`) simply isn't in the allowlist, so it can't be touched either.
+The block list takes precedence over the allowlist. Non-`.py` config not on the block list (e.g. `pipelines/*.yaml`) simply isn't allowed either.
 
-Edit-size caps (post-hoc, enforced after the Claude session):
-- Each edit to a pre-existing file is capped at **50 net lines** (additions + deletions). Larger edits get rejected — wiring is expected to be surgical.
-- At most **3 new `.py` files** under the target package per run.
-- At least one newly-added function/method/class must be **invoked** from another changed file (an import alone isn't enough) — otherwise the diff is code nothing calls.
+**Edit-size caps** (enforced after the Claude session):
+- Each edit to a pre-existing file: ≤50 net lines (additions + deletions)
+- At most 3 new `.py` files per run
+- At least one newly-added function/method/class must be invoked from another changed file (an import alone doesn't count)
 
-If Claude touches anything outside the allowed set, the action rejects the run and does not open a PR. Use the `guardrails-allowlist` input to extend the allowed set for your repo.
+Extend the allowlist for your repo via the `guardrails-allowlist` input.
 
-## How it works
+</details>
+
+<details>
+<summary><b>How it works</b></summary>
 
 ```
 GitHub cron fires the workflow
        ↓
-GET engine.remyx.ai/api/v1.0/papers/recommended?interest_id=<id>
-GET engine.remyx.ai/api/v1.0/research-interests/<id>     ← team focus context
+Query engine.remyx.ai for the candidate pool + interest context
        ↓
-Confidence + dedup gates
+Rate-limit + per-paper dedup + confidence gates
        ↓
-Clone repo, branch from main
+Selection pass: which candidate is most implementable against this repo?
        ↓
-Write .remyx-recommendation/ spec bundle (briefing for Claude)
+Clone, write the .remyx-recommendation/ spec bundle
        ↓
 Pre-flight Claude pass: PR or Issue?
        ↓                              ↓
      ISSUE                            PR
        ↓                              ↓
-   open Issue        Invoke claude --dangerously-skip-permissions
+   open Issue        Invoke Claude Code (implement integration)
                                       ↓
-                     Either: open OPEN_AS_ISSUE.md (→ Issue mode)
-                     or implement INTEGRATION (call-site edit + new module)
-                                      ↓
-                     Path-allowlist check  +  integration validator
+                     Path-allowlist + integration validator
                      (new module must be imported by a modified file)
                                       ↓
-                     Stub-density check (new module not mostly TODOs)
+                     Stub-density + pytest + test-integration check
                                       ↓
-                     pytest  +  test-integration check
-                     (≥1 new test must import a pre-existing module)
+                     Self-review pass (downgrade to Issue if orphan)
                                       ↓
-                     Self-review pass over the diff
-                     (PR body gets "What this PR actually does" section;
-                      downgrade to Issue if diff is deletable with no loss)
-                                      ↓
-                     Commit (with bundle scrubbed) + push + open draft PR
+                     Commit (bundle scrubbed) + push + open draft PR
 ```
 
-The recommendation engine (commit-history extraction, candidate pool, embedding pre-filter, Gemini ranking) lives server-side on engine.remyx.ai. This action is a pure consumer; the API call returns a fully-formed recommendation with reasoning + suggested experiment + interest context body.
+The Remyx engine (commit-history extraction, candidate pool, embedding pre-filter, Gemini ranking) runs server-side. This action is a pure consumer.
 
-## Costs
-
-Per run:
-- Remyx API: included in your engine.remyx.ai subscription
-- Claude Code: ~$0.40-0.70 per draft-PR run (you bring your own `ANTHROPIC_API_KEY`) — the pre-flight + implementation + self-review passes together. Runs routed to Issue at pre-flight skip the implementation pass and cost less.
-- GitHub Actions minutes: ~5 minutes per run on `ubuntu-latest`
-
-At weekly cadence (~4 runs/mo) with ~50% confidence-gate skip rate, expect ~$1-3/mo Claude + a handful of free-tier Actions minutes.
+</details>
 
 ## License
 
