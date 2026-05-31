@@ -38,12 +38,12 @@ inputs:
     default: 'always'
   rate-limit-days:
     description: |
-      PR-cadence guard: skip the implementation pass if a Remyx
-      Recommendation PR was opened within this many days. Applies only
-      to PR-track candidates — pre-flight Issues continue to flow daily
-      even during PR throttle, since Issues are cheap discussion
-      surfaces that don't add to the review queue. Default 7 (weekly
-      PR cadence). Set to 0 to disable.
+      Cadence guard: skip the run if any Remyx Recommendation artifact
+      (PR or Issue) was opened on the target repo within this many
+      days. Counts both routes so customers see at most one Remyx
+      artifact per `rate-limit-days` regardless of whether it lands as
+      a PR or as a discussion Issue. Default 7 (weekly cadence). Set
+      to 0 to disable and rely only on per-paper dedup.
     required: false
     default: '7'
   guardrails-allowlist:

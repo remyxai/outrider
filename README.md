@@ -92,7 +92,7 @@ Visit your repo's **Actions** tab → **Outrider** → **Run workflow**. The fir
 | `github-token` | *(empty — falls back to `${{ github.token }}`)* | Token used for git push + PR/Issue creation. Leave unset for the standard same-repo install; the action will use the workflow's built-in `GITHUB_TOKEN`. Override with a PAT (`${{ secrets.MY_PAT }}`) only for cross-repo controller patterns. |
 | `min-confidence` | `moderate` | Tier gate: `high` / `moderate` / `low`. Recommendations below this are skipped. |
 | `draft-mode` | `always` | PR-draft policy: `always` (default), `on_test_failure`, or `never`. |
-| `rate-limit-days` | `7` | PR-cadence guard: skip the implementation pass if a Remyx PR was opened within this window. Issue-track candidates are NOT gated — pre-flight Issues continue to flow daily even during PR throttle. Set `0` to disable. |
+| `rate-limit-days` | `7` | Cadence guard: skip the run if any Remyx artifact (PR **or** Issue) was opened within this window. Customers see at most one Remyx artifact per `rate-limit-days` regardless of route. Set `0` to disable and rely only on per-paper dedup. |
 | `guardrails-allowlist` | `''` | Comma-separated extra path globs Claude Code may modify (most repos don't need this). |
 | `lookback` | `week` | Recommendation lookback window: `today` / `week` / `month`. The candidate pool is pulled over this window before the selection pass. |
 | `candidate-pool` | `25` | How many recommendations to pull into the selection pool. The selection pass picks the most implementable one; the rest are recorded as rejected with a reason. |

@@ -973,7 +973,7 @@ def open_remyx_issues(target: Target) -> list[dict]:
     separately by existing_pr_for. We keep only items that look like one
     of ours: the title carries the PR_TITLE_PREFIX or the body has the
     orchestrator's attribution footer. Bounded to the first 100 open
-    issues (same pragmatic cap as recent_pr_within_rate_limit)."""
+    issues (same pragmatic cap as recent_remyx_activity_within_rate_limit)."""
     issues = gh_api(
         "GET", f"/repos/{target.repo}/issues?state=open&per_page=100"
     ) or []
@@ -1007,12 +1007,22 @@ def issue_for_paper(open_issues: list[dict], rec: Recommendation) -> dict | None
     return None
 
 
-def recent_pr_within_rate_limit(target: Target) -> bool:
-    """Return True if a Remyx Recommendation PR was opened on the target
-    repo within `rate_limit_days`."""
+def recent_remyx_activity_within_rate_limit(target: Target) -> bool:
+    """Return True if any Remyx Recommendation PR OR Issue was opened on
+    the target repo within `rate_limit_days`.
+
+    Counts both states (open and closed) — a recently-closed artifact
+    still represents a recent customer interruption that the rate-limit
+    is designed to throttle. Counts both PRs (identified by branch
+    prefix) and Issues (identified by title prefix or body marker), so
+    a cadence guard set to e.g. 7 days produces at most one Remyx
+    artifact per week, regardless of whether it lands as a PR or an
+    Issue."""
     if target.rate_limit_days <= 0:
         return False
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=target.rate_limit_days)
+
+    # PRs — identified by branch prefix.
     prs = gh_api(
         "GET", f"/repos/{target.repo}/pulls?state=all&per_page=20"
     )
@@ -1023,10 +1033,32 @@ def recent_pr_within_rate_limit(target: Target) -> bool:
         created = dt.datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
         if created > cutoff:
             log.info(
-                f"  rate-limit hit: {pr['html_url']} opened "
+                f"  rate-limit hit (PR): {pr['html_url']} opened "
                 f"{(dt.datetime.now(dt.timezone.utc) - created).days}d ago"
             )
             return True
+
+    # Issues — identified by title prefix or body attribution marker.
+    # GitHub's /issues endpoint also returns PRs (they carry a
+    # 'pull_request' key); filter those out so we don't double-count.
+    issues = gh_api(
+        "GET", f"/repos/{target.repo}/issues?state=all&per_page=50"
+    ) or []
+    for it in issues:
+        if it.get("pull_request"):
+            continue
+        title = it.get("title") or ""
+        body = it.get("body") or ""
+        if not (title.startswith(PR_TITLE_PREFIX) or "Remyx Recommendation" in body):
+            continue
+        created = dt.datetime.fromisoformat(it["created_at"].replace("Z", "+00:00"))
+        if created > cutoff:
+            log.info(
+                f"  rate-limit hit (Issue): {it['html_url']} opened "
+                f"{(dt.datetime.now(dt.timezone.utc) - created).days}d ago"
+            )
+            return True
+
     return False
 
 
@@ -2242,10 +2274,10 @@ def process_target(target: Target) -> dict:
     skip:
 
         skipped_low_confidence            — tier below min_confidence
-        skipped_rate_limit                — recent PR within rate-limit-days
-                                            AND pre-flight routed this
-                                            candidate to PR (Issues are
-                                            never rate-limited)
+        skipped_rate_limit                — any Remyx artifact (PR or
+                                            Issue) opened within
+                                            rate-limit-days; the gate is
+                                            a global cadence guard
         skipped_pr_exists                 — every candidate already has an
                                             open PR (or a mix of open PRs/Issues)
         skipped_issue_exists              — every candidate already has an
@@ -2270,15 +2302,17 @@ def process_target(target: Target) -> dict:
     """
     result: dict = {"repo": target.repo, "status": "unknown"}
 
-    # 1. (was: rate-limit pre-check) — moved to §5.7. The old §1 ran
-    #    recent_pr_within_rate_limit() before any candidate work, which
-    #    blocked Issue-track activity too. It now fires AFTER pre-flight
-    #    decides PR-vs-Issue, so it only gates PR-track candidates.
-    #    Issues are cheap discussion surfaces that don't add to the
-    #    team's review queue — gating them was overcautious. The
-    #    trade-off: ~$0.10-0.20 spent on pre-flight + selection per
-    #    rate-limited day, in exchange for daily Issue-track scouting
-    #    and a more accurate cadence guard.
+    # 1. Rate-limit (cadence guard) — cheapest gate, before any
+    #    candidate work or checkout. Counts BOTH Remyx PRs and Issues
+    #    opened within rate-limit-days; if any exists, skip the run.
+    #    This makes the rate-limit a true global cadence guard:
+    #    customers see at most one Remyx artifact per N days regardless
+    #    of which route (PR or Issue) it takes. The earlier version
+    #    counted only PRs, which let Issues open daily during PR
+    #    throttle — that was high-noise on daily crons.
+    if recent_remyx_activity_within_rate_limit(target):
+        result["status"] = "skipped_rate_limit"
+        return result
 
     # 2. Query the candidate pool over the lookback window (default: the
     #    past week). The old flow took only papers[0], wasting the
@@ -2423,20 +2457,6 @@ def process_target(target: Target) -> dict:
             result["status"] = "issue_opened_preflight"
             result["issue_url"] = issue_url
             log.info(f"  ✓ issue_opened_preflight: {issue_url}")
-            return result
-
-        # 5.7. Rate-limit (PR-cadence guard). Now that pre-flight has
-        # decided this candidate is PR-track, check whether a recent
-        # Remyx PR was opened within rate-limit-days. If so, skip
-        # implementation. Issue-track candidates already returned above
-        # — Issues are cheap discussion surfaces that don't add to the
-        # team's review queue, so they aren't gated.
-        if recent_pr_within_rate_limit(target):
-            result["status"] = "skipped_rate_limit"
-            log.info(
-                f"  ✗ rate-limit hit before PR-track implementation; "
-                f"would have implemented {rec.arxiv_id}"
-            )
             return result
 
         # 6. Claude Code
