@@ -14,8 +14,6 @@ Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider pick
 - **Issues** when a PR would be premature — pre-flight, validators, or self-review route the paper to discussion instead of scaffold-shaped PRs
 - **One artifact per `rate-limit-days`** by default — no Issue spam
 
-The orchestrator defaults to opening Issues. A PR ships only when new code is actually wired into an existing call site, passes a stub-density check, has a test that imports from a pre-existing module, and survives a Claude self-review pass.
-
 ## Setup (5 minutes)
 
 1. **Sign up at [engine.remyx.ai](https://engine.remyx.ai)** and connect your repo. Remyx ingests your commit history and creates a `ResearchInterest`. Edit its context body to sharpen the framing.

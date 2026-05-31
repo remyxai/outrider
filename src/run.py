@@ -1193,7 +1193,7 @@ def write_spec_bundle(
 
 # Per-run token/cost totals, accumulated across every `claude` call in a
 # run (pre-flight, selection, implementation, self-review) and surfaced in
-# the RUN SUMMARY + $GITHUB_OUTPUT. (REMYX-64)
+# the RUN SUMMARY + $GITHUB_OUTPUT.
 _RUN_COST = {
     "cost_usd": 0.0,
     "input_tokens": 0,
@@ -1228,7 +1228,7 @@ def _run_claude_json(
     cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
 ) -> tuple[bool, str]:
     """Run `claude … --output-format json -p <prompt>`, accumulate token/cost
-    usage into _RUN_COST (REMYX-64), and return (ok, model_text).
+    usage into _RUN_COST, and return (ok, model_text).
 
     With --output-format json the CLI prints a single envelope object
     ({result, total_cost_usd, usage, num_turns, is_error, …}); the model's
@@ -2920,7 +2920,7 @@ def main():
         result = {"repo": target.repo, "status": "error", "error": str(e)}
 
     # Token/cost totals across every Claude pass this run, captured even when
-    # process_target raised (REMYX-64).
+    # process_target raised.
     result["cost_usd"] = round(_RUN_COST["cost_usd"], 4)
     result["input_tokens"] = _RUN_COST["input_tokens"]
     result["output_tokens"] = _RUN_COST["output_tokens"]
