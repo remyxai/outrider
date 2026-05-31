@@ -1,9 +1,9 @@
-# Remyx Recommendation — GitHub Action
+# Outrider — GitHub Action
 
-A composite GitHub Action that, on a schedule you choose, picks the next arXiv paper for your team to integrate (via the Remyx engine API) and either opens a draft pull request that wires the paper's contribution into an existing call site in your codebase, or opens a discussion Issue when the paper doesn't fit.
+A composite GitHub Action that scouts the arXiv frontier for your team — on a schedule you choose, it picks the next paper to integrate (via the Remyx engine API) and either opens a draft pull request that wires the paper's contribution into an existing call site in your codebase, or opens a discussion Issue when the paper doesn't fit.
 
 ```yaml
-- uses: remyxai/remyx-recommendation-action@v1
+- uses: remyxai/outrider@v1
   with:
     interest-id: ${{ vars.REMYX_INTEREST_ID }}
 ```
@@ -51,10 +51,10 @@ This is disabled by default at the org level for new repos. Without it, the acti
 
 ### 4. Add the workflow
 
-Create `.github/workflows/remyx-recommendation.yml`:
+Create `.github/workflows/outrider.yml`:
 
 ```yaml
-name: Remyx Recommendation
+name: Outrider
 
 on:
   schedule:
@@ -73,7 +73,7 @@ jobs:
       REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
-      - uses: remyxai/remyx-recommendation-action@v1
+      - uses: remyxai/outrider@v1
         with:
           interest-id: 'YOUR-INTEREST-UUID-HERE'
 ```
@@ -82,7 +82,7 @@ Replace `YOUR-INTEREST-UUID-HERE` with the UUID from engine.remyx.ai. (Tip: the 
 
 ### 5. First run
 
-Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflow**. The first run takes 4-6 minutes; subsequent scheduled runs are identical. A draft PR appears in your **Pull Requests** tab when it completes.
+Visit your repo's **Actions** tab → **Outrider** → **Run workflow**. The first run takes 4-6 minutes; subsequent scheduled runs are identical. A draft PR appears in your **Pull Requests** tab when it completes.
 
 ## Inputs
 

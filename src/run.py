@@ -1,6 +1,5 @@
 """
-run.py — Entry point for the remyxai/remyx-recommendation-action
-composite GitHub Action.
+run.py — Entry point for the remyxai/outrider composite GitHub Action.
 
 The action runs once per workflow invocation; it opens a draft PR (or
 an Issue when the recommended paper can't be cleanly scaffolded)

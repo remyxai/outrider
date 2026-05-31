@@ -1,7 +1,7 @@
-name: 'Remyx Recommendation'
-description: 'Open a draft PR with the next arXiv paper to integrate. Remyx ranks papers against your team''s research interest; Claude Code drafts the implementation scaffold.'
+name: 'Outrider'
+description: 'Sends a scout to the arXiv frontier — picks the next paper most implementable against your codebase and opens a draft PR. Remyx ranks; Claude Code drafts.'
 branding:
-  icon: 'book-open'
+  icon: 'compass'
   color: 'purple'
 
 inputs:
