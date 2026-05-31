@@ -63,7 +63,8 @@ Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider pick
 | `min-confidence` | `moderate` | Tier gate: `high` / `moderate` / `low` |
 | `draft-mode` | `always` | `always` / `on_test_failure` / `never` |
 | `rate-limit-days` | `7` | Cadence guard. Skip the run if any Remyx artifact (PR **or** Issue) was opened within this window. Set `0` to disable. |
-| `guardrails-allowlist` | `''` | Extra path globs Claude Code may modify (rarely needed) |
+| `guardrails-allowlist` | `''` | Extra path globs Claude Code may modify, **added on top of** the defaults (`*.py`, `.remyx-recommendation/**`, `**/*.md`). Most repos won't need this. |
+| `test-integration-policy` | `strict` | `strict` (demote to Issue if new tests don't import an existing module) / `soft` (open draft PR with warning) / `off` (skip the gate). Use `soft` for layer/component repos where standalone modules are the contribution. |
 | `lookback` | `week` | Candidate pool window: `today` / `week` / `month` |
 | `candidate-pool` | `25` | How many candidates the selection pass picks from |
 
