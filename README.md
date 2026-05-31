@@ -32,7 +32,7 @@ Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider pick
    name: Outrider
    on:
      schedule:
-       - cron: '0 6 * * 1'   # Mondays 06:00 UTC; pick any cadence
+       - cron: '0 14 * * 1'  # Mondays 14:00 UTC; pick any cadence
      workflow_dispatch:
    jobs:
      recommend:
@@ -82,11 +82,11 @@ Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider pick
 
 ## Costs
 
-- **Claude Code**: ~$0.40–0.70 per PR-track run, less for Issue-track (no implementation pass). You bring `ANTHROPIC_API_KEY`.
+- **Claude Code**: ~$2–3 per PR-track run (pre-flight + selection + implementation + self-review). Issue-track runs cost less since they skip the implementation pass. You bring `ANTHROPIC_API_KEY`.
 - **Remyx API**: included in your engine.remyx.ai subscription.
-- **GitHub Actions**: ~5 min on `ubuntu-latest` per run.
+- **GitHub Actions**: ~6–8 min on `ubuntu-latest` per run.
 
-At weekly cadence (default `rate-limit-days: 7`), expect ~$1–3/mo Claude.
+At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 
 <details>
 <summary><b>Status codes</b> (15 outcomes)</summary>
