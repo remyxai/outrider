@@ -251,7 +251,7 @@ def test_classify_pytest():
     assert run._classify_pytest(1, "1 failed\nModuleNotFoundError: x") == "failed"
 
 
-# ── 6. REMYX-64: per-run token/cost accumulation ───────────────────────────
+# ── 6. Per-run token/cost accumulation ────────────────────────────────────
 
 def test_cost_accumulation():
     run._reset_run_cost()
