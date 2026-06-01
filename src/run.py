@@ -2447,7 +2447,33 @@ def process_target(target: Target) -> dict:
             if selection is not None:
                 rec = viable[selection["chosen_index"]]
                 result["selection_reasoning"] = selection.get("reasoning", "")
-                result["selection_rejected"] = selection.get("rejected", [])
+                # The selection pass returns {index, why} for each rejected
+                # candidate. Enrich into {arxiv_id, title, reason} here so
+                # downstream consumers (the $GITHUB_STEP_SUMMARY renderer,
+                # any external tooling parsing the result dict) get
+                # self-describing entries — they shouldn't have to remember
+                # the index is a pointer into the viable list.
+                raw_rejected = selection.get("rejected") or []
+                enriched_rejected = []
+                for r in raw_rejected:
+                    idx = r.get("index")
+                    if isinstance(idx, int) and 0 <= idx < len(viable):
+                        cand = viable[idx]
+                        enriched_rejected.append({
+                            "arxiv_id": cand.arxiv_id,
+                            "title": cand.paper_title,
+                            "reason": r.get("why", ""),
+                        })
+                    else:
+                        # Defensive: selection returned an index that
+                        # doesn't resolve. Keep the reason so the summary
+                        # isn't silent about the candidate.
+                        enriched_rejected.append({
+                            "arxiv_id": "",
+                            "title": "(candidate index out of range)",
+                            "reason": r.get("why", ""),
+                        })
+                result["selection_rejected"] = enriched_rejected
             else:
                 rec = viable[0]
                 result["selection_reasoning"] = (
@@ -2977,10 +3003,16 @@ def _write_step_summary(result: dict) -> None:
     if rejected:
         lines.append(f"<details><summary>Selection: {len(rejected)} other candidate(s) considered</summary>\n")
         for r in rejected[:10]:
-            r_arxiv = r.get("arxiv_id", "?")
-            r_title = (r.get("title") or "")[:120]
+            r_arxiv = (r.get("arxiv_id") or "").strip()
+            r_title = (r.get("title") or "(untitled)")[:120]
             r_reason = (r.get("reason") or "")[:200]
-            lines.append(f"- [`{r_arxiv}`](https://arxiv.org/abs/{r_arxiv}) — {r_title}")
+            if r_arxiv:
+                lines.append(f"- [`{r_arxiv}`](https://arxiv.org/abs/{r_arxiv}) — {r_title}")
+            else:
+                # No arxiv_id (e.g. defensive path when selection returned
+                # an out-of-range index). Render the title without a broken
+                # link target.
+                lines.append(f"- {r_title}")
             if r_reason:
                 lines.append(f"  - _{r_reason}_")
         if len(rejected) > 10:
