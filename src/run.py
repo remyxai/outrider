@@ -594,6 +594,8 @@ _PR_BODY_TEMPLATE = """\
 
 ---
 
+> **Want eval-on-every-PR?** Outrider Validate (coming soon, paid tier) runs your benchmark suite against this diff and posts the results as a PR comment. Design partner pilot is open — [join the waitlist](https://github.com/remyxai/outrider/discussions/19).
+
 _Opened by the [Remyx Recommendation]({attribution_url}) orchestrator._
 """
 
