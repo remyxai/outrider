@@ -1,5 +1,5 @@
-name: 'Outrider'
-description: 'Sends a scout to the arXiv frontier — picks the next paper most implementable against your codebase and opens a draft PR. Remyx ranks; Claude Code drafts.'
+name: 'Remyx Outrider'
+description: 'Scouts arXiv for the next paper most implementable against your codebase and drafts a PR or opens an issue.'
 branding:
   icon: 'compass'
   color: 'purple'
