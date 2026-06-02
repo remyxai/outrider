@@ -1441,6 +1441,105 @@ def preflight_routing(
     return data
 
 
+# ─── Deepresearch veto (REMYX-78) ──────────────────────────────────────────
+#
+# After preflight_routing decides PR or ISSUE, optionally call the engine's
+# /api/v1.0/deepresearch/paper-vs-repo endpoint to get a calibrated
+# {low, moderate, high} confidence verdict on the (paper, repo) match. The
+# engine spins up RepoRanger's deepresearch agent + judge — this is the
+# filter that catches false-positive Issues like salma-remyx/numpyro#3
+# where the ranker scored 1.00 but the paper and repo are in fundamentally
+# different problem classes.
+#
+# Mode is controlled by OUTRIDER_DEEPRESEARCH_VETO:
+#   - off (default): no call, no veto. Cost-safe.
+#   - shadow:        call the endpoint, log the verdict, but always publish.
+#                    Use this to measure precision lift before flipping on.
+#   - enforce:       call the endpoint; if verdict == 'low', skip the run.
+#
+# Latency is ~30-90s per call. Callers should gate invocation (we only
+# call when preflight has decided to publish — see process_target).
+
+
+def _deepresearch_veto_mode() -> str:
+    return os.environ.get("OUTRIDER_DEEPRESEARCH_VETO", "off").strip().lower()
+
+
+def deepresearch_veto_check(
+    rec: "Recommendation",
+    repo_url: str,
+    *,
+    candidate_id: str | None = None,
+    preflight_summary: str | None = None,
+    timeout_s: int = 120,
+) -> dict | None:
+    """Call the engine's deepresearch endpoint for a veto verdict.
+
+    Returns the parsed response dict on success, or None when:
+      - the feature is disabled (OUTRIDER_DEEPRESEARCH_VETO not set)
+      - the endpoint is unreachable / returns 5xx
+      - the response can't be parsed
+      - REMYX_API_KEY is missing
+
+    On None, the caller falls through to the regular path — a failed
+    deepresearch check never blocks publishing, it just doesn't save the
+    Claude budget. Mirrors the preflight_routing fail-soft convention.
+    """
+    mode = _deepresearch_veto_mode()
+    if mode not in ("shadow", "enforce"):
+        return None
+    if not rec.arxiv_id:
+        return None
+    api_key = (
+        os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY") or ""
+    ).strip()
+    if not api_key:
+        log.warning("  deepresearch veto: REMYX_API_KEY not set; skipping")
+        return None
+
+    payload = {
+        "arxiv_url": f"https://arxiv.org/abs/{rec.arxiv_id}",
+        "github_url": repo_url,
+        "candidate_id": candidate_id or rec.arxiv_id,
+        "ranker_score": rec.relevance_score,
+        "preflight_summary": (preflight_summary or "")[:1000],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{REMYX_API_BASE}/api/v1.0/deepresearch/paper-vs-repo",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "feature-finder-orchestrator",
+        },
+        method="POST",
+    )
+    t0 = time.time()
+    log.info(f"  → deepresearch veto check (mode={mode}, ~30-90s)")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        log.warning(
+            f"  deepresearch veto: HTTP {e.code} after "
+            f"{time.time() - t0:.1f}s; falling through"
+        )
+        return None
+    except Exception as e:
+        log.warning(
+            f"  deepresearch veto: {type(e).__name__} after "
+            f"{time.time() - t0:.1f}s; falling through: {str(e)[:200]}"
+        )
+        return None
+    log.info(
+        f"  deepresearch verdict: {data.get('confidence', '?')} "
+        f"({(data.get('rationale') or '')[:120]})"
+    )
+    data["_mode"] = mode
+    return data
+
+
 def _render_candidate_brief(candidates: list[Recommendation]) -> str:
     """Numbered, relevance-ranked brief of the candidate pool for the
     selection pass. Index matches list position so the model's
@@ -2328,6 +2427,8 @@ def process_target(target: Target) -> dict:
                                             open PR (or a mix of open PRs/Issues)
         skipped_issue_exists              — every candidate already has an
                                             open Remyx Issue
+        skipped_by_deepresearch           — deepresearch veto (REMYX-78):
+                                            confidence=low in enforce mode
 
         issue_opened_preflight            — pre-flight (§6) routed to Issue
                                             before invoking implementation
@@ -2505,6 +2606,36 @@ def process_target(target: Target) -> dict:
         result["preflight_decision"] = (
             preflight.get("decision") if preflight else "(skipped)"
         )
+
+        # 5.6. Deepresearch veto (REMYX-78). On candidates that pre-flight
+        # has decided to publish, optionally call the engine's deepresearch
+        # endpoint for a calibrated {low, moderate, high} verdict. Catches
+        # the ranker-high / pre-flight-hedged false-positive shape (e.g.
+        # salma-remyx/numpyro#3). Mode is set by OUTRIDER_DEEPRESEARCH_VETO
+        # (off | shadow | enforce). Failures fall through — never block a
+        # publish.
+        if preflight and preflight.get("decision") in ("PR", "ISSUE"):
+            dr = deepresearch_veto_check(
+                rec,
+                repo_url=f"https://github.com/{target.repo}",
+                candidate_id=rec.arxiv_id,
+                preflight_summary=(preflight.get("reasoning") or "")[:1000],
+            )
+            if dr:
+                result["deepresearch_confidence"] = dr.get("confidence")
+                result["deepresearch_rationale"] = dr.get("rationale")
+                result["deepresearch_mode"] = dr.get("_mode")
+                if (
+                    dr.get("_mode") == "enforce"
+                    and dr.get("confidence") == "low"
+                ):
+                    result["status"] = "skipped_by_deepresearch"
+                    log.info(
+                        f"  ✗ skipped_by_deepresearch: confidence=low "
+                        f"({(dr.get('rationale') or '')[:120]})"
+                    )
+                    return result
+
         if preflight and preflight.get("decision") == "ISSUE":
             issue_title_inner = (
                 preflight.get("issue_title")
@@ -2965,6 +3096,7 @@ def _write_step_summary(result: dict) -> None:
         "skipped_rate_limit":      "⏭️",
         "skipped_pr_exists":       "⏭️",
         "skipped_issue_exists":    "⏭️",
+        "skipped_by_deepresearch": "⏭️",
         "skipped_test_failure":    "⏭️",
         "claude_failed":           "❌",
         "rejected_path_violations":"❌",
