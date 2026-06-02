@@ -2624,6 +2624,8 @@ def process_target(target: Target) -> dict:
             if dr:
                 result["deepresearch_confidence"] = dr.get("confidence")
                 result["deepresearch_rationale"] = dr.get("rationale")
+                result["deepresearch_synth_excerpt"] = dr.get("synth_excerpt") or ""
+                result["deepresearch_log_id"] = dr.get("log_id") or ""
                 result["deepresearch_mode"] = dr.get("_mode")
                 if (
                     dr.get("_mode") == "enforce"
@@ -3122,6 +3124,30 @@ def _write_step_summary(result: dict) -> None:
         lines.append("<details><summary>Why this paper</summary>\n")
         lines.append(f"\n{reasoning}\n")
         lines.append("\n</details>\n")
+
+    # Deepresearch assessment — surfaces the calibrated paper-vs-repo
+    # verdict when the deepresearch veto ran (shadow or enforce). Helps
+    # the maintainer judge whether to act on an Issue, and explains why
+    # a skipped_by_deepresearch run produced no Issue/PR.
+    dr_confidence = result.get("deepresearch_confidence")
+    if dr_confidence:
+        dr_rationale = (result.get("deepresearch_rationale") or "").strip()
+        dr_excerpt = (result.get("deepresearch_synth_excerpt") or "").strip()
+        dr_mode = result.get("deepresearch_mode") or ""
+        conf_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}.get(
+            dr_confidence, "ℹ️"
+        )
+        lines.append("\n**Deepresearch assessment**\n")
+        mode_suffix = f" _(mode: {dr_mode})_" if dr_mode else ""
+        lines.append(
+            f"- **Confidence**: {conf_emoji} `{dr_confidence}`{mode_suffix}"
+        )
+        if dr_rationale:
+            lines.append(f"- _{dr_rationale}_")
+        if dr_excerpt:
+            lines.append("\n<details><summary>Excerpt from the analysis</summary>\n")
+            lines.append(f"\n{dr_excerpt}\n")
+            lines.append("\n</details>\n")
 
     # Cost telemetry — the headline reason this summary exists.
     token_line = f"{in_tok:,} in / {out_tok:,} out"

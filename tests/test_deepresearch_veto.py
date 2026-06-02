@@ -112,6 +112,51 @@ def test_veto_falls_through_on_http_error(monkeypatch):
     assert result is None
 
 
+def test_step_summary_renders_deepresearch_assessment(monkeypatch, tmp_path):
+    """When result carries deepresearch_* fields, _write_step_summary should
+    render a 'Deepresearch assessment' block with confidence + rationale +
+    excerpt."""
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+    result = {
+        "status": "issue_opened_preflight",
+        "paper": "Test Paper",
+        "arxiv": "2605.25734v1",
+        "tier": "high",
+        "issue_url": "https://github.com/o/r/issues/3",
+        "deepresearch_confidence": "low",
+        "deepresearch_rationale": "Different problem class — biomedical vs. PPL.",
+        "deepresearch_synth_excerpt": "The paper applies Stein identities to a supervised encoder; the repo uses them for posterior inference.",
+        "deepresearch_mode": "enforce",
+        "cost_usd": 0.0,
+    }
+    run._write_step_summary(result)
+    written = summary_file.read_text()
+    assert "Deepresearch assessment" in written
+    assert "`low`" in written
+    assert "Different problem class" in written
+    assert "Excerpt from the analysis" in written
+    assert "supervised encoder" in written
+    assert "mode: enforce" in written
+
+
+def test_step_summary_omits_deepresearch_section_when_absent(monkeypatch, tmp_path):
+    """When deepresearch didn't run (mode=off, default), the summary should
+    not include the assessment block."""
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+    result = {
+        "status": "pr_opened_draft",
+        "paper": "T",
+        "arxiv": "2605.25734v1",
+        "pr_url": "https://github.com/o/r/pull/4",
+        "cost_usd": 0.0,
+    }
+    run._write_step_summary(result)
+    written = summary_file.read_text()
+    assert "Deepresearch assessment" not in written
+
+
 def test_veto_sends_expected_payload(monkeypatch):
     """The endpoint receives arxiv_url + github_url + ranker_score +
     candidate_id + preflight_summary, with Bearer auth from REMYX_API_KEY."""
