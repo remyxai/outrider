@@ -157,6 +157,59 @@ def test_step_summary_omits_deepresearch_section_when_absent(monkeypatch, tmp_pa
     assert "Deepresearch assessment" not in written
 
 
+def test_augment_selection_rejected_with_existing_entries():
+    """LLM-enumerated rejections stay at the head; remaining viable
+    candidates fill the tail with a neutral marker."""
+    viable = [_make_rec(arxiv_id="A", score=0.99),  # selected
+              _make_rec(arxiv_id="B", score=0.98),  # already enumerated
+              _make_rec(arxiv_id="C", score=0.95),  # extra
+              _make_rec(arxiv_id="D", score=0.91)]  # extra
+    existing = [{"arxiv_id": "B", "title": "B-paper", "reason": "wrong layer"}]
+    out = run._augment_selection_rejected(
+        existing=existing, viable=viable, selected_arxiv="A"
+    )
+    assert [r["arxiv_id"] for r in out] == ["B", "C", "D"]
+    assert out[0]["reason"] == "wrong layer"
+    assert "not flagged by selection" in out[1]["reason"]
+    assert "0.95" in out[1]["reason"]
+
+
+def test_augment_selection_rejected_when_selection_unavailable():
+    """No LLM-enumerated rejections (single-candidate pool / fallback
+    path) → every other viable candidate becomes an extra."""
+    viable = [_make_rec(arxiv_id="A", score=0.99),  # selected
+              _make_rec(arxiv_id="B", score=0.96),
+              _make_rec(arxiv_id="C", score=0.93)]
+    out = run._augment_selection_rejected(
+        existing=[], viable=viable, selected_arxiv="A"
+    )
+    assert [r["arxiv_id"] for r in out] == ["B", "C"]
+    for entry in out:
+        assert "not flagged by selection" in entry["reason"]
+
+
+def test_augment_selection_rejected_caps_total():
+    """Combined list (LLM-rejected + extras) is capped to keep the
+    workflow step summary readable."""
+    viable = [_make_rec(arxiv_id=str(i), score=0.99 - i * 0.01) for i in range(10)]
+    out = run._augment_selection_rejected(
+        existing=[], viable=viable, selected_arxiv="0", cap=5
+    )
+    assert len(out) == 5
+    # Should be 1, 2, 3, 4, 5 — the next 5 after the selected "0"
+    assert [r["arxiv_id"] for r in out] == ["1", "2", "3", "4", "5"]
+
+
+def test_augment_selection_rejected_skips_selected_candidate():
+    """The selected candidate must never appear in the alternatives list."""
+    viable = [_make_rec(arxiv_id="A", score=0.99),
+              _make_rec(arxiv_id="B", score=0.97)]
+    out = run._augment_selection_rejected(
+        existing=[], viable=viable, selected_arxiv="A"
+    )
+    assert all(r["arxiv_id"] != "A" for r in out)
+
+
 def test_veto_sends_expected_payload(monkeypatch):
     """The endpoint receives arxiv_url + github_url + ranker_score +
     candidate_id + preflight_summary, with Bearer auth from REMYX_API_KEY."""

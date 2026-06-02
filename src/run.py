@@ -1540,6 +1540,40 @@ def deepresearch_veto_check(
     return data
 
 
+def _augment_selection_rejected(
+    *,
+    existing: list[dict],
+    viable: list["Recommendation"],
+    selected_arxiv: str,
+    cap: int = 5,
+) -> list[dict]:
+    """Add ranker-pool candidates the selection LLM didn't enumerate.
+
+    Keeps the existing entries (LLM-enumerated with their "why" reason)
+    at the head; appends tail entries for any other viable candidate not
+    yet listed and not the selected one. Tail entries get a neutral
+    marker so the reader can tell the difference from LLM-rejected ones.
+    Total list is capped to keep the workflow step summary readable.
+    """
+    listed_arxiv = {r.get("arxiv_id") for r in existing if r.get("arxiv_id")}
+    listed_arxiv.add(selected_arxiv)
+    extras: list[dict] = []
+    for cand in viable:
+        if cand.arxiv_id in listed_arxiv:
+            continue
+        extras.append({
+            "arxiv_id": cand.arxiv_id,
+            "title": cand.paper_title,
+            "reason": (
+                f"(ranker relevance {cand.relevance_score:.2f}; "
+                f"not flagged by selection)"
+            ),
+        })
+        if len(existing) + len(extras) >= cap:
+            break
+    return existing + extras
+
+
 def _render_candidate_brief(candidates: list[Recommendation]) -> str:
     """Numbered, relevance-ranked brief of the candidate pool for the
     selection pass. Index matches list position so the model's
@@ -2588,6 +2622,17 @@ def process_target(target: Target) -> dict:
             "tier": rec.tier,
             "candidates_considered": len(viable),
         })
+
+        # Extend selection_rejected with any viable candidates the
+        # selection pass didn't explicitly enumerate. Ensures the
+        # alternatives list is populated whether or not selection
+        # produced explicit reasoning and whether or not deepresearch ran.
+        result["selection_rejected"] = _augment_selection_rejected(
+            existing=result.get("selection_rejected") or [],
+            viable=viable,
+            selected_arxiv=rec.arxiv_id,
+        )
+
         log.info(f"  ✓ selected: [{rec.tier}] {rec.paper_title}")
 
         # 5. Spec bundle for the chosen candidate. Thread the selection
