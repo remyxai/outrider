@@ -2,6 +2,10 @@
 
 Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider picks the next paper most implementable against your codebase and either opens a draft PR wiring it into an existing call site, or starts a discussion Issue when a PR would be premature.
 
+<p align="center">
+  <img src="https://github.com/remyxai/outrider/releases/download/readme-assets/outrider-v1.gif" alt="Outrider demo" width="800">
+</p>
+
 ```yaml
 - uses: remyxai/outrider@v1
   with:
