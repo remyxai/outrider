@@ -483,65 +483,75 @@ __LAYOUT__
 
 _SELECTION_PROMPT_TEMPLATE = """\
 You are selecting which paper recommendation the Remyx Recommendation
-orchestrator should implement as a draft PR against the target repo.
+orchestrator should implement as a draft PR against the target repo
+(`__REPO_FULLNAME__`).
 
-You are given:
-  - a ranked list of candidate papers (ranked by Remyx relevance,
-    highest first),
-  - the target repo's module layout,
-  - a brief of the target repo's currently-open, maintainer-authored
-    Issues, which signals what the team is actively working on or
-    asking about right now.
+You are given a ranked candidate pool (top-N from the Remyx ranker)
+and the target repo's module layout. Relevance rank is NOT
+implementability: the top-ranked paper is frequently a model
+architecture or training method with no call site in a data / inference
+pipeline, while a lower-ranked candidate is a clean drop-in. Surface
+overlap with a repo's keywords does NOT mean methodological fit — two
+papers using "Stein's method" can belong to entirely different problem
+classes (e.g. supervised encoding vs. posterior inference).
 
-Relevance rank is NOT implementability: the top-ranked paper is
-frequently a model architecture or a training method with no call site
-in a data / inference pipeline, while a lower-ranked candidate is a
-clean drop-in.
+**Your job is to VERIFY before picking.** Use the tools below
+iteratively. For your most promising candidate(s):
+  - Find the call site you'd integrate into (`gh code-search` over the
+    repo to locate the relevant module / function).
+  - Read 1-2 lines of the actual code to confirm the integration shape
+    is what the paper assumes (`gh api repos/<repo>/contents/<path>`
+    or `curl -s https://raw.githubusercontent.com/<repo>/main/<path>`).
+  - Check whether the team is actively working on a thread the paper
+    extends (`gh issue list --repo <repo> --state open --search "..."`
+    or `gh issue view <n> --repo <repo>` for specific Issues).
 
-Pick the ONE candidate that maximizes the **product** of two axes:
+If after verification the pre-fetched candidates all turn out to be
+poor structural fits, you MAY broaden the search:
+  - `remyxai search query "<technique>"` — search the broader Remyx
+    catalog for papers in the same technique space
+  - `remyxai papers list --interest <uuid> --limit 20 --format json`
+    — pull a larger slice of the ranker's pool
 
-  1. **Implementability against THIS repo** — maps onto an existing
-     module / call site in the layout; ships its contribution as code
-     this repo would call; is NOT a model-to-train or architecture
-     needing infrastructure absent from the layout.
+But default to picking from the candidates below unless verification
+shows none of them fit. Returning `chosen_index: -1` is allowed when
+every candidate fails verification — you must then explain why in
+`reasoning`.
 
-  2. **Alignment with active maintainer concerns** — addresses one of
-     the currently-open Issues, or extends a thread the team is
-     actively iterating on. A candidate that maps a known open
-     maintainer concern onto a clean call site is the strongest
-     possible pick.
+Tools available:
+  - `gh code-search "<query>" --repo <repo>` — find call sites
+  - `gh api repos/<repo>/contents/<path>` — read a file by path
+  - `gh issue list/view` — see open maintainer concerns
+  - `remyxai papers list/get` — inspect the ranker pool with reasoning
+  - `remyxai interests get` — see the interest's project-summary context
+  - `remyxai search query` — broaden beyond the pool if needed
 
-If two candidates tie on implementability but only one aligns with an
-open Issue, prefer that one. If a candidate addresses an open Issue
-but has no clean call site, still down-rank it — the goal is a focused
-implementable PR, not an aspirational sketch.
-
-You have these CLI tools available if you need richer context (do not
-overuse — most picks should be obvious from the brief alone):
-
-  - `remyxai papers list --interest <uuid> --limit N --format json`
-    inspect the full ranker pool with reasoning
-  - `remyxai interests get <uuid> --format json`
-    see the interest's project-summary context
-  - `gh issue view <number> --repo <owner/name>`
-    expand a specific Issue if its title alone is ambiguous
-  - `gh issue list --repo <owner/name> --search "<query>" --json number,title,state`
-    search Issues by keyword (e.g. an arxiv ID, a paper name)
+Stop iterating once you have enough evidence to pick (verified one
+candidate fits) OR to reject all (every candidate has a structural
+mismatch). Don't burn turns on diminishing returns.
 
 Output a single JSON object. Start with `{` and end with `}`. No Markdown
 fences, no prose before or after. Schema:
 
 {
-  "chosen_index": <integer index into the candidate list below>,
-  "reasoning": "<2-3 sentences: why this candidate is the most directly
-                 implementable against this repo, naming the call site;
-                 if it aligns with a maintainer Issue, name the Issue
-                 number>",
+  "chosen_index": <integer index into the candidate list below, or -1
+                   if every candidate failed verification>,
+  "chosen_call_site": "<the specific path:function you verified the
+                        paper plugs into; omit when chosen_index = -1>",
+  "verification_summary": "<one line: what you actually verified to
+                            pick this — e.g. 'gh code-search confirmed
+                            torchtune/training/quantization/_quantize.py
+                            hosts the bit-allocation step the paper
+                            extends'>",
+  "reasoning": "<2-3 sentences: why this candidate's contribution maps
+                 cleanly onto the verified call site; cite an Issue
+                 number if alignment surfaced one>",
   "rejected": [
-    {"index": <int>, "why": "<one line: why this candidate is a worse fit
-                              to implement now, e.g. needs a trainer the
-                              repo lacks, or no Issue alignment when a
-                              tied alternative has one>"}
+    {"index": <int>, "why": "<one line: why this candidate fails
+                              verification — e.g. 'paper assumes a
+                              trainer the repo lacks', or 'shared
+                              keyword but different problem class
+                              (verified via <path>)'>"}
   ]
 }
 
@@ -552,10 +562,6 @@ __CANDIDATES__
 --- Repo layout (top-level modules in the target package + tests) ---
 
 __LAYOUT__
-
---- Currently-open maintainer-authored Issues (most recently updated first) ---
-
-__ISSUES__
 """
 
 _SELF_REVIEW_PROMPT_TEMPLATE = """\
@@ -1371,7 +1377,7 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
 
 
 def _run_claude_oneshot(
-    workdir: Path, prompt: str, timeout_s: int
+    workdir: Path, prompt: str, timeout_s: int, max_turns: int | None = None
 ) -> tuple[bool, str]:
     """Run the Claude CLI headless with `prompt` and return (ok, stdout).
 
@@ -1379,10 +1385,14 @@ def _run_claude_oneshot(
     expect a JSON object back, not a full code-generation session.
     Failures here are non-fatal: the orchestrator falls through to the
     normal implementation flow.
+
+    `max_turns` caps tool-use rounds for agentic flows (selection now uses
+    this to bound spend). None = no cap (matches prior behavior).
     """
-    return _run_claude_json(
-        ["claude", "--dangerously-skip-permissions"], prompt, workdir, timeout_s
-    )
+    cmd = ["claude", "--dangerously-skip-permissions"]
+    if max_turns is not None:
+        cmd += ["--max-turns", str(max_turns)]
+    return _run_claude_json(cmd, prompt, workdir, timeout_s)
 
 
 def _extract_json_object(s: str) -> dict | None:
@@ -1495,40 +1505,6 @@ def _render_candidate_brief(candidates: list[Recommendation]) -> str:
     return "\n\n".join(blocks)
 
 
-def _fetch_target_issues_brief(target: "Target", limit: int = 25) -> str:
-    """Compact brief of the target repo's currently-open, maintainer-authored Issues.
-
-    Filters out:
-      - PRs (the Issues endpoint mixes them in)
-      - `[Remyx Recommendation]` bot-authored Issues (selection should
-        align with human concerns, not the orchestrator's past output)
-      - Closed Issues (they may be obsolete, resolved, or rejected; only
-        open Issues are currently-actionable maintainer concerns)
-
-    Returns "(none — ...)" on empty / failure so the selection prompt still
-    renders; selection falls back to layout-only reasoning in that case.
-    """
-    try:
-        items = gh_api(
-            "GET",
-            f"/repos/{target.repo}/issues?state=open&per_page={limit}&sort=updated",
-        ) or []
-    except Exception as e:
-        log.warning(f"  issue-brief fetch failed: {str(e)[:120]}")
-        return "(none — could not fetch Issues from GitHub API)"
-    rows = []
-    for it in items:
-        if it.get("pull_request"):
-            continue
-        title = (it.get("title") or "").strip()
-        if title.startswith(PR_TITLE_PREFIX) or "[Remyx Recommendation]" in title:
-            continue
-        rows.append(f"  #{it.get('number')}  {title[:120]}")
-    if not rows:
-        return "(none — no open human-authored Issues)"
-    return "\n".join(rows)
-
-
 def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
     target: "Target | None" = None,
@@ -1550,19 +1526,24 @@ def select_recommendation(
     if len(candidates) <= 1:
         return None
     layout = _repo_layout_manifest(workdir, package)
-    issues_brief = (
-        _fetch_target_issues_brief(target)
-        if target is not None
-        else "(none — target not provided to selection pass)"
-    )
+    repo_fullname = target.repo if target is not None else "<unknown>"
     prompt = (
         _SELECTION_PROMPT_TEMPLATE
+        .replace("__REPO_FULLNAME__", repo_fullname)
         .replace("__CANDIDATES__", _render_candidate_brief(candidates))
         .replace("__LAYOUT__", layout)
-        .replace("__ISSUES__", issues_brief)
     )
-    log.info(f"  → selection pass over {len(candidates)} candidates")
-    ok, output = _run_claude_oneshot(workdir, prompt, timeout_s)
+    # Bound the agentic flow — selection is verification, not a full
+    # implementation session. 25 turns covers a few `gh code-search` +
+    # file-read rounds across multiple candidates + the final JSON;
+    # observed via eval that 15 is too tight on repos with zero open
+    # Issues (the loop spends turns hunting context that doesn't exist).
+    max_turns = int(os.environ.get("REMYX_SELECTION_MAX_TURNS", "25"))
+    log.info(
+        f"  → agentic selection over {len(candidates)} candidates "
+        f"(max-turns={max_turns})"
+    )
+    ok, output = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=max_turns)
     if not ok:
         log.warning(f"  selection call failed: {output[:200]}; "
                     f"falling back to top-ranked candidate")
@@ -1577,6 +1558,16 @@ def select_recommendation(
         log.warning(f"  selection: chosen_index not an int "
                     f"({data.get('chosen_index')!r}); falling back")
         return None
+    # Agentic selection may explicitly reject every candidate after
+    # verification (returns chosen_index: -1). Surface as a structured
+    # signal — the caller treats it as "skip this run" rather than
+    # falling back to the top-ranked candidate (the whole point of the
+    # verification step is that the candidates failed it).
+    if idx == -1:
+        log.info(f"  selection: every candidate failed verification — "
+                 f"{(data.get('reasoning') or '')[:160]}")
+        data["chosen_index"] = -1
+        return data
     if not (0 <= idx < len(candidates)):
         log.warning(f"  selection: chosen_index {idx} out of range "
                     f"[0,{len(candidates)}); falling back")
@@ -2419,6 +2410,11 @@ def process_target(target: Target) -> dict:
                                             orphan, unreachable from production
 
         rejected_path_violations          — Claude touched out-of-bounds paths
+        skipped_by_selection_verification — agentic selection verified every
+                                            ranker candidate and rejected
+                                            them all (structural mismatch
+                                            against the repo's actual
+                                            modules)
         skipped_test_failure              — draft_mode=never and tests failed
         claude_failed                     — Claude CLI exited non-zero
 
@@ -2524,6 +2520,17 @@ def process_target(target: Target) -> dict:
             log.info(f"  ✓ pinned candidate [{pinned_idx}] {rec.paper_title[:50]}…")
         else:
             selection = select_recommendation(workdir, package, viable, target=target)
+            if selection is not None and selection.get("chosen_index") == -1:
+                # Agentic selection rejected every candidate after verification.
+                # The honest signal is "skip this run" — not "fall back to the
+                # top-ranked candidate," because that's precisely what
+                # verification just rejected.
+                result["status"] = "skipped_by_selection_verification"
+                result["selection_reasoning"] = selection.get("reasoning", "")
+                result["selection_rejected"] = selection.get("rejected") or []
+                log.info("  ✗ skipped_by_selection_verification: every "
+                         "candidate failed verification")
+                return result
             if selection is not None:
                 rec = viable[selection["chosen_index"]]
                 result["selection_reasoning"] = selection.get("reasoning", "")
@@ -3043,6 +3050,7 @@ def _write_step_summary(result: dict) -> None:
         "skipped_rate_limit":      "⏭️",
         "skipped_pr_exists":       "⏭️",
         "skipped_issue_exists":    "⏭️",
+        "skipped_by_selection_verification": "⏭️",
         "skipped_test_failure":    "⏭️",
         "claude_failed":           "❌",
         "rejected_path_violations":"❌",
