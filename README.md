@@ -86,6 +86,8 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 | `test-integration-policy` | `strict` | `strict` (demote to Issue if new tests don't import an existing module) / `soft` (open draft PR with warning) / `off` (skip the gate). Use `soft` for layer/component repos where standalone modules are the contribution. |
 | `lookback` | `week` | Candidate pool window: `today` / `week` / `month` |
 | `candidate-pool` | `25` | How many candidates the selection pass picks from |
+| `claude-timeout` | `900` | Wall-clock seconds for the Claude Code implementation step. Bump for very large repos; lower to cap cost. |
+| `pin-arxiv` | `''` | Optional `arxiv_id`. When set and present in the candidate pool, the action implements that exact paper and skips the selection pass — use it for reproducible eval re-runs. Empty = normal selection. |
 
 ## Outputs
 
@@ -108,7 +110,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 
 <details>
-<summary><b>Status codes</b> (16 outcomes)</summary>
+<summary><b>Status codes</b> (17 outcomes)</summary>
 
 | Status | Meaning |
 |---|---|
@@ -138,7 +140,7 @@ At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 **Allowed paths** (defaults):
 - `*.py` — any Python source, anywhere in the repo
 - `.remyx-recommendation/**` — the spec bundle (scrubbed before commit)
-- `README.md` — append-only attribution section
+- `**/*.md` — Markdown anywhere (README, CHANGELOG, docs/, ADR notes); the 50-line edit cap still applies to existing files
 
 **Always blocked** by *role* (filename/type), not directory:
 - `.github/**` — CI / workflow config
