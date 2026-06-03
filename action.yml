@@ -157,9 +157,9 @@ runs:
         npm install -g @anthropic-ai/claude-code
         claude --version
 
-    - name: Install pytest (orchestrator runs target's tests as part of validation)
+    - name: Install pytest + remyxai CLI (validation + selection-pass tool-use)
       shell: bash
-      run: pip install pytest
+      run: pip install pytest remyxai
 
     - name: Configure git identity
       shell: bash

@@ -63,6 +63,12 @@ from typing import Any
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
+# Mirror REMYX_API_KEY → REMYXAI_API_KEY so the `remyxai` CLI authenticates
+# in subprocesses spawned by the selection pass (Claude Code shell-out). The
+# CLI reads REMYXAI_API_KEY; the action canonically uses REMYX_API_KEY.
+if os.environ.get("REMYX_API_KEY") and not os.environ.get("REMYXAI_API_KEY"):
+    os.environ["REMYXAI_API_KEY"] = os.environ["REMYX_API_KEY"]
+
 REMYX_API_BASE = os.environ.get("REMYX_API_BASE", "https://engine.remyx.ai")
 REMYX_RECOMMENDATION_PERIOD = os.environ.get("REMYX_RECOMMENDATION_PERIOD", "week")
 REMYX_RECOMMENDATION_LIMIT = int(os.environ.get("REMYX_RECOMMENDATION_LIMIT", "25"))
@@ -479,24 +485,48 @@ _SELECTION_PROMPT_TEMPLATE = """\
 You are selecting which paper recommendation the Remyx Recommendation
 orchestrator should implement as a draft PR against the target repo.
 
-You are given a ranked list of candidate papers (ranked by Remyx
-relevance, highest first) and the target repo's module layout. Relevance
-rank is NOT implementability: the top-ranked paper is frequently a model
-architecture or a training method with no call site in a data / inference
-pipeline, while a lower-ranked candidate is a clean drop-in.
+You are given:
+  - a ranked list of candidate papers (ranked by Remyx relevance,
+    highest first),
+  - the target repo's module layout,
+  - a brief of the target repo's currently-open, maintainer-authored
+    Issues, which signals what the team is actively working on or
+    asking about right now.
 
-Pick the ONE candidate that is most directly implementable as a focused
-PR against THIS repo. Prefer a candidate that:
-  - maps onto an existing module / call site visible in the layout,
-  - is a pipeline / data-generation / eval change the repo can actually
-    host (not a new trainer, model architecture, or checkpoint the repo
-    has no loader for),
-  - ships its contribution as code this repo would call, rather than a
-    freestanding module nothing imports.
+Relevance rank is NOT implementability: the top-ranked paper is
+frequently a model architecture or a training method with no call site
+in a data / inference pipeline, while a lower-ranked candidate is a
+clean drop-in.
 
-Down-rank candidates whose primary contribution is a model to be trained,
-an architecture, or anything needing infrastructure absent from the
-layout — even when they rank higher by relevance.
+Pick the ONE candidate that maximizes the **product** of two axes:
+
+  1. **Implementability against THIS repo** — maps onto an existing
+     module / call site in the layout; ships its contribution as code
+     this repo would call; is NOT a model-to-train or architecture
+     needing infrastructure absent from the layout.
+
+  2. **Alignment with active maintainer concerns** — addresses one of
+     the currently-open Issues, or extends a thread the team is
+     actively iterating on. A candidate that maps a known open
+     maintainer concern onto a clean call site is the strongest
+     possible pick.
+
+If two candidates tie on implementability but only one aligns with an
+open Issue, prefer that one. If a candidate addresses an open Issue
+but has no clean call site, still down-rank it — the goal is a focused
+implementable PR, not an aspirational sketch.
+
+You have these CLI tools available if you need richer context (do not
+overuse — most picks should be obvious from the brief alone):
+
+  - `remyxai papers list --interest <uuid> --limit N --format json`
+    inspect the full ranker pool with reasoning
+  - `remyxai interests get <uuid> --format json`
+    see the interest's project-summary context
+  - `gh issue view <number> --repo <owner/name>`
+    expand a specific Issue if its title alone is ambiguous
+  - `gh issue list --repo <owner/name> --search "<query>" --json number,title,state`
+    search Issues by keyword (e.g. an arxiv ID, a paper name)
 
 Output a single JSON object. Start with `{` and end with `}`. No Markdown
 fences, no prose before or after. Schema:
@@ -504,11 +534,14 @@ fences, no prose before or after. Schema:
 {
   "chosen_index": <integer index into the candidate list below>,
   "reasoning": "<2-3 sentences: why this candidate is the most directly
-                 implementable against this repo, naming the call site>",
+                 implementable against this repo, naming the call site;
+                 if it aligns with a maintainer Issue, name the Issue
+                 number>",
   "rejected": [
     {"index": <int>, "why": "<one line: why this candidate is a worse fit
                               to implement now, e.g. needs a trainer the
-                              repo lacks>"}
+                              repo lacks, or no Issue alignment when a
+                              tied alternative has one>"}
   ]
 }
 
@@ -519,6 +552,10 @@ __CANDIDATES__
 --- Repo layout (top-level modules in the target package + tests) ---
 
 __LAYOUT__
+
+--- Currently-open maintainer-authored Issues (most recently updated first) ---
+
+__ISSUES__
 """
 
 _SELF_REVIEW_PROMPT_TEMPLATE = """\
@@ -1458,8 +1495,43 @@ def _render_candidate_brief(candidates: list[Recommendation]) -> str:
     return "\n\n".join(blocks)
 
 
+def _fetch_target_issues_brief(target: "Target", limit: int = 25) -> str:
+    """Compact brief of the target repo's currently-open, maintainer-authored Issues.
+
+    Filters out:
+      - PRs (the Issues endpoint mixes them in)
+      - `[Remyx Recommendation]` bot-authored Issues (selection should
+        align with human concerns, not the orchestrator's past output)
+      - Closed Issues (they may be obsolete, resolved, or rejected; only
+        open Issues are currently-actionable maintainer concerns)
+
+    Returns "(none — ...)" on empty / failure so the selection prompt still
+    renders; selection falls back to layout-only reasoning in that case.
+    """
+    try:
+        items = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues?state=open&per_page={limit}&sort=updated",
+        ) or []
+    except Exception as e:
+        log.warning(f"  issue-brief fetch failed: {str(e)[:120]}")
+        return "(none — could not fetch Issues from GitHub API)"
+    rows = []
+    for it in items:
+        if it.get("pull_request"):
+            continue
+        title = (it.get("title") or "").strip()
+        if title.startswith(PR_TITLE_PREFIX) or "[Remyx Recommendation]" in title:
+            continue
+        rows.append(f"  #{it.get('number')}  {title[:120]}")
+    if not rows:
+        return "(none — no open human-authored Issues)"
+    return "\n".join(rows)
+
+
 def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
+    target: "Target | None" = None,
     timeout_s: int = 180,
 ) -> dict | None:
     """Claude pass that picks the most implementable candidate from the
@@ -1478,10 +1550,16 @@ def select_recommendation(
     if len(candidates) <= 1:
         return None
     layout = _repo_layout_manifest(workdir, package)
+    issues_brief = (
+        _fetch_target_issues_brief(target)
+        if target is not None
+        else "(none — target not provided to selection pass)"
+    )
     prompt = (
         _SELECTION_PROMPT_TEMPLATE
         .replace("__CANDIDATES__", _render_candidate_brief(candidates))
         .replace("__LAYOUT__", layout)
+        .replace("__ISSUES__", issues_brief)
     )
     log.info(f"  → selection pass over {len(candidates)} candidates")
     ok, output = _run_claude_oneshot(workdir, prompt, timeout_s)
@@ -2445,7 +2523,7 @@ def process_target(target: Target) -> dict:
             )
             log.info(f"  ✓ pinned candidate [{pinned_idx}] {rec.paper_title[:50]}…")
         else:
-            selection = select_recommendation(workdir, package, viable)
+            selection = select_recommendation(workdir, package, viable, target=target)
             if selection is not None:
                 rec = viable[selection["chosen_index"]]
                 result["selection_reasoning"] = selection.get("reasoning", "")
