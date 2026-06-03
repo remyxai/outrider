@@ -187,7 +187,7 @@ Pre-flight Claude pass: PR or Issue?
                      Commit (bundle scrubbed) + push + open draft PR
 ```
 
-The Remyx engine (commit-history extraction, candidate pool, embedding pre-filter, Gemini ranking) runs server-side. This action is a pure consumer.
+The Remyx engine (commit-history extraction, candidate pool, embedding pre-filter, ranking) runs server-side. This action is a pure consumer.
 
 </details>
 
