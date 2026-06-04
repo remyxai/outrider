@@ -540,16 +540,28 @@ though both invoke "Stein's method" — the I/O contracts are different
 problem classes.
 
 If after verification the pre-fetched candidates all turn out to be
-poor structural fits, you MAY broaden the search:
-  - `remyxai search query "<technique>"` — search the broader Remyx
-    catalog for papers in the same technique space
+poor structural fits, broaden the search:
+  - `remyxai search query "<technique_or_paper_name>"` — search the
+    broader Remyx catalog for papers in the same technique space
   - `remyxai papers list --interest <uuid> --limit 20 --format json`
     — pull a larger slice of the ranker's pool
 
-But default to picking from the candidates below unless verification
-shows none of them fit. Returning `chosen_index: -1` is allowed when
-every candidate fails verification — you must then explain why in
-`reasoning`.
+When the broader catalog surfaces a candidate that satisfies one of the
+three integration shapes — especially when a maintainer thread (an open
+Issue, an active PR discussion) names a specific paper that the pool
+doesn't contain — you MAY return it as an **out-of-pool pick** using
+the extended schema below (`chosen_index: -2`).
+
+The verification bar for out-of-pool picks is STRICTER than for
+in-pool: the search result must explicitly match the contract the
+maintainer thread (or the search query's intent) asks for — not merely
+thematically related. If the search returns nothing that satisfies the
+bar, fall back to `chosen_index: -1`.
+
+Default to picking from the candidates below when one fits cleanly.
+Returning `chosen_index: -1` is allowed when every in-pool candidate
+fails verification AND no out-of-pool candidate cleanly satisfies the
+verification bar — explain why in `reasoning`.
 
 Tools available:
   - `gh code-search "<query>" --repo <repo>` — find call sites
@@ -568,22 +580,33 @@ Output a single JSON object. Start with `{` and end with `}`. No Markdown
 fences, no prose before or after. Schema:
 
 {
-  "chosen_index": <integer index into the candidate list below, or -1
-                   if every candidate failed verification>,
+  "chosen_index": <integer index into the candidate list below,
+                   -1 if every candidate failed verification,
+                   -2 if you surfaced an out-of-pool candidate via
+                       `remyxai search query` that cleanly fits>,
   "chosen_call_site": "<the specific path:function you verified the
                         paper plugs into for `addition`, or the existing
                         component(s) being replaced for `replacement` /
                         `simplification`; omit when chosen_index = -1>",
+  "external_arxiv_id": "<arxiv_id of the out-of-pool paper; REQUIRED
+                         when chosen_index = -2, omit otherwise>",
+  "external_title": "<title of the out-of-pool paper from the search
+                      result; REQUIRED when chosen_index = -2>",
+  "external_query_used": "<the `remyxai search query` argument you
+                           actually ran to surface it; REQUIRED when
+                           chosen_index = -2>",
   "integration_shape": "addition" | "replacement" | "simplification"
                        (omit when chosen_index = -1),
   "contract_match": "<one line — REQUIRED for replacement /
-                      simplification: how the existing component's I/O
-                      contract and the paper's contract align (and where
-                      they don't). Omit for addition.>",
+                      simplification AND for any chosen_index = -2:
+                      how the existing component's I/O contract and the
+                      paper's contract align (and where they don't).
+                      Omit for in-pool addition.>",
   "migration_cost": "<one line — REQUIRED for replacement /
-                      simplification: list of files that would change in
-                      a real swap (factory function, requirements,
-                      tests, docs). Omit for addition.>",
+                      simplification AND for any chosen_index = -2:
+                      list of files that would change in a real swap
+                      (factory function, requirements, tests, docs).
+                      Omit for in-pool addition.>",
   "verification_summary": "<one line: what you actually verified to
                             pick this — e.g. 'gh code-search confirmed
                             torchtune/training/quantization/_quantize.py
@@ -1608,6 +1631,29 @@ def select_recommendation(
         log.warning(f"  selection: chosen_index not an int "
                     f"({data.get('chosen_index')!r}); falling back")
         return None
+    # Agentic selection may surface an out-of-pool candidate via
+    # broadening-search (chosen_index: -2). Validate the required
+    # external_* fields are present; if they're missing, the agent
+    # tried to use the extended schema but didn't honor the contract —
+    # treat as a malformed selection and fall back to skip.
+    if idx == -2:
+        external_arxiv = (data.get("external_arxiv_id") or "").strip()
+        external_title = (data.get("external_title") or "").strip()
+        external_query = (data.get("external_query_used") or "").strip()
+        if not external_arxiv or not external_title:
+            log.warning(
+                f"  selection: chosen_index=-2 but missing required "
+                f"external_* fields "
+                f"(arxiv={external_arxiv!r}, title={external_title!r}); "
+                f"falling back to skip-by-verification"
+            )
+            data["chosen_index"] = -1
+            return data
+        log.info(
+            f"  selection: external pick {external_arxiv} "
+            f"'{external_title[:60]}' via query {external_query!r}"
+        )
+        return data
     # Agentic selection may explicitly reject every candidate after
     # verification (returns chosen_index: -1). Surface as a structured
     # signal — the caller treats it as "skip this run" rather than
@@ -2461,6 +2507,47 @@ def _enrich_selection_rejected(
     return enriched
 
 
+def _resolve_external_candidate(selection: dict) -> "Recommendation | None":
+    """Construct a synthetic Recommendation from the selection pass's
+    external_* fields. Used when chosen_index = -2 — selection surfaced
+    an out-of-pool candidate via `remyxai search query`.
+
+    The minimum required fields (arxiv_id, paper_title) come from the
+    search hit; the rest are filled with reasonable defaults. There's no
+    engine `paper` envelope to consult, so no relevance_score / tier from
+    the ranker — these are deliberately marked as broadening-search
+    provenance so downstream consumers can distinguish external from
+    in-pool picks.
+
+    Returns None when the required external_* fields are missing — caller
+    should fall back to `chosen_index: -1` semantics in that case.
+    """
+    arxiv = (selection.get("external_arxiv_id") or "").strip()
+    title = (selection.get("external_title") or "").strip()
+    query = (selection.get("external_query_used") or "").strip()
+    if not arxiv or not title:
+        return None
+    return Recommendation(
+        paper_title=title,
+        arxiv_id=arxiv,
+        tier="high",          # external picks are deliberate; signal is strong
+        z_score=0.0,          # legacy field; unused
+        spec_md="",           # legacy field; unused
+        paper_abstract="",
+        domain_summary="",
+        raw_paper_md="",
+        relevance_score=0.0,  # not from ranker
+        reasoning=(
+            f"External pick surfaced via `remyxai search query "
+            f"{query!r}` — not in the engine's recommendation pool for "
+            f"this interest, but verified to match the contract the "
+            f"selection pass identified."
+        ),
+        suggested_experiment="(see contract_match + migration_cost below)",
+        interest_name="(via broadening-search)",
+    )
+
+
 def process_target(target: Target) -> dict:
     """Run the full discovery + implementation loop for one target.
     Returns a status dict suitable for logging / Slack notify.
@@ -2492,10 +2579,13 @@ def process_target(target: Target) -> dict:
         issue_opened_substitution         — agentic selection identified a
                                             replacement / pipeline-
                                             simplification candidate (vs.
-                                            additive drop-in); routed to
-                                            Issue because the swap needs
-                                            dep changes the PR guardrails
-                                            block
+                                            additive drop-in), OR
+                                            surfaced an out-of-pool
+                                            candidate via broadening-
+                                            search (chosen_index = -2);
+                                            routed to Issue because the
+                                            swap needs dep changes the
+                                            PR guardrails block
 
         rejected_path_violations          — Claude touched out-of-bounds paths
         skipped_by_selection_verification — agentic selection verified every
@@ -2620,6 +2710,76 @@ def process_target(target: Target) -> dict:
                 )
                 log.info("  ✗ skipped_by_selection_verification: every "
                          "candidate failed verification")
+                return result
+            if selection is not None and selection.get("chosen_index") == -2:
+                # External pick — selection surfaced an out-of-pool candidate
+                # via broadening-search. Construct a synthetic Recommendation
+                # from the external_* fields and route straight to an
+                # `issue_opened_substitution` Issue (PR track is blocked by
+                # guardrails for any out-of-pool candidate; deps change).
+                external_rec = _resolve_external_candidate(selection)
+                if external_rec is None:
+                    # Defensive — select_recommendation already validates the
+                    # external_* fields are present, so this branch is reached
+                    # only on programmer error.
+                    result["status"] = "skipped_by_selection_verification"
+                    result["selection_reasoning"] = (
+                        "(external pick proposed but required external_* "
+                        "fields were missing)"
+                    )
+                    return result
+                rec = external_rec
+                result["selection_reasoning"] = selection.get("reasoning", "")
+                result["selection_rejected"] = _enrich_selection_rejected(
+                    selection.get("rejected") or [], viable
+                )
+                result["selection_external_arxiv_id"] = (
+                    selection.get("external_arxiv_id", "")
+                )
+                result["selection_external_query_used"] = (
+                    selection.get("external_query_used", "")
+                )
+                shape = (selection.get("integration_shape") or "simplification").lower().strip()
+                result["selection_integration_shape"] = shape
+                shape_label = {
+                    "addition":       "out-of-pool addition",
+                    "replacement":    "out-of-pool drop-in replacement",
+                    "simplification": "out-of-pool pipeline simplification",
+                }.get(shape, "out-of-pool substitution")
+                contract_match = selection.get("contract_match", "")
+                migration_cost = selection.get("migration_cost", "")
+                detail = (
+                    f"**Integration shape**: {shape_label}\n\n"
+                    f"**Contract match**: {contract_match or '(none reported)'}\n\n"
+                    f"**Migration cost**: {migration_cost or '(none reported)'}\n\n"
+                    f"_Selection reasoning_: {selection.get('reasoning', '')}\n\n"
+                    f"This candidate was surfaced via `remyxai search query "
+                    f"{selection.get('external_query_used', '')!r}` — it is NOT "
+                    f"in the engine's recommendation pool for this interest. "
+                    f"The selection pass identified it via broadening-search "
+                    f"after verifying that no in-pool candidate cleanly fits "
+                    f"the contract the maintainer thread or search context "
+                    f"pointed at. Opening as an Issue (rather than a draft PR) "
+                    f"because external picks need dependency changes that "
+                    f"fall outside the PR guardrails."
+                )
+                issue_url = _open_downgrade_issue(
+                    target, rec,
+                    reason=f"Selection identified an {shape_label} candidate",
+                    detail=detail,
+                )
+                result.update({
+                    "paper": rec.paper_title,
+                    "arxiv": rec.arxiv_id,
+                    "tier": rec.tier,
+                    "candidates_considered": len(viable),
+                    "status": "issue_opened_substitution",
+                    "issue_url": issue_url,
+                })
+                log.info(
+                    f"  ✓ issue_opened_substitution ({shape}, external): "
+                    f"{issue_url}"
+                )
                 return result
             if selection is not None:
                 rec = viable[selection["chosen_index"]]
