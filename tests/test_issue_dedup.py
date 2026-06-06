@@ -123,3 +123,59 @@ def test_versioned_candidate_no_match_for_unrelated_paper():
     ours = [{"title": "[Remyx Recommendation] OtherPaper",
              "body": "see arxiv.org/abs/2605.99999v1"}]
     assert run.issue_for_paper(ours, _rec("2605.26102v1", "InstructSAM")) is None
+
+
+# ─── external-pick dedup ───────────────────────────────────────────────────
+# The external (broadening-search) branch of run_one_target constructs a
+# synthetic Recommendation via _resolve_external_candidate and routes
+# straight to _open_downgrade_issue. The viability gate above filters
+# engine-pool candidates only; the external branch bypasses it. We now
+# call issue_for_paper(open_issues, rec) in that branch — these tests pin
+# the matching behaviour for the shape of Recommendation the external
+# branch produces.
+
+
+def _external_rec(arxiv, title, query="InstructSAM"):
+    """Mirrors the synthetic Recommendation _resolve_external_candidate builds
+    when the selection pass surfaces an out-of-pool candidate (chosen_index=-2).
+    Same dataclass; just constructed with the via-broadening-search defaults."""
+    return Recommendation(
+        paper_title=title, arxiv_id=arxiv, tier="high", z_score=0.0, spec_md="",
+        paper_abstract="", domain_summary="", raw_paper_md="",
+        relevance_score=0.0, reasoning=f"surfaced via remyxai search {query!r}",
+        suggested_experiment="", recommendation_id="",
+        interest_name="(via broadening-search)", interest_context="",
+        experiment_history="",
+    )
+
+
+def test_external_pick_matches_prior_external_issue():
+    """VQASynth#88's bug: an external pick at arxiv 2605.26102 was filed
+    two days after VQASynth#86 (also external) for the same paper. The
+    dedup helper sees the prior Issue's body and matches."""
+    ours = [{"title": "[Remyx Recommendation] InstructSAM",
+             "body": "External pick surfaced via remyxai search query"
+                     " 'InstructSAM' — arxiv.org/abs/2605.26102"}]
+    rec = _external_rec("2605.26102", "InstructSAM")
+    assert run.issue_for_paper(ours, rec) is not None
+
+
+def test_external_pick_matches_prior_engine_pool_issue():
+    """The other direction of the same bug: an external pick at
+    2605.26102 should match an existing engine-pool Issue body that
+    contains 2605.26102v1. (The version-stripped needle from Commit 1
+    handles this when the existing body has the version.)"""
+    ours = [{"title": "[Remyx Recommendation] InstructSAM: Segment Any Instance",
+             "body": "**Recommended paper**: arxiv.org/abs/2605.26102v1"}]
+    rec = _external_rec("2605.26102", "InstructSAM")
+    assert run.issue_for_paper(ours, rec) is not None
+
+
+def test_external_pick_no_match_for_distinct_paper():
+    """An external pick for paper A shouldn't be deduped against an
+    existing Issue for paper B even if both came from broadening-search."""
+    ours = [{"title": "[Remyx Recommendation] Other paper",
+             "body": "External pick surfaced via remyxai search query "
+                     "'other' — arxiv.org/abs/2605.99999v1"}]
+    rec = _external_rec("2605.26102", "InstructSAM")
+    assert run.issue_for_paper(ours, rec) is None

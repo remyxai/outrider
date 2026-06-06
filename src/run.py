@@ -2768,6 +2768,25 @@ def process_target(target: Target) -> dict:
                 result["selection_external_query_used"] = (
                     selection.get("external_query_used", "")
                 )
+                # Dedup gate for external picks. Engine-pool candidates are
+                # filtered against existing open Issues at the viability gate
+                # above, but a broadening-search pick is born inside the
+                # selection pass and never passes through that gate. Without
+                # this check the same paper gets re-recommended on every run
+                # (observed on VQASynth#86 + #88, both InstructSAM via
+                # broadening-search on consecutive days).
+                existing_issue = issue_for_paper(open_issues, rec)
+                if existing_issue is not None:
+                    result["status"] = "skipped_external_issue_exists"
+                    result["existing_issue_url"] = existing_issue.get(
+                        "html_url", ""
+                    )
+                    log.info(
+                        f"  ✗ skipped_external_issue_exists: external pick "
+                        f"{rec.arxiv_id} already has open Issue "
+                        f"{existing_issue.get('html_url', '')}"
+                    )
+                    return result
                 shape = (selection.get("integration_shape") or "simplification").lower().strip()
                 result["selection_integration_shape"] = shape
                 shape_label = {
