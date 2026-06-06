@@ -30,6 +30,7 @@ def _make_candidates():
         },
         fallback_interest_name="fallback",
         interest_context="team focus body",
+        experiment_history="",
     )
     count = run._paper_to_recommendation(
         {
@@ -41,6 +42,7 @@ def _make_candidates():
         },
         fallback_interest_name="VQASynth",
         interest_context="team focus body",
+        experiment_history="",
     )
     return geo, count
 
@@ -56,10 +58,11 @@ def test_paper_to_recommendation_maps_fields():
 
 
 def test_paper_to_recommendation_fallbacks():
-    rec = run._paper_to_recommendation({"title": "X"}, "FB", "")
+    rec = run._paper_to_recommendation({"title": "X"}, "FB", "", "")
     assert rec.interest_name == "FB"                # falls back when absent
     assert rec.arxiv_id == ""
     assert rec.paper_title == "X"
+    assert rec.experiment_history == ""             # threaded through
 
 
 def test_candidate_brief_is_indexed():
@@ -81,9 +84,9 @@ def test_select_parses_chosen_index(tmp_path, monkeypatch):
     geo, count = _make_candidates()
     monkeypatch.setattr(
         run, "_run_claude_oneshot",
-        lambda wd, p, t: (True, '{"chosen_index": 1, "reasoning": "clear call '
-                                'site in prompts.py", "rejected": [{"index": 0, '
-                                '"why": "model architecture, no call site"}]}'),
+        lambda wd, p, t, **kw: (True, '{"chosen_index": 1, "reasoning": "clear call '
+                                      'site in prompts.py", "rejected": [{"index": 0, '
+                                      '"why": "model architecture, no call site"}]}'),
     )
     sel = run.select_recommendation(tmp_path, "pkg", [geo, count])
     assert sel is not None
@@ -95,7 +98,7 @@ def test_select_parses_chosen_index(tmp_path, monkeypatch):
 def test_select_out_of_range_falls_back(tmp_path, monkeypatch):
     geo, count = _make_candidates()
     monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t: (True, '{"chosen_index": 9}'))
+                        lambda wd, p, t, **kw: (True, '{"chosen_index": 9}'))
     # Out-of-range → None → caller falls back to candidates[0].
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
@@ -103,21 +106,21 @@ def test_select_out_of_range_falls_back(tmp_path, monkeypatch):
 def test_select_non_int_index_falls_back(tmp_path, monkeypatch):
     geo, count = _make_candidates()
     monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t: (True, '{"chosen_index": "two"}'))
+                        lambda wd, p, t, **kw: (True, '{"chosen_index": "two"}'))
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
 def test_select_claude_failure_falls_back(tmp_path, monkeypatch):
     geo, count = _make_candidates()
     monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t: (False, "claude CLI timed out"))
+                        lambda wd, p, t, **kw: (False, "claude CLI timed out"))
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
 def test_select_unparseable_output_falls_back(tmp_path, monkeypatch):
     geo, count = _make_candidates()
     monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t: (True, "I think candidate 1 is best"))
+                        lambda wd, p, t, **kw: (True, "I think candidate 1 is best"))
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
