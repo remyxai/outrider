@@ -20,9 +20,10 @@ from run import Recommendation  # noqa: E402
 def _rec(arxiv="2605.22536v1", title="SpaceDG"):
     return Recommendation(
         paper_title=title, arxiv_id=arxiv, tier="high", z_score=0.0, spec_md="",
-        paper_abstract="", team_context="", domain_summary="", raw_paper_md="",
+        paper_abstract="", domain_summary="", raw_paper_md="",
         relevance_score=0.9, reasoning="", suggested_experiment="",
         recommendation_id="", interest_name="VQASynth", interest_context="",
+        experiment_history="",
     )
 
 
@@ -80,3 +81,45 @@ def test_title_fallback_when_no_arxiv():
 
 def test_empty_open_issue_list_never_matches():
     assert run.issue_for_paper([], _rec()) is None
+
+
+# ─── arxiv version-string normalization ────────────────────────────────────
+
+def test_match_versioned_candidate_against_versionless_body():
+    """The bug that produced VQASynth #87: engine-pool candidate carries
+    ``2605.26102v1`` while the existing Issue body has ``2605.26102``
+    (filed via broadening-search). Substring match in the original
+    direction missed because ``…/abs/2605.26102v1`` is not in
+    ``…/abs/2605.26102``."""
+    ours = [{"title": "[Remyx Recommendation] InstructSAM",
+             "body": "see arxiv.org/abs/2605.26102 — surfaced via broadening-search"}]
+    assert run.issue_for_paper(ours, _rec("2605.26102v1", "InstructSAM")) is not None
+
+
+def test_match_versionless_candidate_against_versioned_body():
+    """Reverse direction: broadening-search candidate ``2605.26102``
+    against an open Issue body containing ``2605.26102v1``. Substring
+    match was already working in this direction (prefix match); locking
+    it down with an explicit test."""
+    ours = [{"title": "[Remyx Recommendation] InstructSAM",
+             "body": "see arxiv.org/abs/2605.26102v1"}]
+    assert run.issue_for_paper(ours, _rec("2605.26102", "InstructSAM")) is not None
+
+
+def test_arxiv_versionless_helper_strips_only_trailing_version():
+    """Pure helper. Only trailing ``v<digits>`` is dropped — embedded
+    sequences that happen to look like a version aren't touched."""
+    assert run._arxiv_versionless("2605.26102v1") == "2605.26102"
+    assert run._arxiv_versionless("2605.26102v17") == "2605.26102"
+    assert run._arxiv_versionless("2605.26102") == "2605.26102"
+    assert run._arxiv_versionless("") == ""
+    assert run._arxiv_versionless("v1abc") == "v1abc"  # not a trailing suffix
+
+
+def test_versioned_candidate_no_match_for_unrelated_paper():
+    """The fix shouldn't widen matches across distinct papers — a
+    versioned candidate for paper A shouldn't match an Issue for paper B
+    even if both share a common arxiv prefix accidentally."""
+    ours = [{"title": "[Remyx Recommendation] OtherPaper",
+             "body": "see arxiv.org/abs/2605.99999v1"}]
+    assert run.issue_for_paper(ours, _rec("2605.26102v1", "InstructSAM")) is None

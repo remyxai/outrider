@@ -1147,19 +1147,40 @@ def open_remyx_issues(target: Target) -> list[dict]:
     return ours
 
 
+def _arxiv_versionless(s: str) -> str:
+    """Drop a trailing ``v<digits>`` from an arxiv id.
+
+    The engine pool and the broadening-search path don't agree on whether
+    to include the version suffix — engine candidates carry ``2605.26102v1``
+    while a `remyxai search query` result for the same paper comes back as
+    ``2605.26102``. issue_for_paper does a substring match on the issue
+    body, and substring matching is directional: ``2605.26102v1`` is NOT
+    a substring of ``2605.26102``, so a versioned candidate misses an open
+    Issue that was filed from the versionless side."""
+    return re.sub(r"v\d+$", "", s or "")
+
+
 def issue_for_paper(open_issues: list[dict], rec: Recommendation) -> dict | None:
     """Return an already-open Remyx Issue for this paper, if any.
 
     Matched on the arxiv_id in the issue body — every Remyx issue links
     ``arxiv.org/abs/<id>``, and that survives the OPEN_AS_ISSUE path where
     the title is Claude-authored rather than ``<prefix> <paper_title>``.
-    Falls back to an exact title match when the recommendation carries no
-    arxiv_id. Pure (no network) so the matching is unit-testable; the
-    fetch lives in open_remyx_issues."""
-    needle = f"arxiv.org/abs/{rec.arxiv_id}" if rec.arxiv_id else None
+    Tries both the as-given arxiv id and its versionless form, since the
+    engine pool and broadening-search disagree on the suffix. Falls back
+    to an exact title match when the recommendation carries no arxiv_id.
+    Pure (no network) so the matching is unit-testable; the fetch lives
+    in open_remyx_issues."""
+    needles: list[str] = []
+    if rec.arxiv_id:
+        needles.append(f"arxiv.org/abs/{rec.arxiv_id}")
+        stripped = _arxiv_versionless(rec.arxiv_id)
+        if stripped and stripped != rec.arxiv_id:
+            needles.append(f"arxiv.org/abs/{stripped}")
     title_match = f"{PR_TITLE_PREFIX} {rec.paper_title}"
     for it in open_issues:
-        if needle and needle in (it.get("body") or ""):
+        body = it.get("body") or ""
+        if any(n in body for n in needles):
             return it
         if not rec.arxiv_id and (it.get("title") or "") == title_match:
             return it
