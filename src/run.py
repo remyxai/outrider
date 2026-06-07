@@ -10,7 +10,7 @@ Flow:
   1. Recommendation: GET /api/v1.0/papers/recommended on engine.remyx.ai
      for the configured ResearchInterest. Remyx server-side handles
      commit-history extraction, candidate pool, embedding pre-filter,
-     and Gemini ranking — this action is a pure consumer.
+     and LLM ranking — this action is a pure consumer.
   2. Confidence gate: skip Low / Noise tiers.
   3. Dedup: skip if an open PR already exists for this paper's arxiv_id
      (branch == `remyx-recommendation/{arxiv_id}`), or if any
@@ -1278,9 +1278,9 @@ def _asset_to_recommendation(
     reasoning = (
         f"Surfaced by Outrider deep-search refine query "
         f"`{refine_query}` against /search/assets. The engine's "
-        f"normal Gemini ranking did not place this paper in the "
-        f"interest's broad pool — it's here because the audit pass "
-        f"identified an under-represented theme this paper covers."
+        f"normal ranking did not place this paper in the interest's "
+        f"broad pool — it's here because the audit pass identified an "
+        f"under-represented theme this paper covers."
     )
     return Recommendation(
         paper_title=title,
@@ -1559,7 +1559,7 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
     past 7 days) and the pool size is ``REMYX_RECOMMENDATION_LIMIT``
     (default 25), both surfaced as the ``lookback`` / ``candidate-pool``
     action inputs. Remyx owns commit-history extraction, candidate pool,
-    embedding pre-filter, Gemini ranking, and reasoning generation; the
+    embedding pre-filter, LLM ranking, and reasoning generation; the
     action is a pure consumer.
 
     The earlier behaviour took only ``papers[0]``, which wasted the
