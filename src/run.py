@@ -2225,15 +2225,39 @@ def existing_pr_for(target: Target, branch: str) -> dict | None:
 def open_remyx_issues(target: Target) -> list[dict]:
     """Open Remyx Recommendation Issues on the target repo.
 
+    Back-compat shim. New callers should prefer ``_remyx_issues(target,
+    state="all")`` so dedup respects closed Issues too (the symmetric
+    discharge invariant — a paper has been addressed by Outrider once
+    any Outrider Issue exists for it, open or closed).
+    """
+    return _remyx_issues(target, state="open")
+
+
+def _remyx_issues(target: Target, state: str = "open") -> list[dict]:
+    """Outrider-opened Issues on the target repo, filtered to ours.
+
+    ``state`` mirrors GitHub's ``/issues?state=`` param: ``"open"``,
+    ``"closed"``, or ``"all"``. Bounded to the first 100 issues per
+    state (200 total for ``state="all"`` — pragmatic cap on retrieval).
+
     GitHub's /issues endpoint also returns PRs (they carry a
     'pull_request' key) — those are filtered out; PRs are deduped
-    separately by existing_pr_for. We keep only items that look like one
-    of ours: the title carries the PR_TITLE_PREFIX or the body has the
-    orchestrator's attribution footer. Bounded to the first 100 open
-    issues (same pragmatic cap as recent_remyx_activity_within_rate_limit)."""
-    issues = gh_api(
-        "GET", f"/repos/{target.repo}/issues?state=open&per_page=100"
-    ) or []
+    separately by ``existing_pr_for``. We keep only items that look
+    like one of ours: the title carries the PR_TITLE_PREFIX or the
+    body has the orchestrator's attribution footer.
+
+    Use ``state="all"`` for dedup gates so a closed Outrider Issue
+    suppresses re-recommendation of the same paper — reopen-the-Issue
+    is the maintainer's re-engagement lever.
+    """
+    try:
+        issues = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues?state={state}&per_page=100",
+        ) or []
+    except Exception as e:
+        log.debug(f"  fetch issues (state={state}) for {target.repo} failed: {e}")
+        return []
     ours = []
     for it in issues:
         if it.get("pull_request"):
@@ -2243,6 +2267,11 @@ def open_remyx_issues(target: Target) -> list[dict]:
         if title.startswith(PR_TITLE_PREFIX) or "Remyx Recommendation" in body:
             ours.append(it)
     return ours
+
+
+def _all_remyx_issues(target: Target) -> list[dict]:
+    """Convenience wrapper: every Outrider Issue (open + closed)."""
+    return _remyx_issues(target, state="all")
 
 
 def _arxiv_versionless(s: str) -> str:
@@ -3595,7 +3624,17 @@ def open_issue(
             f"orchestrator — the coding agent elected Issue-mode rather "
             f"than scaffolding a PR for this paper._"
         )
-    full_body = f"{body}\n\n---\n\n{footer}"
+    # Re-engagement lever. Outrider treats a paper as discharged once
+    # any Outrider Issue exists for it — open or closed. The maintainer's
+    # lever for re-engaging is to reopen the Issue; documenting that in
+    # every Issue body ensures the mechanism is visible at the moment
+    # the maintainer decides whether to close or keep open.
+    reengage_note = (
+        "_Reopen this Issue if you want Outrider to revisit this "
+        "paper later. While it stays closed, the orchestrator "
+        "will not re-recommend the same paper._"
+    )
+    full_body = f"{body}\n\n---\n\n{footer}\n\n{reengage_note}"
     log.info(f"  → opening Issue on {target.repo}")
     payload = {"title": title, "body": full_body}
     try:
@@ -4109,13 +4148,15 @@ def process_target(target: Target) -> dict:
     #    Issue for the paper. The Issue check matters with a longer
     #    lookback: a sticky top candidate that keeps routing to Issue would
     #    otherwise be re-selected every run and reopen a duplicate Issue.
-    #    Treating an open Issue as "in flight" drops it from the pool so
-    #    selection advances to the next-best candidate; closing the Issue
-    #    makes the paper eligible again. Running this BEFORE the clone
-    #    preserves the "don't check out the repo if nothing is actionable"
+    #    Symmetric discharge: a paper is considered addressed
+    #    once *any* Outrider Issue exists for it, open or closed. Open
+    #    means "still in flight" and closed means "the team has made a
+    #    call" — both signal "stop re-recommending." Reopen the Issue
+    #    to re-engage. Running this BEFORE the clone preserves the
+    #    "don't check out the repo if nothing is actionable"
     #    optimization the single-pick flow had.
     min_required = TIER_RANK.get(target.min_confidence.lower(), 2)
-    open_issues = open_remyx_issues(target)
+    open_issues = _all_remyx_issues(target)
     viable: list[Recommendation] = []
     dropped_low_conf = 0
     dropped_pr_exists = 0
@@ -4128,7 +4169,8 @@ def process_target(target: Target) -> dict:
         if existing_pr_for(target, c_branch):
             dropped_pr_exists += 1
             continue
-        if issue_for_paper(open_issues, c):
+        prior_issue = issue_for_paper(open_issues, c)
+        if prior_issue:
             dropped_issue_exists += 1
             continue
         viable.append(c)
@@ -4142,19 +4184,19 @@ def process_target(target: Target) -> dict:
         elif dropped_issue_exists and not dropped_pr_exists:
             result["status"] = "skipped_issue_exists"
             log.info(f"  ✗ all {dropped_issue_exists} candidate(s) already "
-                     f"have open Remyx Issues; skipping")
+                     f"have prior Outrider Issues (open or closed); skipping")
         else:
-            # PR dedup, or a mix of open PRs and Issues.
+            # PR dedup, or a mix of open PRs and prior Issues.
             result["status"] = "skipped_pr_exists"
             log.info(f"  ✗ all candidates already in flight "
                      f"({dropped_pr_exists} open PRs, "
-                     f"{dropped_issue_exists} open Issues); skipping")
+                     f"{dropped_issue_exists} prior Issues); skipping")
         return result
 
     log.info(f"  ✓ {len(viable)} viable candidate(s) "
              f"(dropped {dropped_low_conf} low-confidence, "
              f"{dropped_pr_exists} open PRs, "
-             f"{dropped_issue_exists} open Issues)")
+             f"{dropped_issue_exists} prior Issues)")
 
     # 4. Workdir + selection. Clone first (the selection pass needs the
     #    repo's module layout), then let Claude pick the candidate most
@@ -4225,21 +4267,28 @@ def process_target(target: Target) -> dict:
                     selection.get("external_query_used", "")
                 )
                 # Dedup gate for external picks. Engine-pool candidates are
-                # filtered against existing open Issues at the viability gate
-                # above, but a broadening-search pick is born inside the
+                # filtered against existing Outrider Issues at the viability
+                # gate above, but a broadening-search pick is born inside the
                 # selection pass and never passes through that gate. Without
-                # this check the same paper gets re-recommended on every run
-                # (observed on VQASynth#86 + #88, both InstructSAM via
-                # broadening-search on consecutive days).
+                # this check the same paper gets re-recommended on every run.
+                # Symmetric: matches against any prior Outrider Issue (open
+                # or closed). `open_issues` is misnamed at this point — it
+                # now carries the all-state set.
                 existing_issue = issue_for_paper(open_issues, rec)
                 if existing_issue is not None:
+                    issue_state = existing_issue.get("state", "open")
                     result["status"] = "skipped_external_issue_exists"
                     result["existing_issue_url"] = existing_issue.get(
                         "html_url", ""
                     )
+                    result["existing_issue_state"] = issue_state
+                    state_phrase = (
+                        "open Issue" if issue_state == "open"
+                        else "closed Issue (team resolved)"
+                    )
                     log.info(
                         f"  ✗ skipped_external_issue_exists: external pick "
-                        f"{rec.arxiv_id} already has open Issue "
+                        f"{rec.arxiv_id} already has {state_phrase} "
                         f"{existing_issue.get('html_url', '')}"
                     )
                     return result
@@ -4928,6 +4977,7 @@ def _write_step_summary(result: dict) -> None:
         "skipped_rate_limit":      "⏭️",
         "skipped_pr_exists":       "⏭️",
         "skipped_issue_exists":    "⏭️",
+        "skipped_external_issue_exists": "⏭️",
         "skipped_by_selection_verification": "⏭️",
         "issue_opened_substitution": "🔁",
         "skipped_test_failure":    "⏭️",
@@ -4948,6 +4998,24 @@ def _write_step_summary(result: dict) -> None:
         lines.append(f"**PR**: {pr_url}\n")
     if issue_url:
         lines.append(f"**Issue**: {issue_url}\n")
+
+    # When the dedup gate fires (open OR closed prior Issue), surface
+    # the existing-Issue context inline so the maintainer sees at a
+    # glance which thread already covers this paper and whether it's
+    # still in flight or resolved (symmetric discharge).
+    existing_url = result.get("existing_issue_url") or ""
+    if existing_url:
+        existing_state = result.get("existing_issue_state", "open")
+        if existing_state == "closed":
+            lines.append(
+                f"**Already addressed**: {existing_url} (closed — team "
+                f"has resolved). Reopen the Issue to re-engage.\n"
+            )
+        else:
+            lines.append(
+                f"**Already in flight**: {existing_url} (open — "
+                f"re-validated this run).\n"
+            )
 
     if reasoning:
         # Collapse long reasoning into a <details> so the cost line
