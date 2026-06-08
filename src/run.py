@@ -2021,7 +2021,11 @@ def _coalesce_candidate_families(
         return candidates
     # Build a mapping: github_slug → list of indices into ``candidates``
     # that share it. Candidates with no GitHub URL skip grouping —
-    # they're never merged with anyone.
+    # they're never merged with anyone. The dedup key is lowercased
+    # because GitHub URLs are case-insensitive for owner/repo
+    # (``github.com/Owner/Repo`` and ``github.com/owner/repo`` resolve
+    # to the same project) but different upstream envelopes occasionally
+    # supply the URL in different cases.
     families: dict[str, list[int]] = {}
     for i, c in enumerate(candidates):
         if not c.paper_github_url:
@@ -2029,7 +2033,7 @@ def _coalesce_candidate_families(
         slug = _extract_github_urls(c.paper_github_url)
         if not slug:
             continue
-        families.setdefault(slug[0], []).append(i)
+        families.setdefault(slug[0].lower(), []).append(i)
     # Indices to drop (siblings being collapsed into their representative).
     drop: set[int] = set()
     for slug, idxs in families.items():

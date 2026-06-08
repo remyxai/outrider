@@ -428,6 +428,23 @@ def test_coalesce_empty_or_single_passes_through():
     assert run._coalesce_candidate_families(solo) == solo
 
 
+def test_coalesce_is_case_insensitive_on_github_slug():
+    """GitHub URLs resolve case-insensitively for owner/repo. Different
+    upstream envelopes occasionally supply the URL in different cases
+    (one envelope might canonicalize to lowercase, another preserves
+    CamelCase) — family dedup must catch that."""
+    recs = [
+        _broad_rec("p1", "UniDepth",
+                   "https://github.com/lpiccinelli-eth/unidepth", 0.65),
+        _broad_rec("p2", "UniDepthV2",
+                   "https://github.com/lpiccinelli-eth/UniDepth", 0.72),
+    ]
+    out = run._coalesce_candidate_families(recs)
+    assert len(out) == 1
+    assert out[0].paper_title == "UniDepthV2"
+    assert "Coalesced from 2" in out[0].family_summary
+
+
 # ─── issue_for_paper sibling-paper dedup ──────────────────────────────────
 
 
