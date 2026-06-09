@@ -1,6 +1,6 @@
 # Outrider — GitHub Action
 
-Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider picks the next paper most implementable against your codebase and either opens a draft PR wiring it into an existing call site, or starts a discussion Issue when a PR would be premature.
+Scouts the arXiv frontier for your repo and picks the next paper most implementable against your codebase. Verifies each candidate's structural fit against your actual modules (not just keyword relevance), then either opens a draft PR wiring it into an existing call site, opens an Issue when a PR would be premature, or opens an RFC-shape Issue when the candidate proposes a new capability your team has signaled openness to. Won't re-recommend a paper that's already in front of your team — whether Outrider filed it or you did.
 
 <p align="center">
   <img src="https://github.com/remyxai/outrider/releases/download/readme-assets/outrider-v1.gif" alt="Outrider demo" width="800">
@@ -16,6 +16,9 @@ Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider pick
 
 - **Draft PRs** that wire a paper's contribution into an existing module, with a self-review section in the body honestly noting what was implemented vs. left out
 - **Issues** when a PR would be premature — pre-flight, validators, or self-review route the paper to discussion instead of scaffold-shaped PRs
+- **RFC-shape Issues** when the team has signaled openness to a new capability (a README roadmap section, an open `[RFC]` Issue, a CONTEXT.md investment pattern) and a candidate fits as an extension — a clear proposal instead of speculation
+- **No duplicate work** — the same paper isn't re-recommended once any Outrider or maintainer Issue references it; reopen the Issue to re-engage
+- **A selection narrative** in the run's GitHub Actions step summary explaining why this paper (or why nothing actionable this run) — visible at a glance, not buried in logs
 - **One artifact per `rate-limit-days`** by default — no Issue spam
 
 ## Setup
@@ -110,7 +113,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 
 <details>
-<summary><b>Status codes</b> (18 outcomes)</summary>
+<summary><b>Status codes</b></summary>
 
 | Status | Meaning |
 |---|---|
@@ -121,13 +124,14 @@ At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 | `issue_opened_no_integration` | Diff adds code that nothing invokes |
 | `issue_opened_stub_density` | New module is ≥50% stubs (`pass` / `NotImplementedError` / empty bodies) |
 | `issue_opened_no_test_integration` | New tests don't import from any pre-existing module |
-| `issue_opened_self_review` | Self-review judged the new code an orphan, unreachable from production |
+| `issue_opened_self_review` | Self-review judged the new code an orphan, unreachable from production. Body preserves Claude's implementation diff so the maintainer can review or apply it manually |
+| `issue_opened_substitution` | Selection identified a replacement / pipeline-simplification / extension candidate (vs. additive drop-in); routed to Issue because the swap needs dep changes the PR guardrails block, or there's no existing call site to anchor against |
 | `skipped_low_confidence` | Recommendation below `min-confidence` |
 | `skipped_rate_limit` | A Remyx PR or Issue was opened within `rate-limit-days` |
 | `skipped_pr_exists` | Every candidate already has an open PR |
-| `skipped_issue_exists` | Every candidate already has an open Remyx Issue — close one to retry that paper |
-| `skipped_by_selection_verification` | Selection pass verified every candidate against the repo and rejected all (none structurally fit the existing modules) |
-| `issue_opened_substitution` | Selection identified a replacement / pipeline-simplification candidate (vs. additive drop-in); routed to Issue because the swap needs dep changes the PR guardrails block |
+| `skipped_issue_exists` | Every candidate already has a prior Issue referencing the arxiv id — Outrider-opened OR maintainer-opened, open OR closed. Step summary differentiates "Already in flight" (open) vs "Already addressed" (closed). Reopen the Issue to re-engage |
+| `skipped_external_issue_exists` | Selection pass surfaced an out-of-pool candidate but it's already in the team's attention — same Outrider/Maintainer × open/closed differentiation as above |
+| `skipped_by_selection_verification` | Selection pass verified every candidate against the repo and rejected all. The `selection_reasoning` payload renders open in the step summary explaining why — the most useful signal for "no actionable paper this run" outcomes |
 | `skipped_test_failure` | Tests failed AND `draft-mode: never` |
 | `claude_failed` | Claude CLI exited non-zero |
 | `rejected_path_violations` | Claude touched files outside the guardrails allowlist |
@@ -160,19 +164,50 @@ Extend the allowlist for your repo via the `guardrails-allowlist` input.
 </details>
 
 <details>
-<summary><b>How it works</b></summary>
+<summary><b>How selection works</b> — four integration shapes + discharge model</summary>
+
+Outrider's selection pass classifies every candidate against your repo using a four-shape taxonomy. A candidate that doesn't fit one of these shapes is a structural mismatch and gets rejected:
+
+- **addition** — paper adds a new module wired into existing code. Most common. Verification: the call site exists and the new module's I/O contract fits.
+- **replacement** — strict drop-in for an existing component with the same I/O contract but better internals (smaller / faster / newer foundation). Verification: I/O contracts are functionally equivalent, not just thematically related.
+- **simplification** — merges two or more existing components into one with the same end-to-end contract. Pipeline collapses. Verification: merged contribution spans the existing boundary contract cleanly.
+- **extension** — proposes a new capability your repo lacks AND that you've signaled openness to (README roadmap, an open `[RFC]` Issue, CONTEXT.md investment pattern). Stricter bar than addition — four gates: pipeline-compatible I/O, explicit team-direction signal, no existing implementation, tier=high + relevance ≥ 0.90. Without ≥1 explicit direction signal in your repo, extension picks are RFC-fishing and get rejected.
+
+Tie-break preference: `simplification > replacement > addition > extension`. Extension is last-resort — picked only when the other three shapes fail AND the four gates pass.
+
+**Discharge model** — the same paper isn't re-recommended once it's already in front of your team. The dedup gate counts:
+
+- **Outrider-opened Issues** (any state, open OR closed) — closing an Issue means "the team has decided," still a discharge signal
+- **Maintainer-opened Issues** (RFCs, discussions) whose body links the paper's arxiv id — a stronger signal than Outrider's own, since you authored the thread
+
+Re-engagement lever: **reopen the Issue** to drop the paper from the discharge set so Outrider can re-recommend it.
+
+</details>
+
+<details>
+<summary><b>How it works</b> — full pipeline</summary>
 
 ```
 GitHub cron fires the workflow
        ↓
 Query engine.remyx.ai for the candidate pool + interest context
        ↓
-Rate-limit + per-paper dedup + confidence gates
+Rate-limit + per-candidate viability gates:
+  - confidence (tier above min-confidence)
+  - PR exists for arxiv?
+  - any prior Issue references arxiv? (Outrider OR maintainer; open OR closed)
        ↓
 Clone the target repo + detect package / default branch
        ↓
-Selection pass: verify each promising candidate against the cloned repo
-(gh code-search + file reads). May reject all and exit early.
+Selection pass (Claude agentic, ~5 min budget):
+  Prompt threads in:
+    - candidate brief (with inline "✗ already filed [Outrider/Maintainer]" tags)
+    - "Already in the team's attention" discharge section
+    - 4 integration shapes + tie-break ordering
+    - verification tools: gh code-search, gh api, remyxai search query/info
+  Outputs: chosen_index + integration_shape + selection_reasoning
+       ↓
+External-pick dedup (if out-of-pool / extension candidate) against the same set
        ↓
 Write the .remyx-recommendation/ spec bundle
        ↓
@@ -181,13 +216,14 @@ Pre-flight Claude pass: PR or Issue?
      ISSUE                            PR
        ↓                              ↓
    open Issue        Invoke Claude Code (implement integration)
+   (impl. diff                        ↓
+    preserved in     Path-allowlist + integration validator
+    body when         (new module must be imported by a modified file)
+    self-review                       ↓
+    routed here)     Stub-density + pytest + test-integration check
                                       ↓
-                     Path-allowlist + integration validator
-                     (new module must be imported by a modified file)
-                                      ↓
-                     Stub-density + pytest + test-integration check
-                                      ↓
-                     Self-review pass (downgrade to Issue if orphan)
+                     Self-review pass (downgrade to Issue if orphan;
+                     diff preserved in Issue body for manual review)
                                       ↓
                      Commit (bundle scrubbed) + push + open draft PR
 ```
