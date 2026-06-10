@@ -34,11 +34,13 @@ inputs:
     description: >-
       GitHub token used for git push, PR / Issue creation, and the
       existing-PR dedup check. Leave empty for the standard same-repo
-      install — the action falls back to the workflow's built-in
-      github.token, which has write access to the repo the workflow
-      runs in. Override with a PAT only for cross-repo controller
-      patterns (action runs in repo A but writes PRs to repo B);
-      the PAT needs `repo` scope on the target.
+      install — the action self-mints a remyx[bot] token from
+      engine.remyx.ai (using REMYX_API_KEY) so artifacts are authored
+      by the Remyx App by default, and falls back to the workflow's
+      built-in github.token when minting isn't available. Override
+      with a PAT only for cross-repo controller patterns (action runs
+      in repo A but writes PRs to repo B); the PAT needs `repo` scope
+      on the target.
     required: false
     default: ''
   min-confidence:

@@ -976,23 +976,85 @@ class Recommendation:
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
 
+# Run-scoped cache for the self-minted remyx[bot] token — one mint attempt
+# per run, success or failure. `permissions` carries the scopes the engine
+# actually granted so capability-aware callers (the Discussion post) can
+# branch instead of discovering a 403.
+_BOT_TOKEN = {"attempted": False, "token": "", "permissions": {}}
+
+
+def _mint_bot_token() -> str:
+    """Self-mint a short-lived remyx[bot] installation token from the engine.
+
+    The action already holds REMYX_API_KEY — exactly the credential the
+    engine's ``/github/installation-token`` endpoint authenticates — so
+    the bot identity must not depend on the customer's workflow YAML
+    carrying a mint step. Called lazily by ``_github_token``; one attempt
+    per run. Best-effort: any failure (engine unreachable, App not
+    installed, no provisioned action for this repo) returns ``""`` and
+    the caller falls back to GITHUB_TOKEN — the same graceful semantics
+    as the YAML mint step's ``|| token=""``.
+    """
+    if _BOT_TOKEN["attempted"]:
+        return _BOT_TOKEN["token"]
+    _BOT_TOKEN["attempted"] = True
+    api_key = (
+        os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
+    )
+    repo = (os.environ.get("TARGET_REPO") or "").strip()
+    repo = repo.split("github.com/")[-1].strip("/")
+    if not api_key or "/" not in repo:
+        return ""
+    req = urllib.request.Request(
+        f"{REMYX_API_BASE}/api/v1.0/github/installation-token",
+        data=json.dumps({"repo": repo}).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read() or b"{}")
+    except Exception as e:
+        log.info(f"  bot-token self-mint unavailable ({e}); "
+                 f"falling back to GITHUB_TOKEN")
+        return ""
+    _BOT_TOKEN["token"] = (data.get("token") or "").strip()
+    _BOT_TOKEN["permissions"] = data.get("permissions") or {}
+    if _BOT_TOKEN["token"]:
+        log.info(f"  ✓ self-minted remyx[bot] token (scopes: "
+                 f"{sorted(_BOT_TOKEN['permissions']) or '(unreported)'})")
+    return _BOT_TOKEN["token"]
+
+
 def _github_token() -> str:
     """Resolve the GitHub token to use for git push + API calls.
 
     Preference order:
-      1. INPUT_GITHUB_TOKEN — explicit cross-repo PAT override
-      2. GITHUB_TOKEN — the workflow's built-in token (action.yml's
-         step env sets this from `${{ github.token }}`).
+      1. INPUT_GITHUB_TOKEN — explicit override: a cross-repo PAT, or a
+         bot token the workflow's own mint step passed via the
+         `github-token` input.
+      2. Self-minted remyx[bot] installation token (engine-issued; see
+         ``_mint_bot_token``). Makes the bot the DEFAULT author of every
+         artifact — PRs, Issues, Discussion comments — even when the
+         workflow YAML carries no mint step.
+      3. GITHUB_TOKEN — the workflow's built-in token (artifacts author
+         as github-actions[bot]).
 
     Two separate env vars rather than a single `${{ a || b }}` in
     action.yml because GitHub Actions' || operator on empty-string
     inputs returns '' instead of falling through (observed via v1.0.3
     git-push failure). Resolving in Python gives reliable semantics.
     """
-    return (
-        os.environ.get("INPUT_GITHUB_TOKEN", "").strip()
-        or os.environ.get("GITHUB_TOKEN", "").strip()
-    )
+    explicit = os.environ.get("INPUT_GITHUB_TOKEN", "").strip()
+    if explicit:
+        return explicit
+    minted = _mint_bot_token()
+    if minted:
+        return minted
+    return os.environ.get("GITHUB_TOKEN", "").strip()
 
 
 def gh_api(method: str, path: str, body: dict | None = None) -> Any:
@@ -1025,7 +1087,9 @@ def gh_api(method: str, path: str, body: dict | None = None) -> Any:
         raise RuntimeError(f"GitHub {method} {path} → HTTP {e.code}: {body_text}") from e
 
 
-def gh_graphql(query: str, variables: dict | None = None) -> dict:
+def gh_graphql(
+    query: str, variables: dict | None = None, token: str | None = None,
+) -> dict:
     """Minimal GitHub GraphQL wrapper — sibling of ``gh_api``.
 
     The Discussions API is GraphQL-only (no REST endpoint exists for
@@ -1034,9 +1098,11 @@ def gh_graphql(query: str, variables: dict | None = None) -> dict:
     ``gh_api``: raises RuntimeError on transport errors AND on
     GraphQL-level errors (GraphQL returns HTTP 200 with an ``errors``
     array; surfacing those as exceptions keeps the two helpers
-    behaviorally identical for callers). Returns the ``data`` object.
+    behaviorally identical for callers). ``token`` overrides the resolved
+    token — used by the Discussion-post permission fallback. Returns the
+    ``data`` object.
     """
-    token = _github_token()
+    token = token or _github_token()
     if not token:
         raise RuntimeError(
             "Neither INPUT_GITHUB_TOKEN nor GITHUB_TOKEN is set. The "
@@ -2796,6 +2862,7 @@ def _reset_run_cost() -> None:
         cache_read_input_tokens=0, num_turns=0, claude_calls=0,
     )
     _RUN_REFINE_QUERIES.clear()
+    _BOT_TOKEN.update(attempted=False, token="", permissions={})
 
 
 def _record_claude_usage(env: dict) -> None:
@@ -5587,13 +5654,40 @@ def _resolve_discussion_id(target: Target, raw: str) -> str:
 
 
 def _post_discussion_comment(discussion_id: str, body: str) -> str:
-    """Post ``body`` as a comment on the Discussion; return the comment URL."""
-    data = gh_graphql(
+    """Post ``body`` as a comment on the Discussion; return the comment URL.
+
+    Posts with the active token first — the self-minted remyx[bot] token
+    when available, so the digest is bot-authored by default. When that
+    token can't post Discussions (the App's Discussions permission isn't
+    granted/accepted on this install yet → GraphQL "Resource not
+    accessible"), falls back to the workflow's GITHUB_TOKEN so the digest
+    still ships — authored by github-actions[bot] rather than failing
+    the run.
+    """
+    mutation = (
         "mutation($id: ID!, $body: String!) {"
         " addDiscussionComment(input: {discussionId: $id, body: $body}) {"
-        " comment { url } } }",
-        {"id": discussion_id, "body": body},
+        " comment { url } } }"
     )
+    variables = {"id": discussion_id, "body": body}
+    try:
+        data = gh_graphql(mutation, variables)
+    except RuntimeError as e:
+        fallback = os.environ.get("GITHUB_TOKEN", "").strip()
+        permission_denied = (
+            "Resource not accessible" in str(e)
+            or "FORBIDDEN" in str(e)
+            or "403" in str(e)
+        )
+        if not (fallback and fallback != _github_token() and permission_denied):
+            raise
+        log.warning(
+            f"  weekly: active token can't post Discussions "
+            f"({str(e)[:120]}); retrying with GITHUB_TOKEN. Grant the "
+            f"Remyx App 'Discussions: Read and write' for a bot-authored "
+            f"digest."
+        )
+        data = gh_graphql(mutation, variables, token=fallback)
     comment = (data.get("addDiscussionComment") or {}).get("comment") or {}
     return comment.get("url") or ""
 
