@@ -3168,13 +3168,21 @@ def select_recommendation(
         retry_prompt = (
             prompt
             + "\n\n--- OUTPUT FORMAT REMINDER ---\n"
-              "Your previous response was prose. Respond NOW with only the "
-              "JSON object specified above — no prose, no preamble, no "
-              "explanation, no markdown fences. The first character of "
-              "your response must be `{` and the last must be `}`."
+              "Your previous response was prose. You already did the "
+              "verification work — do NOT re-verify, do NOT call any tools. "
+              "Respond NOW with only the JSON object specified above — no "
+              "prose, no preamble, no explanation, no markdown fences. The "
+              "first character of your response must be `{` and the last "
+              "must be `}`."
         )
+        # Retry budget: ~5 max-turns × ~10-15s per turn for the Claude API
+        # round-trip puts the floor around 50-75s before the agent has any
+        # time to compose the final JSON. 180s leaves enough headroom for
+        # a slow API response while still capping cost; the prior 90s
+        # default was tight enough that complex selection pools (30+
+        # candidates with embedded paper context) routinely timed out.
         retry_timeout = int(
-            os.environ.get("REMYX_SELECTION_RETRY_TIMEOUT_S", "90")
+            os.environ.get("REMYX_SELECTION_RETRY_TIMEOUT_S", "180")
         )
         retry_max_turns = int(
             os.environ.get("REMYX_SELECTION_RETRY_MAX_TURNS", "5")
