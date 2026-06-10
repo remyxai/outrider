@@ -62,6 +62,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from diff_risk_score import (
+    DIFF_RISK_ISSUE_THRESHOLD,
+    render_risk_detail,
+    score_diff_risk,
+)
+
 # ─── Configuration ─────────────────────────────────────────────────────────
 
 # Mirror REMYX_API_KEY → REMYXAI_API_KEY so the `remyxai` CLI authenticates
@@ -5025,6 +5031,41 @@ def process_target(target: Target) -> dict:
             result["issue_url"] = issue_url
             return result
 
+        # 7.7. Diff Risk Score (RADAR). Calibrated static-diff risk band
+        # over features the funnel already computed (files, lines, new
+        # callables, critical-file edits, test impact). "high" routes to a
+        # human-review Issue; "elevated" is handled at §10 (PR, forced draft).
+        risk = score_diff_risk(workdir, package)
+        result["diff_risk_score"] = risk.score
+        result["diff_risk_band"] = risk.band
+        result["diff_risk_factors"] = risk.factors
+        if risk.band == "high":
+            log.warning(f"  ✗ diff risk {risk.score:.2f} ≥ "
+                        f"{DIFF_RISK_ISSUE_THRESHOLD:.2f} (high); → Issue")
+            issue_url = _open_downgrade_issue(
+                target, rec,
+                reason=(f"Diff Risk Score {risk.score:.2f} exceeds the "
+                        f"auto-land threshold ({DIFF_RISK_ISSUE_THRESHOLD:.2f})"),
+                detail=(
+                    "A calibrated static-diff risk score placed this change in "
+                    "the **high** band, where RADAR mandates human review over "
+                    "auto-landing. The implementation is attached for a "
+                    "maintainer to land manually.\n\n" + render_risk_detail(risk)
+                ),
+                implementation_diff=_capture_implementation_diff(workdir),
+                selection_note=result.get("selection_reasoning", ""),
+                selection_rejected=result.get("selection_rejected"),
+                footer_override=(
+                    f"_Opened by the [Remyx Recommendation]"
+                    f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. The diff's "
+                    f"calibrated risk crossed the auto-land threshold — routed "
+                    f"to Issue for human review per RADAR's risk-aware policy._"
+                ),
+            )
+            result["status"] = "issue_opened_high_risk"
+            result["issue_url"] = issue_url
+            return result
+
         # 8. Tests
         tests_status, test_output = run_tests(workdir)
         result["tests_status"] = tests_status
@@ -5153,6 +5194,12 @@ def process_target(target: Target) -> dict:
             draft = tests_status != "passed"
         else:                                # "on_test_failure"
             draft = tests_status != "passed"
+
+        # RADAR risk-aware safety: an "elevated"-band diff stays a draft even
+        # when tests pass, so a human reviews before it lands. Low-risk diffs
+        # are unaffected; "high" already routed to an Issue above.
+        if result.get("diff_risk_band") == "elevated":
+            draft = True
 
         # 11. Commit + push + PR
         pr_title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
