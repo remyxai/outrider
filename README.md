@@ -250,9 +250,12 @@ no PR or Issue.
 
 Setup:
 
-1. **Create (or pick) a Discussion** on your repo to host the digests, and
+1. **Enable Discussions** on your repo if it isn't already on:
+   *Settings → General → Features → ☑ Discussions*. (Repos — forks
+   especially — have Discussions off by default.)
+2. **Create (or pick) a Discussion** on your repo to host the digests, and
    note its number from the URL.
-2. **Add a second scheduled job** (weekly cron) that calls the action in
+3. **Add a second scheduled job** (weekly cron) that calls the action in
    `weekly-summary` mode. Note the extra `discussions: write` permission:
 
    ```yaml
@@ -279,6 +282,11 @@ Setup:
              mode: weekly-summary
              weekly-discussion-id: '123'  # your Discussion number
    ```
+
+The digest posts as `remyx-ai[bot]` when the Remyx GitHub App is installed
+on the repo with Discussions access (if a permission prompt is pending,
+accept it under *Settings → GitHub Apps → remyx-ai*); otherwise it falls
+back to the workflow's `GITHUB_TOKEN` and posts as `github-actions[bot]`.
 
 Cost: one Claude call per week (~$0.10–0.20) to draft the interpretive
 sections; the rest is GitHub API reads. If that call fails, the digest still
