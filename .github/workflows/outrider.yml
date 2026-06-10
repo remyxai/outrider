@@ -1,0 +1,26 @@
+name: Outrider
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: outrider
+  cancel-in-progress: false
+
+jobs:
+  recommend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          interest-id: '054bb25c-ff68-4d10-bd65-762df0aca8e8'
