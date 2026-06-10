@@ -9,8 +9,10 @@
     extension (extension is last-resort)
   - `select_recommendation` rejects extension picks missing the
     required fields (treats as malformed → falls back to skip)
-  - Extension floor: tier=high AND relevance >= 0.90 required for
+  - Extension floor: tier=high AND relevance >= 0.85 required for
     in-pool extension picks; below-floor picks are rejected
+    (recalibrated from 0.90 in v1.5.1 to admit candidates in the
+    0.85-0.90 boundary band that the old hard cut was over-rejecting)
   - Extension picks thread through `selection_team_direction_signal`
     and `selection_proposed_call_site` in the result dict (for
     downgrade Issue body + step summary consumption)
@@ -151,13 +153,13 @@ def test_extension_pick_missing_proposed_call_site_rejected(
 
 
 def test_extension_pick_below_relevance_floor_rejected(monkeypatch, tmp_path):
-    """Gate 4: tier=high AND relevance >= 0.90. A pick at relevance 0.85
+    """Gate 4: tier=high AND relevance >= 0.85. A pick at relevance 0.60
     fails gate 4 and must be rejected even if the other fields are
     present."""
     result = _run_selection(
         monkeypatch, tmp_path,
         candidates=[
-            _rec("2605.26004", "Paper Alpha", relevance=0.85),
+            _rec("2605.26004", "Paper Alpha", relevance=0.60),
             _rec("9999.99999", "Filler"),
         ],
         claude_response={
@@ -166,6 +168,65 @@ def test_extension_pick_below_relevance_floor_rejected(monkeypatch, tmp_path):
             "team_direction_signal": "Issue #95 names this paper",
             "proposed_call_site": "after stage_a, before publish",
             "reasoning": "below-floor relevance — must reject",
+        },
+    )
+    assert result["chosen_index"] == -1
+
+
+def test_extension_pick_at_0p85_floor_passes(monkeypatch, tmp_path):
+    """Recalibrated v1.5.1 boundary: relevance exactly at 0.85 passes
+    gate 4 (the comparison is `< 0.85`, not `<=`). A pick at 0.87 — the
+    target boundary-band score regime the recalibration was designed to
+    admit — must also pass."""
+    result = _run_selection(
+        monkeypatch, tmp_path,
+        candidates=[
+            _rec("2605.26004", "Paper Alpha", tier="high", relevance=0.85),
+            _rec("9999.99999", "Filler"),
+        ],
+        claude_response={
+            "chosen_index": 0,
+            "integration_shape": "extension",
+            "team_direction_signal": "Issue #95 names this paper",
+            "proposed_call_site": "after stage_a, before publish",
+            "reasoning": "at-floor boundary-band pick — must pass",
+        },
+    )
+    assert result["chosen_index"] == 0
+
+    result = _run_selection(
+        monkeypatch, tmp_path,
+        candidates=[
+            _rec("2605.26004", "Paper Beta", tier="high", relevance=0.87),
+            _rec("9999.99999", "Filler"),
+        ],
+        claude_response={
+            "chosen_index": 0,
+            "integration_shape": "extension",
+            "team_direction_signal": "Issue #95 names this paper",
+            "proposed_call_site": "after stage_a, before publish",
+            "reasoning": "common boundary-band score — must pass",
+        },
+    )
+    assert result["chosen_index"] == 0
+
+
+def test_extension_pick_below_0p85_floor_rejected(monkeypatch, tmp_path):
+    """Recalibrated v1.5.1 boundary: 0.84 must fail (one tick below the
+    new floor). Pinning this boundary protects against accidental
+    recalibration drift."""
+    result = _run_selection(
+        monkeypatch, tmp_path,
+        candidates=[
+            _rec("2605.26004", "Paper Alpha", relevance=0.84),
+            _rec("9999.99999", "Filler"),
+        ],
+        claude_response={
+            "chosen_index": 0,
+            "integration_shape": "extension",
+            "team_direction_signal": "Issue #95 names this paper",
+            "proposed_call_site": "after stage_a, before publish",
+            "reasoning": "just-below-floor — must reject",
         },
     )
     assert result["chosen_index"] == -1

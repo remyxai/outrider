@@ -570,8 +570,11 @@ a structural mismatch and should be rejected.
          contribution. If a partial implementation exists, this is
          addition or replacement, not extension.
       4. **Higher relevance + interest-alignment bar than addition** —
-         tier MUST be `high` AND relevance MUST be ≥ 0.90 AND the
+         tier MUST be `high` AND relevance MUST be ≥ 0.85 AND the
          `reasoning` field MUST verbalize the interest-alignment.
+         Gates 1-3 carry the structural-fit load — gate 4 is a
+         "ranker put this candidate in the top band" sanity check,
+         not a second pass on relevance.
     Verification: cite the specific team-direction signal that satisfies
     gate 2 in the `team_direction_signal` schema field below. Cite the
     adjacent pipeline stage (upstream or downstream of the proposed new
@@ -3172,18 +3175,24 @@ def select_recommendation(
             )
             data["chosen_index"] = -1
             return data
-        # Extension floor: tier=high AND relevance >= 0.90 (gate 4 of the
-        # four-gate verification). Only validate when chosen_index >= 0;
-        # external extension picks (-2) don't have a pool candidate to
-        # check against.
+        # Extension floor: tier=high AND relevance >= 0.85 (gate 4 of the
+        # four-gate verification). The 0.85 threshold (down from the
+        # original 0.90) admits high-tier candidates that fall just under
+        # the old hard 0.90 cut — the 0.85-0.90 boundary band where
+        # several legitimate extension picks were being rejected on
+        # relevance alone. Gates 1-3 carry the structural-fit load; this
+        # gate is a "ranker put this candidate in the top band" sanity
+        # check, not a second pass on relevance. Only validate when
+        # chosen_index >= 0; external extension picks (-2) don't have a
+        # pool candidate to check against.
         if idx >= 0 and 0 <= idx < len(candidates):
             cand = candidates[idx]
-            if cand.tier.lower() != "high" or cand.relevance_score < 0.90:
+            if cand.tier.lower() != "high" or cand.relevance_score < 0.85:
                 log.warning(
                     f"  selection: extension pick [{idx}] "
                     f"{cand.paper_title[:50]}… fails extension floor "
                     f"(tier={cand.tier!r}, relevance={cand.relevance_score:.2f}); "
-                    f"extension requires tier=high AND relevance>=0.90; "
+                    f"extension requires tier=high AND relevance>=0.85; "
                     f"falling back to skip-by-verification"
                 )
                 data["chosen_index"] = -1
