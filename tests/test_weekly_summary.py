@@ -205,13 +205,31 @@ def test_aggregate_week_sums_and_merges():
 # ─── _compose_weekly_markdown ─────────────────────────────────────────────
 
 
-def _compose(agg=None, open_issues=None, drafted=None):
+def _compose(agg=None, open_items=None, drafted=None):
     agg = agg or run._aggregate_week([_entry(_SUMMARY)])
     start = dt.datetime(2026, 6, 2, tzinfo=dt.timezone.utc)
     end = dt.datetime(2026, 6, 9, tzinfo=dt.timezone.utc)
     return run._compose_weekly_markdown(
-        start, end, agg, open_issues or [], drafted,
+        start, end, agg, open_items or [], drafted,
     )
+
+
+def test_compose_headline_and_stat_line():
+    agg = run._aggregate_week([
+        _entry(_SUMMARY),
+        _entry({
+            "status": "pr_opened_draft",
+            "pr_url": "https://github.com/example/repo/pull/11",
+            "cost_usd": 1.0,
+        }),
+    ])
+    body = _compose(agg=agg)
+    assert body.startswith("## 🧭 Outrider weekly — Jun 2 → Jun 9")
+    stat_line = body.splitlines()[2]
+    assert "**2 runs**" in stat_line
+    assert "✅ 1 draft PR" in stat_line
+    assert "⏭️ 1 skip" in stat_line
+    assert "💸 $2.01 verified" in stat_line
 
 
 def test_compose_preserves_selection_quote_verbatim():
@@ -225,47 +243,158 @@ def test_compose_renders_retention_gap_row():
     assert "outside log retention — details unavailable" in body
 
 
+def test_compose_run_log_collapsed_and_grouped_by_date():
+    agg = run._aggregate_week([
+        _entry({"status": "error", "error": "x"}),
+        _entry({"status": "error", "error": "y"}),
+        _entry({
+            "status": "pr_opened_draft",
+            "pr_url": "https://github.com/example/repo/pull/7",
+        }, created="2026-06-07T14:00:00Z"),
+    ])
+    body = _compose(agg=agg)
+    assert "<summary>📋 Full run log (3 runs)</summary>" in body
+    # Two same-day errors collapse to one cell with a count.
+    assert "| 06-08 | `error` ×2 | — |" in body
+    assert "| 06-07 | `pr_opened_draft` | [#7](https://github.com/example/repo/pull/7) |" in body
+
+
 def test_compose_patterns_only_when_drafted():
     no_draft = _compose(drafted=None)
-    assert "Patterns worth attention" not in no_draft
+    assert "Patterns worth your attention" not in no_draft
     drafted = _compose(drafted={
-        "patterns": ["The dedup gate fired twice — review Issue #87."],
+        "patterns": ["**Dedup gate** — fired twice → review Issue #87"],
     })
-    assert "### Patterns worth attention" in drafted
-    assert "1. The dedup gate fired twice — review Issue #87." in drafted
+    assert "### ⚡ Patterns worth your attention" in drafted
+    assert "1. **Dedup gate** — fired twice → review Issue #87" in drafted
 
 
-def test_compose_open_issue_next_action_column():
+def test_compose_research_stream_only_when_drafted():
+    no_draft = _compose(drafted={"patterns": ["**X** — y → z"]})
+    assert "In the research stream" not in no_draft
+    body = _compose(drafted={
+        "research_trends": [
+            "**Eval-efficiency methods dominate** — 5 of 13 candidates",
+        ],
+    })
+    assert "### 📈 In the research stream" in body
+    assert "- **Eval-efficiency methods dominate** — 5 of 13 candidates" in body
+
+
+def test_compose_checklist_with_next_action_and_date():
     body = _compose(
-        open_issues=[{
-            "number": 93, "title": "CLIP4DM",
+        open_items=[{
+            "number": 93,
+            "title": "[Remyx Recommendation] CLIP4DM",
             "html_url": "https://github.com/example/repo/issues/93",
+            "created_at": "2026-06-08T10:00:00Z",
         }],
         drafted={"next_actions": {"93": "flip the default-False flag"}},
     )
-    assert "| [#93](https://github.com/example/repo/issues/93) " in body
-    assert "flip the default-False flag" in body
+    assert (
+        "- [ ] [#93](https://github.com/example/repo/issues/93) CLIP4DM "
+        "· Jun 8 — next: flip the default-False flag"
+    ) in body
 
 
-def test_compose_open_issue_without_next_action_gets_dash():
-    body = _compose(open_issues=[{
+def test_compose_checklist_without_next_action_or_date():
+    body = _compose(open_items=[{
         "number": 85, "title": "Beyond 3D VQAs",
         "html_url": "https://github.com/example/repo/issues/85",
     }])
-    assert "| [#85](https://github.com/example/repo/issues/85) | Beyond 3D VQAs | — |" in body
+    assert (
+        "- [ ] [#85](https://github.com/example/repo/issues/85) "
+        "Beyond 3D VQAs"
+    ) in body
+    assert "— next:" not in body
 
 
-def test_compose_license_table_canonical_order():
+def test_compose_license_findings_inline_canonical_order():
     body = _compose()
-    perm_idx = body.index("| permissive | 4 |")
-    missing_idx = body.index("| missing | 30 |")
-    assert perm_idx < missing_idx
+    assert "### ⚖️ License gate findings" in body
+    assert "`permissive: 4 · missing: 30`" in body
+
+
+def test_compose_refine_themes_as_bullets():
+    body = _compose(drafted={
+        "refine_themes": [
+            {"theme": "Eval-set compression", "queries": 1,
+             "hit_rate": "low hit rate"},
+        ],
+    })
+    assert "### 🔭 Refine-query themes the audit pass explored" in body
+    assert "- Eval-set compression — 1 query · low hit rate" in body
 
 
 def test_compose_flags_unverified_cost():
     agg = run._aggregate_week([_entry(_SUMMARY), _entry(None)])
     body = _compose(agg=agg)
     assert "1 run(s) outside log retention not counted" in body
+
+
+def test_compose_footer_is_small():
+    body = _compose()
+    assert body.rstrip().endswith("</sub>")
+
+
+# ─── candidate corpus + prior digest ──────────────────────────────────────
+
+
+def test_aggregate_week_candidate_corpus_dedups_across_runs():
+    rejected = [
+        {"arxiv_id": "2601.1", "title": "Paper A", "reason": "no call site"},
+        {"arxiv_id": "2601.2", "title": "Paper B", "reason": "off contract"},
+    ]
+    entries = [
+        _entry({
+            "status": "pr_opened_draft",
+            "pr_url": "https://github.com/example/repo/pull/11",
+            "paper": "Chosen Paper", "arxiv": "2601.9",
+            "selection_rejected": rejected,
+        }),
+        # Same pool the day before — must not double-count.
+        _entry({
+            "status": "error",
+            "selection_rejected": rejected,
+        }, created="2026-06-07T14:00:00Z"),
+    ]
+    agg = run._aggregate_week(entries)
+    titles = [c["title"] for c in agg["candidates"]]
+    assert titles == ["Chosen Paper", "Paper A", "Paper B"]
+    assert agg["candidates"][0]["outcome"] == "chosen → pr_opened_draft"
+    assert agg["candidates"][1]["outcome"] == "rejected — no call site"
+
+
+def test_fetch_prior_digest_excerpt_returns_newest_digest(monkeypatch):
+    monkeypatch.setattr(run, "gh_graphql", lambda q, v=None: {
+        "node": {"comments": {"nodes": [
+            {"body": "## 🧭 Outrider weekly — old digest"},
+            {"body": "a maintainer reply, not a digest"},
+            {"body": "## 🧭 Outrider weekly — newest digest"},
+        ]}},
+    })
+    excerpt = run._fetch_prior_digest_excerpt("D_node")
+    assert "newest digest" in excerpt
+
+
+def test_fetch_prior_digest_excerpt_empty_on_failure(monkeypatch):
+    def boom(q, v=None):
+        raise RuntimeError("GraphQL down")
+
+    monkeypatch.setattr(run, "gh_graphql", boom)
+    assert run._fetch_prior_digest_excerpt("D_node") == ""
+
+
+def test_remyx_open_prs_filters_to_ours(monkeypatch):
+    monkeypatch.setattr(run, "gh_api", lambda m, p: [
+        {"number": 1, "title": "[Remyx Recommendation] Ours by title",
+         "head": {"ref": "feature/x"}},
+        {"number": 2, "title": "Some other PR",
+         "head": {"ref": "remyx-recommendation/2601.1"}},
+        {"number": 3, "title": "Unrelated", "head": {"ref": "fix/y"}},
+    ])
+    ours = run._remyx_open_prs(_target())
+    assert [pr["number"] for pr in ours] == [1, 2]
 
 
 # ─── run_weekly_summary ───────────────────────────────────────────────────
@@ -284,7 +413,11 @@ def test_weekly_posts_and_threads_url(monkeypatch):
     monkeypatch.setattr(run, "_fetch_week_runs",
                         lambda target, since: [_entry(_SUMMARY)])
     monkeypatch.setattr(run, "_remyx_issues", lambda target, state: [])
-    monkeypatch.setattr(run, "_draft_weekly_narrative", lambda agg, oi: None)
+    monkeypatch.setattr(run, "_remyx_open_prs", lambda target: [])
+    monkeypatch.setattr(run, "_fetch_prior_digest_excerpt", lambda d: "")
+    monkeypatch.setattr(
+        run, "_draft_weekly_narrative", lambda agg, items, prior: None,
+    )
 
     def fake_post(discussion_id, body):
         posted["id"] = discussion_id
@@ -297,9 +430,9 @@ def test_weekly_posts_and_threads_url(monkeypatch):
     assert result["discussion_comment_url"].endswith("#comment-1")
     assert result["runs_aggregated"] == 1
     assert posted["id"] == "D_node"
-    assert "## Outrider weekly summary" in posted["body"]
+    assert "## 🧭 Outrider weekly" in posted["body"]
     # Data-only degrade: the digest still posted without drafted sections.
-    assert "Patterns worth attention" not in posted["body"]
+    assert "Patterns worth your attention" not in posted["body"]
 
 
 # ─── _fetch_run_log_text (zip handling) ───────────────────────────────────

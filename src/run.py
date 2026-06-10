@@ -2431,6 +2431,31 @@ def _all_remyx_issues(target: Target) -> list[dict]:
     return _remyx_issues(target, state="all")
 
 
+def _remyx_open_prs(target: Target) -> list[dict]:
+    """Open Outrider-opened PRs on the target repo.
+
+    The weekly digest's review checklist covers both artifact routes —
+    an idle draft PR is exactly as actionable as an open Issue. Ours =
+    head branch carries the recommendation prefix, or the title carries
+    the PR prefix. Best-effort, returns ``[]`` on fetch failure.
+    """
+    try:
+        prs = gh_api(
+            "GET", f"/repos/{target.repo}/pulls?state=open&per_page=100",
+        ) or []
+    except Exception as e:
+        log.debug(f"  fetch open PRs for {target.repo} failed: {e}")
+        return []
+    ours = []
+    for pr in prs:
+        title = pr.get("title") or ""
+        head_ref = ((pr.get("head") or {}).get("ref")) or ""
+        if (title.startswith(PR_TITLE_PREFIX)
+                or head_ref.startswith(BRANCH_PREFIX)):
+            ours.append(pr)
+    return ours
+
+
 def _arxiv_linked_issues(target: Target, state: str = "all") -> list[dict]:
     """All Issues on the target repo whose body links an arxiv paper,
     regardless of who opened them.
@@ -5573,6 +5598,34 @@ def _post_discussion_comment(discussion_id: str, body: str) -> str:
     return comment.get("url") or ""
 
 
+def _fetch_prior_digest_excerpt(discussion_id: str, max_chars: int = 3000) -> str:
+    """Most recent prior digest comment on the host Discussion, truncated.
+
+    Fed to the narrative call so research-stream trends can make
+    week-over-week claims ("up from 1 candidate last week") with zero
+    storage — the Discussion thread IS the history. Best-effort: ``""``
+    when the lookup fails or no prior digest exists.
+    """
+    try:
+        data = gh_graphql(
+            "query($id: ID!) { node(id: $id) { ... on Discussion {"
+            " comments(last: 5) { nodes { body } } } } }",
+            {"id": discussion_id},
+        )
+    except Exception as e:
+        log.debug(f"  weekly: prior-digest fetch failed: {e}")
+        return ""
+    nodes = (
+        ((data.get("node") or {}).get("comments") or {}).get("nodes")
+    ) or []
+    # `last: 5` returns oldest→newest; scan newest first.
+    for node in reversed(nodes):
+        body = (node or {}).get("body") or ""
+        if "Outrider weekly" in body:
+            return body[:max_chars]
+    return ""
+
+
 _LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z ?")
 
 
@@ -5695,13 +5748,23 @@ def _aggregate_week(entries: list[dict]) -> dict:
         "n_runs": len(entries),
         "n_success": 0,
         "n_failed": 0,
+        "n_artifacts": 0,
+        "n_skips": 0,
+        "n_errors": 0,
+        "artifact_statuses": {},
         "status_counts": {},
         "verified_cost": 0.0,
         "unverified_runs": 0,
         "license_class_counts": {},
         "refine_queries": [],
         "selection_quotes": [],
+        # Distinct candidates the selection pass saw this week — title +
+        # outcome (chosen, or the rejection reason). Deduped across runs
+        # (the same pool repeats on daily crons); the research-stream
+        # trends in the narrative call are drawn from this corpus.
+        "candidates": [],
     }
+    seen_candidates: set[str] = set()
     for e in entries:
         run, summary = e["run"], e["summary"]
         date = (run.get("created_at") or "")[:10]
@@ -5711,6 +5774,8 @@ def _aggregate_week(entries: list[dict]) -> dict:
             agg["n_failed"] += 1
         if summary is None:
             agg["unverified_runs"] += 1
+            if run.get("conclusion") != "success":
+                agg["n_errors"] += 1
             agg["rows"].append({
                 "date": date,
                 "status": "(outside log retention — details unavailable)",
@@ -5721,9 +5786,17 @@ def _aggregate_week(entries: list[dict]) -> dict:
         agg["status_counts"][status] = agg["status_counts"].get(status, 0) + 1
         artifact = summary.get("pr_url") or summary.get("issue_url") or ""
         if artifact:
+            agg["n_artifacts"] += 1
+            agg["artifact_statuses"][status] = (
+                agg["artifact_statuses"].get(status, 0) + 1
+            )
             number = artifact.rstrip("/").split("/")[-1]
             output = f"[#{number}]({artifact})"
         else:
+            if status.startswith("skipped"):
+                agg["n_skips"] += 1
+            else:
+                agg["n_errors"] += 1
             output = "No artifact"
         agg["rows"].append({"date": date, "status": status, "output": output})
         agg["verified_cost"] += float(summary.get("cost_usd") or 0.0)
@@ -5735,62 +5808,109 @@ def _aggregate_week(entries: list[dict]) -> dict:
         reasoning = (summary.get("selection_reasoning") or "").strip()
         if status == "skipped_by_selection_verification" and reasoning:
             agg["selection_quotes"].append(reasoning)
+        # Candidate corpus — entries are newest-first, so the first
+        # occurrence carries the most recent outcome for that paper.
+        chosen_key = (
+            summary.get("arxiv") or summary.get("paper") or ""
+        ).strip().lower()
+        if artifact and chosen_key and chosen_key not in seen_candidates:
+            seen_candidates.add(chosen_key)
+            agg["candidates"].append({
+                "title": (summary.get("paper") or "")[:120],
+                "outcome": f"chosen → {status}",
+            })
+        for r in summary.get("selection_rejected") or []:
+            key = (
+                (r.get("arxiv_id") or "") or (r.get("title") or "")
+            ).strip().lower()
+            if not key or key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            agg["candidates"].append({
+                "title": (r.get("title") or "")[:120],
+                "outcome": f"rejected — {(r.get('reason') or '')[:160]}",
+            })
+    if len(agg["candidates"]) > 60:
+        log.info(f"  weekly: candidate corpus capped at 60 "
+                 f"(of {len(agg['candidates'])} distinct)")
+        agg["candidates"] = agg["candidates"][:60]
     return agg
 
 
 _WEEKLY_NARRATIVE_PROMPT_TEMPLATE = """\
-You are drafting the interpretive sections of Outrider's weekly summary
-for the repository __REPO__. Everything below is the week's aggregated
-run data plus the open Outrider Issues awaiting maintainer review. Your
-output supplements the data tables — do NOT restate them.
+You are drafting the interpretive sections of Outrider's weekly digest
+for the repository __REPO__. Below: the week's aggregated run data
+(including the distinct candidate papers the selection pass saw), the
+open Outrider artifacts awaiting maintainer review, and — when present —
+last week's digest. Your output supplements the data sections; do NOT
+restate them.
 
 Aggregated run data (JSON)
 --------------------------
 __AGG_JSON__
 
-Open Outrider Issues (number, title, body excerpt)
---------------------------------------------------
-__OPEN_ISSUES__
+Open Outrider artifacts awaiting review (number, title, body excerpt)
+---------------------------------------------------------------------
+__OPEN_ITEMS__
+
+Last week's digest (excerpt; may be empty)
+------------------------------------------
+__PRIOR_DIGEST__
 
 Produce strictly this JSON object (no prose wrapper):
 {
   "verdict_bullets": ["...", ...],
   "refine_themes": [{"theme": "...", "queries": N, "hit_rate": "..."}, ...],
   "patterns": ["...", ...],
-  "next_actions": {"<issue number>": "<one-line next action>", ...}
+  "research_trends": ["...", ...],
+  "next_actions": {"<artifact number>": "<short next action>", ...}
 }
 
+Style — every string is a terse fragment, NOT a full sentence. No
+trailing periods. The reader is skimming; distill each point to its
+essence.
+
 Rules:
-- verdict_bullets: 2-4 bullets summarizing what the selection pass did
-  this week (what it anchored on, what it rejected and why). Do not
-  paraphrase any verbatim reasoning quote — that is rendered separately.
-- refine_themes: cluster the refine queries into themes with a per-theme
-  query count and a one-phrase hit-rate assessment. Empty list if there
-  were no refine queries.
-- patterns: 3-5 entries. Each MUST lead with a noun, and each MUST end
-  with a concrete maintainer action. This is the only opinionated
-  section of the summary — interpretation, not data.
-- next_actions: for each open Issue where the body makes the next step
+- verdict_bullets: 2-3 fragments on what the selection pass did this
+  week — what it anchored on, what it rejected and why. Verbatim
+  reasoning quotes are rendered separately; never paraphrase them.
+  Quotes exist only for verification-skip runs, so their absence in a
+  week with PR/Issue outcomes is normal — NOT a wiring failure.
+- refine_themes: cluster the refine queries into themes; per-theme query
+  count + one-phrase hit-rate assessment. Empty list when no queries.
+- patterns: 3-5 entries about operating Outrider better. Format:
+  "**Noun phrase** — evidence → concrete maintainer action". Evidence
+  MUST cite numbers from the data.
+- research_trends: 2-4 entries on the research themes moving through
+  this repo's recommendation stream (NOT arxiv at large — the pool is
+  shaped by this repo's interest). Format: "**Theme** — N of M
+  candidates, what it means for this repo". Only claim a trend with
+  >= 2 supporting candidates; always cite the counts. Use last week's
+  digest for week-over-week deltas only when it actually supports the
+  claim. Do NOT duplicate content between patterns and research_trends:
+  patterns = operate the tool, research_trends = the field.
+- next_actions: for each open artifact whose body makes the next step
   obvious (a flag to flip, a license to re-check, a question to answer),
-  a one-line action. Omit Issues where no clear next action exists.
+  a short action fragment. Omit artifacts with no clear next action.
 """
 
 
 def _draft_weekly_narrative(
-    agg: dict, open_issues: list[dict],
+    agg: dict, open_items: list[dict], prior_digest: str = "",
 ) -> dict | None:
     """One Claude call drafting the interpretive sections. None on any
     failure — the digest degrades to data-only, never blocks the post."""
-    issues_block = "\n".join(
+    items_block = "\n".join(
         f"#{it.get('number')} {it.get('title', '')}\n"
         f"  {' '.join((it.get('body') or '').split())[:1200]}"
-        for it in open_issues
+        for it in open_items
     ) or "(none open)"
     prompt = (
         _WEEKLY_NARRATIVE_PROMPT_TEMPLATE
         .replace("__REPO__", agg.get("repo", ""))
         .replace("__AGG_JSON__", json.dumps(agg, indent=2)[:20000])
-        .replace("__OPEN_ISSUES__", issues_block)
+        .replace("__OPEN_ITEMS__", items_block)
+        .replace("__PRIOR_DIGEST__", prior_digest or "(no prior digest)")
     )
     timeout_s = int(os.environ.get("REMYX_WEEKLY_TIMEOUT_S", "180"))
     max_turns = int(os.environ.get("REMYX_WEEKLY_MAX_TURNS", "3"))
@@ -5808,58 +5928,167 @@ def _draft_weekly_narrative(
     return data
 
 
+def _short_artifact_title(title: str, max_len: int = 70) -> str:
+    """Checklist-friendly title: prefix stripped, word-boundary truncated."""
+    t = (title or "").strip()
+    if t.startswith(PR_TITLE_PREFIX):
+        t = t[len(PR_TITLE_PREFIX):].strip()
+    if len(t) > max_len:
+        t = t[:max_len].rsplit(" ", 1)[0].rstrip(",;:·-") + "…"
+    return t
+
+
+def _month_day(iso: str) -> str:
+    """``2026-06-10T…`` → ``Jun 10``; ``""`` when unparseable."""
+    try:
+        d = dt.datetime.fromisoformat((iso or "").replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return f"{d.strftime('%b')} {d.day}"
+
+
+def _drafted_fragments(drafted: dict, key: str) -> list[str]:
+    """Non-empty string fragments under ``key``, or [] for any bad shape."""
+    raw = drafted.get(key)
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _group_run_rows_by_date(rows: list[dict]) -> list[tuple[str, str, str]]:
+    """Collapse per-run rows into one table row per date.
+
+    A daily-cron week produces 7+ near-identical rows; one row per date
+    with per-status counts (``\\`error\\` ×3``) keeps the collapsed run
+    log skimmable without dropping the audit trail. Output cell joins
+    the date's artifact links, ``—`` when none.
+    """
+    by_date: dict[str, dict] = {}
+    order: list[str] = []
+    for row in rows:
+        date = row["date"][5:] if len(row["date"]) == 10 else row["date"]
+        if date not in by_date:
+            by_date[date] = {"order": [], "counts": {}, "outputs": []}
+            order.append(date)
+        g = by_date[date]
+        s = row["status"]
+        if s not in g["counts"]:
+            g["order"].append(s)
+        g["counts"][s] = g["counts"].get(s, 0) + 1
+        out = row.get("output") or ""
+        if out and out not in ("No artifact", "—"):
+            g["outputs"].append(out)
+    grouped = []
+    for date in order:
+        g = by_date[date]
+        status_cell = " · ".join(
+            f"`{s}`" + (f" ×{g['counts'][s]}" if g["counts"][s] > 1 else "")
+            for s in g["order"]
+        )
+        grouped.append((date, status_cell, " · ".join(g["outputs"]) or "—"))
+    return grouped
+
+
 def _compose_weekly_markdown(
     window_start: "dt.datetime",
     window_end: "dt.datetime",
     agg: dict,
-    open_issues: list[dict],
+    open_items: list[dict],
     drafted: dict | None,
 ) -> str:
-    """Assemble the Discussion-comment body. Data sections are mechanical;
-    the drafted sections slot in when the Claude call succeeded. The
-    verbatim selection-reasoning quote is copied as-is into a blockquote —
-    never paraphrased (it's the most maintainer-impactful content)."""
+    """Assemble the Discussion-comment body.
+
+    Layout: interpretive sections lead — patterns, then research-stream
+    trends — followed by a checkable review list of open artifacts; the
+    mechanical data sections support below, with the full run log
+    collapsed so a long week doesn't turn the digest into a scroll.
+    Everything renders as fragments, not sentences. The verbatim
+    selection-reasoning quote is copied as-is into a blockquote — never
+    paraphrased (it's the most maintainer-impactful content). Drafted
+    sections slot in when the narrative call succeeded; the digest is
+    data-only otherwise.
+    """
     drafted = drafted or {}
     lines: list[str] = []
     lines.append(
-        f"## Outrider weekly summary — "
-        f"{window_start.strftime('%Y-%m-%d')} to "
-        f"{window_end.strftime('%Y-%m-%d')}"
+        f"## 🧭 Outrider weekly — "
+        f"{window_start.strftime('%b')} {window_start.day} → "
+        f"{window_end.strftime('%b')} {window_end.day}"
     )
     lines.append("")
-    # Exact when every run's log parsed; explicitly partial otherwise —
-    # never report an estimate as exact.
-    cost_phrase = f"${agg['verified_cost']:.2f}"
+
+    # Stat line — zero segments are dropped; cost is exact when every
+    # run's log parsed and explicitly partial otherwise (never report an
+    # estimate as exact).
+    segments = [f"**{agg['n_runs']} runs**"]
+    if agg.get("n_artifacts"):
+        statuses = set(agg.get("artifact_statuses") or {})
+        plural = agg["n_artifacts"] != 1
+        if statuses == {"pr_opened_draft"}:
+            label = "draft PRs" if plural else "draft PR"
+        elif statuses and all(s.startswith("pr_opened") for s in statuses):
+            label = "PRs" if plural else "PR"
+        elif statuses and all(s.startswith("issue_opened") for s in statuses):
+            label = "Issues" if plural else "Issue"
+        else:
+            label = "artifacts" if plural else "artifact"
+        segments.append(f"✅ {agg['n_artifacts']} {label}")
+    if agg.get("n_skips"):
+        n = agg["n_skips"]
+        segments.append(f"⏭️ {n} skip{'s' if n != 1 else ''}")
+    if agg.get("n_errors"):
+        n = agg["n_errors"]
+        segments.append(f"❌ {n} error{'s' if n != 1 else ''}")
+    cost_seg = f"💸 ${agg['verified_cost']:.2f} verified"
     if agg["unverified_runs"]:
-        cost_phrase += (
-            f" verified ({agg['unverified_runs']} run(s) outside log "
-            f"retention not counted)"
+        cost_seg += (
+            f" · {agg['unverified_runs']} run(s) outside log retention "
+            f"not counted"
         )
-    lines.append(
-        f"**Runs this week**: {agg['n_runs']} "
-        f"({agg['n_success']} successful, {agg['n_failed']} failed). "
-        f"Claude spend: {cost_phrase}."
-    )
+    segments.append(cost_seg)
+    lines.append(" · ".join(segments))
 
-    if agg["rows"]:
-        lines += ["", "### Outcomes", "", "| Date | Status | Output |",
-                  "|---|---|---|"]
-        for row in agg["rows"]:
-            lines.append(
-                f"| {row['date']} | `{row['status']}` | {row['output']} |"
+    patterns = _drafted_fragments(drafted, "patterns")
+    if patterns:
+        lines += ["", "### ⚡ Patterns worth your attention", ""]
+        lines += [f"{i}. {p}" for i, p in enumerate(patterns, start=1)]
+
+    trends = _drafted_fragments(drafted, "research_trends")
+    if trends:
+        lines += ["", "### 📈 In the research stream", ""]
+        lines += [f"- {t}" for t in trends]
+
+    if open_items:
+        next_actions = drafted.get("next_actions")
+        if not isinstance(next_actions, dict):
+            next_actions = {}
+        lines += ["", "### 📥 Awaiting your review", ""]
+        for it in open_items:
+            number = it.get("number")
+            url = it.get("html_url") or ""
+            entry = (
+                f"- [ ] [#{number}]({url}) "
+                f"{_short_artifact_title(it.get('title') or '')}"
             )
+            opened = _month_day(it.get("created_at") or "")
+            if opened:
+                entry += f" · {opened}"
+            action = str(next_actions.get(str(number), "") or "").strip()
+            if action:
+                entry += f" — next: {action}"
+            lines.append(entry)
 
-    lines += ["", "### Selection-pass verdicts", ""]
-    bullets = drafted.get("verdict_bullets") or []
-    if isinstance(bullets, list) and bullets:
-        lines += [f"- {b}" for b in bullets if str(b).strip()]
+    lines += ["", "### 🔍 Selection-pass verdicts", ""]
+    bullets = _drafted_fragments(drafted, "verdict_bullets")
+    if bullets:
+        lines += [f"- {b}" for b in bullets]
     elif agg["status_counts"]:
         lines += [
             f"- {n} run(s) ended `{s}`"
             for s, n in sorted(agg["status_counts"].items())
         ]
     else:
-        lines.append("- No completed Outrider runs in this window.")
+        lines.append("- No completed Outrider runs in this window")
     if agg["selection_quotes"]:
         # Verbatim, most recent first — the rejection reasoning is the
         # most maintainer-impactful content; never paraphrase it.
@@ -5868,18 +6097,19 @@ def _compose_weekly_markdown(
             lines.append(f"> {quote_line}")
 
     themes = drafted.get("refine_themes") or []
-    if isinstance(themes, list) and themes:
-        lines += ["", "### Refine-query themes the audit pass explored", "",
-                  "| Theme | Queries | Hit rate |", "|---|---|---|"]
+    if isinstance(themes, list) and any(isinstance(t, dict) for t in themes):
+        lines += ["", "### 🔭 Refine-query themes the audit pass explored", ""]
         for t in themes:
             if not isinstance(t, dict):
                 continue
+            n_q = t.get("queries", "")
+            unit = "query" if str(n_q) == "1" else "queries"
             lines.append(
-                f"| {t.get('theme', '')} | {t.get('queries', '')} "
-                f"| {t.get('hit_rate', '')} |"
+                f"- {t.get('theme', '')} — {n_q} {unit} "
+                f"· {t.get('hit_rate', '')}"
             )
     elif agg["refine_queries"]:
-        lines += ["", "### Refine queries the audit pass explored", ""]
+        lines += ["", "### 🔭 Refine queries the audit pass explored", ""]
         seen_q: set[str] = set()
         for q in agg["refine_queries"]:
             if q not in seen_q:
@@ -5887,43 +6117,28 @@ def _compose_weekly_markdown(
                 lines.append(f"- `{q}`")
 
     if agg["license_class_counts"]:
-        lines += ["", "### License gate findings", "",
-                  "| Class | Count |", "|---|---|"]
-        counts = agg["license_class_counts"]
-        ordered = [k for k in _LICENSE_CLASS_ORDER if counts.get(k)]
-        ordered += [k for k in counts if k not in _LICENSE_CLASS_ORDER]
-        for cls in ordered:
-            lines.append(f"| {cls} | {counts[cls]} |")
-
-    if open_issues:
-        next_actions = drafted.get("next_actions") or {}
-        lines += ["", "### Open Outrider Issues awaiting maintainer review",
-                  "", "| Issue | Title | Next action |", "|---|---|---|"]
-        for it in open_issues:
-            number = it.get("number")
-            title = (it.get("title") or "").replace("|", "\\|")[:100]
-            url = it.get("html_url") or ""
-            action = "—"
-            if isinstance(next_actions, dict):
-                action = str(
-                    next_actions.get(str(number), "—") or "—"
-                ).replace("|", "\\|")
-            lines.append(f"| [#{number}]({url}) | {title} | {action} |")
-
-    patterns = drafted.get("patterns") or []
-    if isinstance(patterns, list) and patterns:
-        lines += ["", "### Patterns worth attention", ""]
         lines += [
-            f"{i}. {p}" for i, p in enumerate(
-                (str(p).strip() for p in patterns if str(p).strip()), start=1,
-            )
+            "", "### ⚖️ License gate findings", "",
+            f"`{_format_license_class_counts(agg['license_class_counts'])}`",
         ]
+
+    if agg["rows"]:
+        lines += [
+            "", "<details>",
+            f"<summary>📋 Full run log ({agg['n_runs']} "
+            f"run{'s' if agg['n_runs'] != 1 else ''})</summary>", "",
+            "| Date | Status | Output |", "|---|---|---|",
+        ]
+        for date, status_cell, output_cell in _group_run_rows_by_date(
+            agg["rows"]
+        ):
+            lines.append(f"| {date} | {status_cell} | {output_cell} |")
+        lines += ["", "</details>"]
 
     lines += [
         "", "---", "",
-        "_Generated by Outrider's weekly-summary mode. Data source: "
-        "GitHub Actions API + per-run logs; runs whose logs aged out of "
-        "retention are listed without details._",
+        "<sub>Outrider weekly-summary · data: GitHub Actions API + run "
+        "logs · out-of-retention runs listed without details</sub>",
     ]
     return "\n".join(lines)
 
@@ -5947,19 +6162,26 @@ def run_weekly_summary(target: Target) -> dict:
     log.info(f"  → weekly summary over {target.repo} "
              f"({window_start.date()} → {window_end.date()})")
     entries = _fetch_week_runs(target, window_start)
-    open_issues = _remyx_issues(target, state="open")
+    # Review checklist = open Outrider PRs + Issues, newest first — an
+    # idle draft PR is as actionable as an open Issue.
+    open_items = sorted(
+        _remyx_open_prs(target) + _remyx_issues(target, state="open"),
+        key=lambda it: it.get("created_at") or "",
+        reverse=True,
+    )
     agg = _aggregate_week(entries)
     agg["repo"] = target.repo
-    drafted = _draft_weekly_narrative(agg, open_issues)
+    prior_digest = _fetch_prior_digest_excerpt(discussion_id)
+    drafted = _draft_weekly_narrative(agg, open_items, prior_digest)
     body = _compose_weekly_markdown(
-        window_start, window_end, agg, open_issues, drafted,
+        window_start, window_end, agg, open_items, drafted,
     )
     url = _post_discussion_comment(discussion_id, body)
     result.update({
         "status": "weekly_summary_posted",
         "discussion_comment_url": url,
         "runs_aggregated": len(entries),
-        "open_issues_listed": len(open_issues),
+        "open_items_listed": len(open_items),
         "narrative_drafted": drafted is not None,
     })
     log.info(f"  ✓ weekly_summary_posted: {url}")
