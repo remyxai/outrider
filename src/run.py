@@ -45,6 +45,7 @@ from __future__ import annotations
 import ast
 import base64
 import datetime as dt
+import io
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -836,8 +838,9 @@ TEST_INTEGRATION_POLICIES = ("strict", "soft", "off")
 # Terminal statuses that should make the workflow step exit non-zero (red
 # in CI). Everything else — Issues, skips, PRs — is a legitimate green
 # outcome. `claude_failed` used to exit 0, so a run that produced no PR/Issue
-# looked green; it now fails visibly.
-FAILURE_EXIT_STATUSES = {"error", "claude_failed"}
+# looked green; it now fails visibly. `weekly_summary_failed` is the
+# weekly-summary mode's analog: a run that posted nothing should be red.
+FAILURE_EXIT_STATUSES = {"error", "claude_failed", "weekly_summary_failed"}
 
 
 @dataclass
@@ -961,6 +964,13 @@ class Recommendation:
                                       # releases), the representative carries
                                       # a human-readable summary of the
                                       # siblings. Empty for solo candidates.
+    refine_query: str = ""            # Non-empty when this candidate reached
+                                      # the pool via a deep-search refine
+                                      # query (audit pass) rather than the
+                                      # broad /papers/recommended ranking.
+                                      # Carries the query text for provenance;
+                                      # "" = broad pool. Drives the pool-
+                                      # composition telemetry.
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
@@ -1013,6 +1023,49 @@ def gh_api(method: str, path: str, body: dict | None = None) -> Any:
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")[:500]
         raise RuntimeError(f"GitHub {method} {path} → HTTP {e.code}: {body_text}") from e
+
+
+def gh_graphql(query: str, variables: dict | None = None) -> dict:
+    """Minimal GitHub GraphQL wrapper — sibling of ``gh_api``.
+
+    The Discussions API is GraphQL-only (no REST endpoint exists for
+    posting Discussion comments), so the weekly-summary mode needs this
+    alongside the REST helper. Same token resolution and error shape as
+    ``gh_api``: raises RuntimeError on transport errors AND on
+    GraphQL-level errors (GraphQL returns HTTP 200 with an ``errors``
+    array; surfacing those as exceptions keeps the two helpers
+    behaviorally identical for callers). Returns the ``data`` object.
+    """
+    token = _github_token()
+    if not token:
+        raise RuntimeError(
+            "Neither INPUT_GITHUB_TOKEN nor GITHUB_TOKEN is set. The "
+            "action.yml should pass ${{ github.token }} as GITHUB_TOKEN "
+            "by default; if you're invoking the script outside an Action, "
+            "export GITHUB_TOKEN manually."
+        )
+    payload = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(
+        "https://api.github.com/graphql", data=payload, method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "feature-finder-orchestrator",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            resp = json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"GitHub GraphQL → HTTP {e.code}: {body_text}") from e
+    if resp.get("errors"):
+        raise RuntimeError(
+            f"GitHub GraphQL errors: {json.dumps(resp['errors'])[:500]}"
+        )
+    return resp.get("data") or {}
 
 
 def slugify(s: str, max_len: int = 60) -> str:
@@ -1725,6 +1778,7 @@ def _asset_to_recommendation(
         experiment_history=experiment_history,
         paper_github_url=paper_github_url,
         paper_huggingface_url=paper_huggingface_url,
+        refine_query=refine_query,
     )
 
 
@@ -1961,6 +2015,7 @@ def audit_and_refine_pool(
              f"{(data.get('reasoning') or '')[:160]}")
     if not queries:
         return broad_candidates
+    _RUN_REFINE_QUERIES.extend(queries)
     # Pre-collect existing arxiv ids (with version-stripped variants) so
     # refine results that duplicate the broad pool are skipped silently.
     seen: set[str] = set()
@@ -2107,6 +2162,49 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
                  f"({c.license_class}, compat={c.license_compat:.2f})"
                  f"{source_hint}{url_hint}")
     return candidates
+
+
+# Canonical rendering order for license-class distributions. Any class
+# outside this list (future additions) is appended after, so the line
+# never silently drops a bucket.
+_LICENSE_CLASS_ORDER = (
+    "permissive", "copyleft", "nc", "no-code-link", "unknown", "missing",
+)
+
+
+def _pool_composition(candidates: list[Recommendation]) -> tuple[int, int]:
+    """(broad, refine) candidate counts, post family-dedup.
+
+    Counted from the per-candidate ``refine_query`` provenance marker so
+    the numbers reflect the pool the selection pass actually saw —
+    ``_coalesce_candidate_families`` may have collapsed siblings from
+    either source.
+    """
+    refine = sum(1 for c in candidates if c.refine_query)
+    return len(candidates) - refine, refine
+
+
+def _license_class_counts(candidates: list[Recommendation]) -> dict[str, int]:
+    """Per-class license distribution across the candidate pool."""
+    counts: dict[str, int] = {}
+    for c in candidates:
+        cls = c.license_class or "unknown"
+        counts[cls] = counts.get(cls, 0) + 1
+    return counts
+
+
+def _format_license_class_counts(counts: dict) -> str:
+    """Single-line distribution: ``permissive: 4 · nc: 1 · missing: 30``.
+
+    Canonical class order first, unexpected classes appended;
+    zero-count classes omitted (the dict only carries observed ones).
+    """
+    parts = [f"{k}: {counts[k]}" for k in _LICENSE_CLASS_ORDER if counts.get(k)]
+    parts += [
+        f"{k}: {v}" for k, v in counts.items()
+        if k not in _LICENSE_CLASS_ORDER and v
+    ]
+    return " · ".join(parts) if parts else "(no candidates)"
 
 
 def _coalesce_candidate_families(
@@ -2660,12 +2758,19 @@ _RUN_COST = {
     "claude_calls": 0,
 }
 
+# Refine queries the audit pass actually executed this run, including ones
+# that returned zero new candidates (those are signal too — "explored, no
+# hits"). Run-scoped like _RUN_COST; surfaced on the result dict so the
+# weekly summary can aggregate themes across runs.
+_RUN_REFINE_QUERIES: list[str] = []
+
 
 def _reset_run_cost() -> None:
     _RUN_COST.update(
         cost_usd=0.0, input_tokens=0, output_tokens=0,
         cache_read_input_tokens=0, num_turns=0, claude_calls=0,
     )
+    _RUN_REFINE_QUERIES.clear()
 
 
 def _record_claude_usage(env: dict) -> None:
@@ -3273,6 +3378,35 @@ def self_review_diff(
     return data
 
 
+# Class-coded emoji shared by the Issue/PR body license section and the
+# step summary's license-verdict line, so the two surfaces never disagree
+# on severity color.
+_LICENSE_CLASS_EMOJI = {
+    "permissive": "🟢",
+    "copyleft": "🟡",
+    "nc": "🔴",
+    "missing": "🔴",
+    "no-code-link": "🟡",
+    "unknown": "⚪",
+}
+
+
+def _license_enrichment_ran(rec: Recommendation) -> bool:
+    """True when the license gate populated any signal on ``rec``.
+
+    Every field at its dataclass default means enrichment never ran
+    (env opt-out, or a caller that bypasses query_remyx_candidates) —
+    renderers should omit the license verdict rather than report a
+    misleading "unknown".
+    """
+    return bool(
+        rec.paper_github_url or rec.paper_huggingface_url
+        or rec.paper_license
+        or rec.license_class not in ("unknown", "")
+        or rec.license_compat != 0.0
+    )
+
+
 def _render_license_section(rec: Recommendation) -> str:
     """Render the License & code availability block for the PR/Issue body.
 
@@ -3281,20 +3415,16 @@ def _render_license_section(rec: Recommendation) -> str:
     query_remyx_candidates). Otherwise renders a short status block
     with a class-coded emoji and a one-line note so the maintainer
     reads it at a glance.
+
+    Deliberately a sibling of ``_render_engineering_section``: the
+    license verdict and the engineering verdict are two independent
+    calls a maintainer must be able to read separately — an A++
+    engineering analysis fused with a wrong license flag means the
+    reader can miss either one.
     """
-    if (not rec.paper_github_url and not rec.paper_huggingface_url
-            and not rec.paper_license
-            and rec.license_class in ("unknown", "")
-            and rec.license_compat == 0.0):
+    if not _license_enrichment_ran(rec):
         return "\n"
-    emoji = {
-        "permissive": "🟢",
-        "copyleft": "🟡",
-        "nc": "🔴",
-        "missing": "🔴",
-        "no-code-link": "🟡",
-        "unknown": "⚪",
-    }.get(rec.license_class, "⚪")
+    emoji = _LICENSE_CLASS_EMOJI.get(rec.license_class, "⚪")
     note = {
         "permissive": "Permissive license — safe to adopt.",
         "copyleft":
@@ -3342,6 +3472,57 @@ def _render_license_section(rec: Recommendation) -> str:
         f"{family_line}"
         "\n"
     )
+
+
+def _render_engineering_section(
+    *,
+    integration_shape: str = "",
+    contract_match: str = "",
+    migration_cost: str = "",
+    team_direction_signal: str = "",
+    proposed_call_site: str = "",
+) -> str:
+    """Render the Engineering verdict block for Issue bodies.
+
+    Sibling of ``_render_license_section`` — the engineering call
+    (call site, contract match, migration cost) and the license call
+    must read as two adjacent, independent verdicts rather than
+    interleaved prose, so a maintainer can take one without the other
+    (e.g. a great swap proposal under a blocking license stays findable
+    if upstream relicenses). Returns ``""`` when no field carries
+    signal so callers skip the section silently.
+    """
+    rows = []
+    if integration_shape.strip():
+        rows.append(f"- **Integration shape**: {integration_shape.strip()}")
+    if contract_match.strip():
+        rows.append(f"- **Contract match**: {contract_match.strip()}")
+    if migration_cost.strip():
+        rows.append(f"- **Migration cost**: {migration_cost.strip()}")
+    if team_direction_signal.strip():
+        rows.append(
+            f"- **Team-direction signal**: {team_direction_signal.strip()}"
+        )
+    if proposed_call_site.strip():
+        rows.append(f"- **Proposed call site**: {proposed_call_site.strip()}")
+    if not rows:
+        return ""
+    return "## Engineering verdict\n\n" + "\n".join(rows) + "\n"
+
+
+def _record_verdict_fields(result: dict, rec: Recommendation) -> None:
+    """Thread the chosen candidate's license axis onto the result dict.
+
+    The step summary renders a license-verdict line adjacent to the
+    engineering verdict from these fields. Skipped entirely when the
+    license gate never ran, so the summary degrades silently instead
+    of reporting a misleading "unknown".
+    """
+    if not _license_enrichment_ran(rec):
+        return
+    result["license_class"] = rec.license_class
+    result["license_compat"] = rec.license_compat
+    result["paper_license"] = rec.paper_license
 
 
 def _render_self_review_section(review: dict) -> str:
@@ -4219,6 +4400,7 @@ def _open_downgrade_issue(
     implementation_diff: str = "",
     *,
     tldr: str = "",
+    engineering_section: str = "",
     selection_note: str = "",
     selection_rejected: list[dict] | None = None,
     skip_paper_reasoning_section: bool = False,
@@ -4239,6 +4421,10 @@ def _open_downgrade_issue(
     Optional kwargs (added in v1.4.5 to tighten reviewer triage):
 
       tldr: at-a-glance one-paragraph summary; opens the body when set
+      engineering_section: pre-rendered "## Engineering verdict" block
+        (_render_engineering_section). Rendered immediately above the
+        license section so the two verdicts read as adjacent,
+        independent calls.
       selection_note: "Why this candidate from the pool" rationale —
         parity with PR-body selection section. Skips parenthetical
         fallback strings.
@@ -4271,6 +4457,11 @@ def _open_downgrade_issue(
 
     if tldr.strip():
         sections.append(f"\n## TL;DR\n\n{tldr.strip()}\n")
+
+    # Engineering verdict then license verdict, adjacent — two
+    # independent calls, not interleaved prose.
+    if engineering_section.strip():
+        sections.append(engineering_section.rstrip() + "\n")
 
     license_section = _render_license_section(rec)
     if license_section.strip():
@@ -4459,6 +4650,18 @@ def process_target(target: Target) -> dict:
     #    the most implementable candidate.
     candidates = query_remyx_candidates(target)
     result["candidates_returned"] = len(candidates)
+    # Pool-composition + license-distribution telemetry.
+    # Post-dedup counts (query_remyx_candidates coalesces families before
+    # returning). Carried on the result dict so the step summary can
+    # surface them and the weekly summary can aggregate across runs;
+    # these are also the fields engine-side run telemetry will persist.
+    broad_n, refine_n = _pool_composition(candidates)
+    result["broad_pool_size"] = broad_n
+    result["refine_pool_size"] = refine_n
+    if _RUN_REFINE_QUERIES:
+        result["refine_queries"] = list(_RUN_REFINE_QUERIES)
+    if os.environ.get("REMYX_LICENSE_GATE", "1") != "0":
+        result["license_class_counts"] = _license_class_counts(candidates)
 
     # 3. Per-candidate gates. Drop anything below the confidence tier or
     #    already in flight — an open PR for its branch, OR an open Remyx
@@ -4639,37 +4842,45 @@ def process_target(target: Target) -> dict:
                     )
                 contract_match = selection.get("contract_match", "")
                 migration_cost = selection.get("migration_cost", "")
+                result["selection_contract_match"] = contract_match
+                result["selection_migration_cost"] = migration_cost
+                # Engineering axis rendered as its own section (adjacent
+                # to the license section in the body) instead of fused
+                # into the routing prose. Extension
+                # picks use different schema fields: team_direction_signal
+                # and proposed_call_site instead of contract_match /
+                # migration_cost (which don't apply when there's no
+                # existing call site).
                 if shape == "extension":
-                    # Extension picks use different schema fields. Render
-                    # the team_direction_signal and proposed_call_site
-                    # instead of contract_match / migration_cost (which
-                    # don't apply when there's no existing call site).
                     tds = selection.get("team_direction_signal", "")
                     pcs = selection.get("proposed_call_site", "")
+                    engineering_section = _render_engineering_section(
+                        integration_shape=shape_label,
+                        team_direction_signal=tds or "(none reported)",
+                        proposed_call_site=pcs or "(none reported)",
+                    )
                     detail = (
-                        f"**Integration shape**: {shape_label}\n\n"
-                        f"**Team-direction signal**: "
-                        f"{tds or '(none reported)'}\n\n"
-                        f"**Proposed adjacent call site**: "
-                        f"{pcs or '(none reported)'}\n\n"
                         f"_Selection reasoning_: "
                         f"{selection.get('reasoning', '')}\n\n"
                         f"This candidate proposes a NEW capability the "
                         f"repository does not currently have. The selection "
                         f"pass verified that the team has signaled openness "
                         f"to this capability via the direction signal "
-                        f"above (an RFC, a README roadmap item, or a "
-                        f"CONTEXT.md investment pattern). Opening as an "
+                        f"in the Engineering verdict above (an RFC, a "
+                        f"README roadmap item, or a CONTEXT.md investment "
+                        f"pattern). Opening as an "
                         f"Issue rather than a PR because there is no "
                         f"existing call site to integrate against — this "
                         f"is a proposal for the maintainer to weigh, not a "
                         f"drop-in implementation."
                     )
                 else:
+                    engineering_section = _render_engineering_section(
+                        integration_shape=shape_label,
+                        contract_match=contract_match or "(none reported)",
+                        migration_cost=migration_cost or "(none reported)",
+                    )
                     detail = (
-                        f"**Integration shape**: {shape_label}\n\n"
-                        f"**Contract match**: {contract_match or '(none reported)'}\n\n"
-                        f"**Migration cost**: {migration_cost or '(none reported)'}\n\n"
                         f"_Selection reasoning_: {selection.get('reasoning', '')}\n\n"
                         f"This candidate was surfaced via `remyxai search query "
                         f"{selection.get('external_query_used', '')!r}` — it is NOT "
@@ -4681,10 +4892,12 @@ def process_target(target: Target) -> dict:
                         f"because external picks need dependency changes that "
                         f"fall outside the PR guardrails."
                     )
+                _record_verdict_fields(result, rec)
                 issue_url = _open_downgrade_issue(
                     target, rec,
                     reason=f"Selection identified an {shape_label} candidate",
                     detail=detail,
+                    engineering_section=engineering_section,
                     selection_note=selection.get("reasoning", ""),
                     selection_rejected=result.get("selection_rejected"),
                     footer_override=(
@@ -4722,6 +4935,12 @@ def process_target(target: Target) -> dict:
                 # half-built PR.
                 shape = (selection.get("integration_shape") or "addition").lower().strip()
                 result["selection_integration_shape"] = shape
+                result["selection_contract_match"] = (
+                    selection.get("contract_match", "")
+                )
+                result["selection_migration_cost"] = (
+                    selection.get("migration_cost", "")
+                )
                 if shape in ("replacement", "simplification"):
                     contract_match = selection.get("contract_match", "")
                     migration_cost = selection.get("migration_cost", "")
@@ -4730,20 +4949,26 @@ def process_target(target: Target) -> dict:
                         if shape == "replacement"
                         else "pipeline simplification"
                     )
+                    # Engineering axis as its own section, adjacent to the
+                    # license section.
+                    engineering_section = _render_engineering_section(
+                        integration_shape=shape_label,
+                        contract_match=contract_match or "(none reported)",
+                        migration_cost=migration_cost or "(none reported)",
+                    )
                     detail = (
-                        f"**Integration shape**: {shape_label}\n\n"
-                        f"**Contract match**: {contract_match or '(none reported)'}\n\n"
-                        f"**Migration cost**: {migration_cost or '(none reported)'}\n\n"
                         f"_Selection reasoning_: {selection.get('reasoning', '')}\n\n"
                         f"This swap touches dependency files and existing module "
                         f"boundaries — changes that fall outside Outrider's "
                         f"auto-PR guardrails. Opening as an Issue so the team "
                         f"can decide whether to merge the upgrade."
                     )
+                    _record_verdict_fields(result, rec)
                     issue_url = _open_downgrade_issue(
                         target, rec,
                         reason=f"Selection identified a {shape_label} candidate",
                         detail=detail,
+                        engineering_section=engineering_section,
                         selection_note=selection.get("reasoning", ""),
                         selection_rejected=result.get("selection_rejected"),
                         footer_override=(
@@ -4784,6 +5009,7 @@ def process_target(target: Target) -> dict:
             "tier": rec.tier,
             "candidates_considered": len(viable),
         })
+        _record_verdict_fields(result, rec)
         log.info(f"  ✓ selected: [{rec.tier}] {rec.paper_title}")
 
         # 5. Spec bundle for the chosen candidate. Thread the selection
@@ -5292,6 +5518,454 @@ def build_target_from_env() -> Target:
     )
 
 
+# ─── Weekly Discussion summary ─────────────────────────────────────────────
+#
+# A rolling weekly digest of Outrider's work on the target repo, posted as
+# a comment on a designated GitHub Discussion. Opt-in: fires only when the
+# action is invoked with `mode: weekly-summary` AND REMYX_WEEKLY_DISCUSSION_ID
+# is set. Data source: the GitHub Actions API + per-run logs (the engine
+# engine-side `recommendation_runs` table is the preferred long-term
+# carrier; `_fetch_week_runs` is the seam to swap when it ships). Runs whose
+# logs have aged out of retention are listed without details rather than
+# silently dropped. One Claude call drafts the interpretive sections; on
+# failure the post degrades to data-only.
+
+WEEKLY_WINDOW_DAYS = 7
+
+
+def _resolve_discussion_id(target: Target, raw: str) -> str:
+    """Resolve REMYX_WEEKLY_DISCUSSION_ID to a GraphQL node ID.
+
+    Accepts either the node ID itself (``D_kwDO…``) or a plain Discussion
+    number — numbers are friendlier to copy from the Discussion URL, so
+    resolve them via one GraphQL query. Raises RuntimeError when a number
+    doesn't match any Discussion on the target repo.
+    """
+    raw = raw.strip()
+    if not raw.isdigit():
+        return raw
+    owner, _, name = target.repo.partition("/")
+    data = gh_graphql(
+        "query($owner: String!, $name: String!, $number: Int!) {"
+        " repository(owner: $owner, name: $name) {"
+        " discussion(number: $number) { id } } }",
+        {"owner": owner, "name": name, "number": int(raw)},
+    )
+    node = (data.get("repository") or {}).get("discussion") or {}
+    disc_id = node.get("id") or ""
+    if not disc_id:
+        raise RuntimeError(
+            f"Discussion #{raw} not found on {target.repo} — check "
+            f"REMYX_WEEKLY_DISCUSSION_ID / the weekly-discussion-id input."
+        )
+    return disc_id
+
+
+def _post_discussion_comment(discussion_id: str, body: str) -> str:
+    """Post ``body`` as a comment on the Discussion; return the comment URL."""
+    data = gh_graphql(
+        "mutation($id: ID!, $body: String!) {"
+        " addDiscussionComment(input: {discussionId: $id, body: $body}) {"
+        " comment { url } } }",
+        {"id": discussion_id, "body": body},
+    )
+    comment = (data.get("addDiscussionComment") or {}).get("comment") or {}
+    return comment.get("url") or ""
+
+
+_LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z ?")
+
+
+def _extract_run_summary(log_text: str) -> dict | None:
+    """Parse the RUN SUMMARY JSON object out of a raw Actions job log.
+
+    GitHub prefixes every log line with an ISO timestamp; strip it, find
+    the last ``=== RUN SUMMARY ===`` marker, then collect from the first
+    ``{`` to the matching column-0 ``}`` (json.dumps(indent=2) shape).
+    Returns None when no marker / unparseable — callers treat that as
+    "not an Outrider run" or "log truncated".
+    """
+    if "=== RUN SUMMARY ===" not in log_text:
+        return None
+    lines = [_LOG_TIMESTAMP_RE.sub("", l) for l in log_text.splitlines()]
+    marker_idx = max(
+        i for i, l in enumerate(lines) if "=== RUN SUMMARY ===" in l
+    )
+    buf: list[str] = []
+    for line in lines[marker_idx + 1:]:
+        if not buf:
+            if line.startswith("{"):
+                buf.append(line)
+            continue
+        buf.append(line)
+        if line.startswith("}"):
+            break
+    if not buf:
+        return None
+    try:
+        parsed = json.loads("\n".join(buf))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _fetch_run_log_text(repo: str, run_id: int) -> str | None:
+    """Download one workflow run's log archive and return the text of the
+    member containing the RUN SUMMARY marker (or the largest member when
+    none matches — callers re-check). Returns None when the archive is
+    gone (aged out of retention → HTTP 410/404) or unreadable."""
+    token = _github_token()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/logs",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "feature-finder-orchestrator",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            blob = r.read()
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+        for info in archive.infolist():
+            if not info.filename.endswith(".txt"):
+                continue
+            text = archive.read(info).decode("utf-8", errors="replace")
+            if "=== RUN SUMMARY ===" in text:
+                return text
+        return ""
+    except Exception as e:
+        log.debug(f"  weekly: log fetch for run {run_id} failed: {e}")
+        return None
+
+
+def _fetch_week_runs(target: Target, since: "dt.datetime") -> list[dict]:
+    """Completed Outrider runs on the target repo since ``since``.
+
+    Returns entries ``{"run": <Actions run envelope>, "summary": dict|None}``,
+    newest first. A run counts as an Outrider run when its log contains the
+    RUN SUMMARY marker; when the log has aged out, the workflow name/path
+    containing "outrider" is the fallback signal and the entry carries
+    ``summary=None`` (rendered as "details unavailable" — an honest gap,
+    never a silent drop). Weekly-summary runs themselves are excluded.
+    """
+    created = urllib.parse.quote(f">={since.strftime('%Y-%m-%d')}")
+    resp = gh_api(
+        "GET",
+        f"/repos/{target.repo}/actions/runs?created={created}&per_page=100",
+    )
+    runs = resp.get("workflow_runs") or []
+    total = resp.get("total_count") or len(runs)
+    if total > len(runs):
+        log.info(f"  weekly: repo had {total} runs this window; "
+                 f"only the first {len(runs)} were fetched")
+    entries: list[dict] = []
+    for run in runs:
+        if run.get("status") != "completed":
+            continue
+        log_text = _fetch_run_log_text(target.repo, run.get("id"))
+        if log_text is None:
+            name_path = (
+                (run.get("name") or "") + (run.get("path") or "")
+            ).lower()
+            if "outrider" in name_path:
+                entries.append({"run": run, "summary": None})
+            continue
+        summary = _extract_run_summary(log_text)
+        if summary is None:
+            continue  # not an Outrider run
+        if summary.get("mode") == "weekly-summary":
+            continue  # don't aggregate the digest runs themselves
+        entries.append({"run": run, "summary": summary})
+    entries.sort(key=lambda e: e["run"].get("created_at") or "", reverse=True)
+    return entries
+
+
+def _aggregate_week(entries: list[dict]) -> dict:
+    """Mechanical aggregation across the week's run entries.
+
+    Everything here is data, not interpretation — the one Claude call in
+    ``_draft_weekly_narrative`` works from this dict. Costs are summed
+    only over runs whose logs parsed; ``unverified_runs`` counts the
+    retention gaps so the digest never reports an estimate as exact.
+    """
+    agg: dict = {
+        "rows": [],
+        "n_runs": len(entries),
+        "n_success": 0,
+        "n_failed": 0,
+        "status_counts": {},
+        "verified_cost": 0.0,
+        "unverified_runs": 0,
+        "license_class_counts": {},
+        "refine_queries": [],
+        "selection_quotes": [],
+    }
+    for e in entries:
+        run, summary = e["run"], e["summary"]
+        date = (run.get("created_at") or "")[:10]
+        if run.get("conclusion") == "success":
+            agg["n_success"] += 1
+        else:
+            agg["n_failed"] += 1
+        if summary is None:
+            agg["unverified_runs"] += 1
+            agg["rows"].append({
+                "date": date,
+                "status": "(outside log retention — details unavailable)",
+                "output": "—",
+            })
+            continue
+        status = summary.get("status", "unknown")
+        agg["status_counts"][status] = agg["status_counts"].get(status, 0) + 1
+        artifact = summary.get("pr_url") or summary.get("issue_url") or ""
+        if artifact:
+            number = artifact.rstrip("/").split("/")[-1]
+            output = f"[#{number}]({artifact})"
+        else:
+            output = "No artifact"
+        agg["rows"].append({"date": date, "status": status, "output": output})
+        agg["verified_cost"] += float(summary.get("cost_usd") or 0.0)
+        for cls, n in (summary.get("license_class_counts") or {}).items():
+            agg["license_class_counts"][cls] = (
+                agg["license_class_counts"].get(cls, 0) + int(n)
+            )
+        agg["refine_queries"].extend(summary.get("refine_queries") or [])
+        reasoning = (summary.get("selection_reasoning") or "").strip()
+        if status == "skipped_by_selection_verification" and reasoning:
+            agg["selection_quotes"].append(reasoning)
+    return agg
+
+
+_WEEKLY_NARRATIVE_PROMPT_TEMPLATE = """\
+You are drafting the interpretive sections of Outrider's weekly summary
+for the repository __REPO__. Everything below is the week's aggregated
+run data plus the open Outrider Issues awaiting maintainer review. Your
+output supplements the data tables — do NOT restate them.
+
+Aggregated run data (JSON)
+--------------------------
+__AGG_JSON__
+
+Open Outrider Issues (number, title, body excerpt)
+--------------------------------------------------
+__OPEN_ISSUES__
+
+Produce strictly this JSON object (no prose wrapper):
+{
+  "verdict_bullets": ["...", ...],
+  "refine_themes": [{"theme": "...", "queries": N, "hit_rate": "..."}, ...],
+  "patterns": ["...", ...],
+  "next_actions": {"<issue number>": "<one-line next action>", ...}
+}
+
+Rules:
+- verdict_bullets: 2-4 bullets summarizing what the selection pass did
+  this week (what it anchored on, what it rejected and why). Do not
+  paraphrase any verbatim reasoning quote — that is rendered separately.
+- refine_themes: cluster the refine queries into themes with a per-theme
+  query count and a one-phrase hit-rate assessment. Empty list if there
+  were no refine queries.
+- patterns: 3-5 entries. Each MUST lead with a noun, and each MUST end
+  with a concrete maintainer action. This is the only opinionated
+  section of the summary — interpretation, not data.
+- next_actions: for each open Issue where the body makes the next step
+  obvious (a flag to flip, a license to re-check, a question to answer),
+  a one-line action. Omit Issues where no clear next action exists.
+"""
+
+
+def _draft_weekly_narrative(
+    agg: dict, open_issues: list[dict],
+) -> dict | None:
+    """One Claude call drafting the interpretive sections. None on any
+    failure — the digest degrades to data-only, never blocks the post."""
+    issues_block = "\n".join(
+        f"#{it.get('number')} {it.get('title', '')}\n"
+        f"  {' '.join((it.get('body') or '').split())[:1200]}"
+        for it in open_issues
+    ) or "(none open)"
+    prompt = (
+        _WEEKLY_NARRATIVE_PROMPT_TEMPLATE
+        .replace("__REPO__", agg.get("repo", ""))
+        .replace("__AGG_JSON__", json.dumps(agg, indent=2)[:20000])
+        .replace("__OPEN_ISSUES__", issues_block)
+    )
+    timeout_s = int(os.environ.get("REMYX_WEEKLY_TIMEOUT_S", "180"))
+    max_turns = int(os.environ.get("REMYX_WEEKLY_MAX_TURNS", "3"))
+    with tempfile.TemporaryDirectory(prefix="outrider-weekly-") as tmp:
+        ok, output = _run_claude_oneshot(
+            Path(tmp), prompt, timeout_s, max_turns=max_turns,
+        )
+    if not ok:
+        log.warning(f"  weekly: narrative call failed: {output[:200]}")
+        return None
+    data = _extract_json_object(output)
+    if not isinstance(data, dict):
+        log.warning(f"  weekly: narrative JSON unparseable: {output[:200]!r}")
+        return None
+    return data
+
+
+def _compose_weekly_markdown(
+    window_start: "dt.datetime",
+    window_end: "dt.datetime",
+    agg: dict,
+    open_issues: list[dict],
+    drafted: dict | None,
+) -> str:
+    """Assemble the Discussion-comment body. Data sections are mechanical;
+    the drafted sections slot in when the Claude call succeeded. The
+    verbatim selection-reasoning quote is copied as-is into a blockquote —
+    never paraphrased (it's the most maintainer-impactful content)."""
+    drafted = drafted or {}
+    lines: list[str] = []
+    lines.append(
+        f"## Outrider weekly summary — "
+        f"{window_start.strftime('%Y-%m-%d')} to "
+        f"{window_end.strftime('%Y-%m-%d')}"
+    )
+    lines.append("")
+    # Exact when every run's log parsed; explicitly partial otherwise —
+    # never report an estimate as exact.
+    cost_phrase = f"${agg['verified_cost']:.2f}"
+    if agg["unverified_runs"]:
+        cost_phrase += (
+            f" verified ({agg['unverified_runs']} run(s) outside log "
+            f"retention not counted)"
+        )
+    lines.append(
+        f"**Runs this week**: {agg['n_runs']} "
+        f"({agg['n_success']} successful, {agg['n_failed']} failed). "
+        f"Claude spend: {cost_phrase}."
+    )
+
+    if agg["rows"]:
+        lines += ["", "### Outcomes", "", "| Date | Status | Output |",
+                  "|---|---|---|"]
+        for row in agg["rows"]:
+            lines.append(
+                f"| {row['date']} | `{row['status']}` | {row['output']} |"
+            )
+
+    lines += ["", "### Selection-pass verdicts", ""]
+    bullets = drafted.get("verdict_bullets") or []
+    if isinstance(bullets, list) and bullets:
+        lines += [f"- {b}" for b in bullets if str(b).strip()]
+    elif agg["status_counts"]:
+        lines += [
+            f"- {n} run(s) ended `{s}`"
+            for s, n in sorted(agg["status_counts"].items())
+        ]
+    else:
+        lines.append("- No completed Outrider runs in this window.")
+    if agg["selection_quotes"]:
+        # Verbatim, most recent first — the rejection reasoning is the
+        # most maintainer-impactful content; never paraphrase it.
+        lines.append("")
+        for quote_line in agg["selection_quotes"][0].splitlines():
+            lines.append(f"> {quote_line}")
+
+    themes = drafted.get("refine_themes") or []
+    if isinstance(themes, list) and themes:
+        lines += ["", "### Refine-query themes the audit pass explored", "",
+                  "| Theme | Queries | Hit rate |", "|---|---|---|"]
+        for t in themes:
+            if not isinstance(t, dict):
+                continue
+            lines.append(
+                f"| {t.get('theme', '')} | {t.get('queries', '')} "
+                f"| {t.get('hit_rate', '')} |"
+            )
+    elif agg["refine_queries"]:
+        lines += ["", "### Refine queries the audit pass explored", ""]
+        seen_q: set[str] = set()
+        for q in agg["refine_queries"]:
+            if q not in seen_q:
+                seen_q.add(q)
+                lines.append(f"- `{q}`")
+
+    if agg["license_class_counts"]:
+        lines += ["", "### License gate findings", "",
+                  "| Class | Count |", "|---|---|"]
+        counts = agg["license_class_counts"]
+        ordered = [k for k in _LICENSE_CLASS_ORDER if counts.get(k)]
+        ordered += [k for k in counts if k not in _LICENSE_CLASS_ORDER]
+        for cls in ordered:
+            lines.append(f"| {cls} | {counts[cls]} |")
+
+    if open_issues:
+        next_actions = drafted.get("next_actions") or {}
+        lines += ["", "### Open Outrider Issues awaiting maintainer review",
+                  "", "| Issue | Title | Next action |", "|---|---|---|"]
+        for it in open_issues:
+            number = it.get("number")
+            title = (it.get("title") or "").replace("|", "\\|")[:100]
+            url = it.get("html_url") or ""
+            action = "—"
+            if isinstance(next_actions, dict):
+                action = str(
+                    next_actions.get(str(number), "—") or "—"
+                ).replace("|", "\\|")
+            lines.append(f"| [#{number}]({url}) | {title} | {action} |")
+
+    patterns = drafted.get("patterns") or []
+    if isinstance(patterns, list) and patterns:
+        lines += ["", "### Patterns worth attention", ""]
+        lines += [
+            f"{i}. {p}" for i, p in enumerate(
+                (str(p).strip() for p in patterns if str(p).strip()), start=1,
+            )
+        ]
+
+    lines += [
+        "", "---", "",
+        "_Generated by Outrider's weekly-summary mode. Data source: "
+        "GitHub Actions API + per-run logs; runs whose logs aged out of "
+        "retention are listed without details._",
+    ]
+    return "\n".join(lines)
+
+
+def run_weekly_summary(target: Target) -> dict:
+    """Aggregate the past week's runs and post the digest to the
+    configured Discussion. The weekly-mode counterpart to
+    ``process_target`` — main() routes here on ``mode: weekly-summary``."""
+    result: dict = {
+        "repo": target.repo, "mode": "weekly-summary", "status": "unknown",
+    }
+    raw_id = os.environ.get("REMYX_WEEKLY_DISCUSSION_ID", "").strip()
+    if not raw_id:
+        result["status"] = "weekly_summary_skipped_no_discussion_id"
+        log.info("  ✗ weekly-summary mode invoked without "
+                 "REMYX_WEEKLY_DISCUSSION_ID; nothing to post to")
+        return result
+    discussion_id = _resolve_discussion_id(target, raw_id)
+    window_end = dt.datetime.now(dt.timezone.utc)
+    window_start = window_end - dt.timedelta(days=WEEKLY_WINDOW_DAYS)
+    log.info(f"  → weekly summary over {target.repo} "
+             f"({window_start.date()} → {window_end.date()})")
+    entries = _fetch_week_runs(target, window_start)
+    open_issues = _remyx_issues(target, state="open")
+    agg = _aggregate_week(entries)
+    agg["repo"] = target.repo
+    drafted = _draft_weekly_narrative(agg, open_issues)
+    body = _compose_weekly_markdown(
+        window_start, window_end, agg, open_issues, drafted,
+    )
+    url = _post_discussion_comment(discussion_id, body)
+    result.update({
+        "status": "weekly_summary_posted",
+        "discussion_comment_url": url,
+        "runs_aggregated": len(entries),
+        "open_issues_listed": len(open_issues),
+        "narrative_drafted": drafted is not None,
+    })
+    log.info(f"  ✓ weekly_summary_posted: {url}")
+    return result
+
+
 def _write_step_summary(result: dict) -> None:
     """Render the run outcome as Markdown into $GITHUB_STEP_SUMMARY.
 
@@ -5303,6 +5977,10 @@ def _write_step_summary(result: dict) -> None:
     Sections (only what applies given the result's shape):
       - Headline: status + paper link
       - PR / Issue link if one was opened
+      - Engineering verdict + license verdict for the chosen candidate,
+        adjacent — two independent calls
+      - Pool composition (broad + refine, after dedup) and the pool's
+        license-class distribution on one line each
       - Why-this-paper reasoning (collapsed by default for brevity)
       - Cost + tokens
       - Selection rejected candidates (collapsed) for "what else did
@@ -5349,6 +6027,9 @@ def _write_step_summary(result: dict) -> None:
         "claude_failed":           "❌",
         "rejected_path_violations":"❌",
         "error":                   "❌",
+        "weekly_summary_posted":   "🟢",
+        "weekly_summary_skipped_no_discussion_id": "⏭️",
+        "weekly_summary_failed":   "❌",
     }.get(status, "ℹ️")
 
     lines: list[str] = []
@@ -5363,6 +6044,9 @@ def _write_step_summary(result: dict) -> None:
         lines.append(f"**PR**: {pr_url}\n")
     if issue_url:
         lines.append(f"**Issue**: {issue_url}\n")
+    discussion_url = result.get("discussion_comment_url") or ""
+    if discussion_url:
+        lines.append(f"**Discussion comment**: {discussion_url}\n")
 
     # When the dedup gate fires (open OR closed prior Issue), surface
     # the existing-Issue context inline so the maintainer sees at a
@@ -5381,6 +6065,57 @@ def _write_step_summary(result: dict) -> None:
                 f"**Already in flight**: {existing_url} (open — "
                 f"re-validated this run).\n"
             )
+
+    # Engineering verdict + license verdict for the chosen candidate,
+    # rendered adjacently so they read as two independent calls — a
+    # maintainer should be able to take the engineering analysis and the
+    # license risk separately. Each degrades
+    # silently when its fields are absent.
+    eng_shape = (result.get("selection_integration_shape") or "").strip()
+    eng_contract = (result.get("selection_contract_match") or "").strip()
+    eng_migration = (result.get("selection_migration_cost") or "").strip()
+    eng_tds = (result.get("selection_team_direction_signal") or "").strip()
+    eng_pcs = (result.get("selection_proposed_call_site") or "").strip()
+    if eng_contract or eng_migration or eng_tds or eng_pcs:
+        lines.append("**Engineering verdict**\n")
+        if eng_shape:
+            lines.append(f"- **Integration shape**: {eng_shape}")
+        if eng_contract:
+            lines.append(f"- **Contract match**: {eng_contract}")
+        if eng_migration:
+            lines.append(f"- **Migration cost**: {eng_migration}")
+        if eng_tds:
+            lines.append(f"- **Team-direction signal**: {eng_tds}")
+        if eng_pcs:
+            lines.append(f"- **Proposed call site**: {eng_pcs}")
+        lines.append("")
+    license_class = (result.get("license_class") or "").strip()
+    if license_class:
+        lic_emoji = _LICENSE_CLASS_EMOJI.get(license_class, "⚪")
+        lic_compat = result.get("license_compat", 0.0)
+        lic_spdx = result.get("paper_license") or "(none detected)"
+        lines.append(
+            f"**License verdict**: {lic_emoji} `{lic_spdx}` "
+            f"(class: `{license_class}`, compat: {lic_compat:.2f})\n"
+        )
+
+    # Pool composition + license-class distribution — run-level context
+    # for "what did Outrider actually look at". Surfaces the
+    # deep-search contribution and the license gate's coverage at a
+    # glance; both degrade silently when the fields are absent.
+    broad_n = result.get("broad_pool_size")
+    refine_n = result.get("refine_pool_size")
+    if broad_n is not None and refine_n is not None and (broad_n + refine_n):
+        lines.append(
+            f"**Candidate pool**: {broad_n} broad + {refine_n} refine "
+            f"candidate(s) considered (after dedup)\n"
+        )
+    license_counts = result.get("license_class_counts") or {}
+    if license_counts:
+        lines.append(
+            f"**License gate (pool)**: "
+            f"{_format_license_class_counts(license_counts)}\n"
+        )
 
     # Selection-pass narrative — "why this candidate (or skip)" from
     # the agentic selection. Distinct from rec.reasoning, which is the
@@ -5454,19 +6189,40 @@ def _write_step_summary(result: dict) -> None:
 
 
 def main():
+    # Mode dispatch: "recommend" is the classic
+    # scout-and-implement run; "weekly-summary" aggregates the past week
+    # and posts a digest comment to the configured Discussion. Customers
+    # opt in via a second scheduled job passing `mode: weekly-summary`.
+    mode = (
+        os.environ.get("REMYX_MODE")
+        or os.environ.get("INPUT_MODE")
+        or "recommend"
+    ).strip().lower().replace("_", "-")
+    if mode not in ("recommend", "weekly-summary"):
+        log.error(f"Unknown mode {mode!r}; must be 'recommend' or "
+                  f"'weekly-summary'.")
+        sys.exit(2)
+
     target = build_target_from_env()
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
-    log.info(f"  min_confidence={target.min_confidence}  "
-             f"draft_mode={target.draft_mode}  "
-             f"rate_limit_days={target.rate_limit_days}")
+    if mode == "weekly-summary":
+        log.info("  mode=weekly-summary")
+        runner = run_weekly_summary
+        failure_status = "weekly_summary_failed"
+    else:
+        log.info(f"  min_confidence={target.min_confidence}  "
+                 f"draft_mode={target.draft_mode}  "
+                 f"rate_limit_days={target.rate_limit_days}")
+        runner = process_target
+        failure_status = "error"
 
     _reset_run_cost()
     try:
-        result = process_target(target)
+        result = runner(target)
     except Exception as e:
         log.exception(f"  ✗ unhandled error: {e}")
-        result = {"repo": target.repo, "status": "error", "error": str(e)}
+        result = {"repo": target.repo, "status": failure_status, "error": str(e)}
 
     # Token/cost totals across every Claude pass this run, captured even when
     # process_target raised.
@@ -5494,6 +6250,11 @@ def main():
                     f.write(f"pr_url={result['pr_url']}\n")
                 if "issue_url" in result:
                     f.write(f"issue_url={result['issue_url']}\n")
+                if "discussion_comment_url" in result:
+                    f.write(
+                        f"discussion_comment_url="
+                        f"{result['discussion_comment_url']}\n"
+                    )
                 if "arxiv" in result:
                     f.write(f"arxiv={result['arxiv']}\n")
                 if "tier" in result:

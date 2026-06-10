@@ -91,6 +91,8 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 | `candidate-pool` | `25` | How many candidates the selection pass picks from |
 | `claude-timeout` | `900` | Wall-clock seconds for the Claude Code implementation step. Bump for very large repos; lower to cap cost. |
 | `pin-arxiv` | `''` | Optional `arxiv_id`. When set and present in the candidate pool, the action implements that exact paper and skips the selection pass — use it for reproducible eval re-runs. Empty = normal selection. |
+| `mode` | `recommend` | `recommend` (classic per-run flow) / `weekly-summary` (post a weekly digest to a Discussion — see [Weekly Discussion summary](#weekly-discussion-summary-opt-in)) |
+| `weekly-discussion-id` | `''` | Discussion number (from its URL) or GraphQL node ID. Only read in `weekly-summary` mode. |
 
 ## Outputs
 
@@ -103,6 +105,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 | `tier` | when a paper was picked | `high` / `moderate` / `low` / `noise` |
 | `cost_usd` | always | Claude spend for this run |
 | `input_tokens` / `output_tokens` | always | Token usage |
+| `discussion_comment_url` | `weekly_summary_posted` | URL of the posted weekly digest comment |
 
 ## Costs
 
@@ -136,6 +139,9 @@ At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 | `claude_failed` | Claude CLI exited non-zero |
 | `rejected_path_violations` | Claude touched files outside the guardrails allowlist |
 | `error` | Unhandled exception |
+| `weekly_summary_posted` | Weekly digest comment posted to the configured Discussion |
+| `weekly_summary_skipped_no_discussion_id` | `mode: weekly-summary` ran without a `weekly-discussion-id` |
+| `weekly_summary_failed` | Weekly mode hit an unhandled error (nothing was posted) |
 
 </details>
 
@@ -231,6 +237,54 @@ Pre-flight Claude pass: PR or Issue?
 The Remyx engine (commit-history extraction, candidate pool, embedding pre-filter, ranking) runs server-side. This action is a pure consumer.
 
 </details>
+
+## Weekly Discussion summary (opt-in)
+
+A rolling weekly digest of Outrider's work on your repo, posted as a comment
+on a Discussion you designate: run outcomes, the selection pass's verdicts
+(with its rejection reasoning quoted verbatim), refine-query themes, the
+license gate's class distribution, open Outrider Issues with a next-action
+column, and a short "patterns worth attention" section. Makes the action's
+work auditable at a glance — including the runs that deliberately produced
+no PR or Issue.
+
+Setup:
+
+1. **Create (or pick) a Discussion** on your repo to host the digests, and
+   note its number from the URL.
+2. **Add a second scheduled job** (weekly cron) that calls the action in
+   `weekly-summary` mode. Note the extra `discussions: write` permission:
+
+   ```yaml
+   name: Outrider weekly summary
+   on:
+     schedule:
+       - cron: '0 15 * * 1'  # Mondays 15:00 UTC
+     workflow_dispatch:
+   jobs:
+     weekly-summary:
+       runs-on: ubuntu-latest
+       permissions:
+         contents: read
+         actions: read        # read the week's run logs
+         issues: read         # list open Outrider Issues
+         discussions: write   # post the digest comment
+       env:
+         REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+       steps:
+         - uses: remyxai/outrider@v1
+           with:
+             interest-id: 'YOUR-INTEREST-UUID-HERE'
+             mode: weekly-summary
+             weekly-discussion-id: '123'  # your Discussion number
+   ```
+
+Cost: one Claude call per week (~$0.10–0.20) to draft the interpretive
+sections; the rest is GitHub API reads. If that call fails, the digest still
+posts with the data tables only. Runs whose logs have aged out of GitHub's
+retention window are listed as "details unavailable" rather than silently
+dropped.
 
 ## License
 
