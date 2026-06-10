@@ -294,6 +294,29 @@ posts with the data tables only. Runs whose logs have aged out of GitHub's
 retention window are listed as "details unavailable" rather than silently
 dropped.
 
+## Diff Risk Score — adapted from *Automating Low-Risk Code Review at Meta: RADAR, Risk Calibration, and Review Efficiency*
+
+The integration funnel includes a **calibrated Diff Risk Score** gate
+(`src/diff_risk_score.py`, wired into `process_target`). RADAR stratifies
+every diff with a machine-learned risk score over static-diff features and
+lets low-risk diffs auto-land while routing higher-risk ones to deeper
+review. Outrider ports the *result*, not the trained model: a transparent
+logistic over the same static features the other gates already extract
+(files touched, lines changed, new public callables, critical-path edits,
+test-coverage impact) yields a score in `[0, 1]` and a band:
+
+- **low** → flows straight through the funnel to a PR;
+- **elevated** → still a PR, but forced to draft so a human reviews before
+  it lands;
+- **high** → routed to a human-review Issue (`issue_opened_high_risk`)
+  instead of an auto-PR, with the implementation diff attached.
+
+The two band cut points are the single tunable knob RADAR exposes — a
+percentile that trades automation yield against safety — expressed as fixed
+score thresholds. Scoping note: this delivers the risk-aware *routing
+decision*, not RADAR's trained model, telemetry pipeline, or revert/incident
+measurement, none of which the action hosts.
+
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).
