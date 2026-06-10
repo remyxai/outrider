@@ -35,6 +35,6 @@ jobs:
           echo "token=$token" >> "$GITHUB_OUTPUT"
       - uses: ./
         with:
-          interest-id: '054bb25c-ff68-4d10-bd65-762df0aca8e8'
+          interest-id: '29ca03e7-454d-446c-9941-32c96c53d95d'
           # remyx[bot] token (empty → action falls back to GITHUB_TOKEN).
           github-token: ${{ steps.remyx-bot.outputs.token }}
