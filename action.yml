@@ -10,15 +10,37 @@ inputs:
       Remyx ResearchInterest UUID. Get it from engine.remyx.ai → your
       interest's detail page → "Workflow snippet" tab.
     required: true
+  mode:
+    description: |
+      Run mode:
+        - "recommend" (default): scout a paper, draft a PR or open an
+          Issue — the classic per-run flow.
+        - "weekly-summary": aggregate the past 7 days of Outrider runs
+          on this repo and post a digest comment to the Discussion named
+          by `weekly-discussion-id`. Opt-in; customers add a second
+          scheduled job (weekly cron) that calls the action in this
+          mode. Requires `discussions: write` in the workflow's
+          permissions block.
+    required: false
+    default: 'recommend'
+  weekly-discussion-id:
+    description: |
+      Target Discussion for weekly-summary mode. Accepts the Discussion
+      number (from its URL) or the GraphQL node ID. Only read when
+      `mode: weekly-summary`; the mode skips cleanly when empty.
+    required: false
+    default: ''
   github-token:
     description: >-
       GitHub token used for git push, PR / Issue creation, and the
       existing-PR dedup check. Leave empty for the standard same-repo
-      install — the action falls back to the workflow's built-in
-      github.token, which has write access to the repo the workflow
-      runs in. Override with a PAT only for cross-repo controller
-      patterns (action runs in repo A but writes PRs to repo B);
-      the PAT needs `repo` scope on the target.
+      install — the action self-mints a remyx[bot] token from
+      engine.remyx.ai (using REMYX_API_KEY) so artifacts are authored
+      by the Remyx App by default, and falls back to the workflow's
+      built-in github.token when minting isn't available. Override
+      with a PAT only for cross-repo controller patterns (action runs
+      in repo A but writes PRs to repo B); the PAT needs `repo` scope
+      on the target.
     required: false
     default: ''
   min-confidence:
@@ -114,8 +136,15 @@ outputs:
       Run outcome: "pr_opened" | "pr_opened_draft" | "issue_opened" |
       "skipped_low_confidence" | "skipped_rate_limit" | "skipped_pr_exists" |
       "skipped_issue_exists" | "skipped_test_failure" | "claude_failed" |
-      "rejected_path_violations" | "error".
+      "rejected_path_violations" | "error". In weekly-summary mode:
+      "weekly_summary_posted" | "weekly_summary_skipped_no_discussion_id" |
+      "weekly_summary_failed".
     value: ${{ steps.recommend.outputs.status }}
+  discussion_comment_url:
+    description: |
+      URL of the posted weekly-summary Discussion comment (set when
+      status == "weekly_summary_posted").
+    value: ${{ steps.recommend.outputs.discussion_comment_url }}
   pr_url:
     description: 'URL of the opened PR (set when status starts with "pr_opened").'
     value: ${{ steps.recommend.outputs.pr_url }}
@@ -189,6 +218,9 @@ runs:
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
+        # Weekly Discussion summary (opt-in second scheduled job).
+        REMYX_MODE: ${{ inputs.mode }}
+        REMYX_WEEKLY_DISCUSSION_ID: ${{ inputs.weekly-discussion-id }}
         # Lookback window + pool size for the candidate selection pass.
         # run.py reads these directly (not via INPUT_*) — they default to
         # week / 10 in run.py too, so omitting them is safe.
