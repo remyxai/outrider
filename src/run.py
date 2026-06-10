@@ -666,6 +666,46 @@ Tools available:
     bypasses keyword-search retrieval gaps
   - `remyxai search query` — keyword broaden beyond the pool if needed
 
+Recovery strategies for missing/broken links (apply BEFORE concluding
+"paper has no code" or "candidate is unreadable"):
+  - **Arxiv URL variants.** If `arxiv.org/html/<id>` 404s or returns a
+    near-empty page, try `arxiv.org/abs/<id>` first (most reliable),
+    then `ar5iv.labs.arxiv.org/<id>` (HTML5 mirror — better for very
+    recent papers), then `arxiv.org/pdf/<id>` as last resort.
+  - **Dead live URLs (project pages, github repos).** Academic project
+    pages routinely die within months. If `WebFetch <url>` 404s or
+    times out, try `web.archive.org/web/<url>` for the latest archived
+    snapshot. Especially relevant for `*.github.io/*` project pages
+    and university-hosted demo sites.
+  - **Engine reports `github_url: (none)` but code likely exists.**
+    Don't take the engine's null at face value. In order:
+      1. `gh search code "<distinctive method name from paper>"` — the
+         method name (not the paper title) usually surfaces the official
+         repo if one exists.
+      2. WebFetch the arxiv abstract page and grep for `github.com/`
+         links — abstracts often mention code that the engine's
+         regex missed.
+      3. If `huggingface_url` is populated, WebFetch the model card —
+         it routinely cross-references the official codebase.
+      4. If a project page is mentioned in the abstract, follow it
+         one hop — code links cluster on project pages even when
+         absent from the abstract.
+    Treat "no code found" as a verdict you reach AFTER exhausting these,
+    not a default. Many engine `github_url: (none)` cases have code
+    reachable via one of these paths (REMYX-100 will fix this at ingest;
+    until then, agent-side recovery is the defense).
+  - **Login-wall detection.** Pages from Colab, Drive, JSTOR, OpenReview
+    can return HTTP 200 with sign-in content that LOOKS like real
+    content. If a fetched page is < 500 chars of non-nav body AND
+    contains "Sign in" / "Log in" / "Please log in", treat as
+    unfetched (the content you got is not the content you wanted).
+    Note in `reasoning` if a login-wall blocked verification.
+  - **Failure budget.** Spend at most ~3 turns on recovery per
+    candidate before moving on. If a candidate has multiple broken
+    links and no reachable code/context, that itself is a signal —
+    document the failed lookups in `reasoning` and reject the
+    candidate rather than burning the turn budget guessing.
+
 Stop iterating once you have enough evidence to pick (verified one
 candidate fits one of the three shapes) OR to reject all (every
 candidate has a structural mismatch). Don't burn turns on diminishing
