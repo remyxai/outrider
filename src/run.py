@@ -4450,8 +4450,18 @@ def _capture_implementation_diff(
             ["git", "add", "-A"], cwd=workdir, check=True,
             capture_output=True, timeout=30,
         )
+        # Exclude the orchestrator's scratchpad files from the user-facing
+        # diff. `.remyx-recommendation/` holds CONTEXT.md, GUARDRAILS.md,
+        # INVOCATION.md, PAPER.md, SPEC.md — internal agent prompts that
+        # leak orchestrator phrasing into the Issue body otherwise. The
+        # pathspec exclusion runs inside git, so the diff captured is
+        # already clean — no post-parse filtering needed.
         proc = subprocess.run(
-            ["git", "diff", "--staged"], cwd=workdir,
+            [
+                "git", "diff", "--staged", "--",
+                ".", ":(exclude).remyx-recommendation",
+            ],
+            cwd=workdir,
             capture_output=True, text=True, timeout=30,
         )
         if proc.returncode != 0:

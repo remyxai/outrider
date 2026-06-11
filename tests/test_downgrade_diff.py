@@ -104,6 +104,42 @@ def test_capture_diff_returns_empty_when_no_changes(tmp_path):
     assert diff == ""
 
 
+def test_capture_diff_excludes_remyx_recommendation_scratchpad(tmp_path):
+    """The orchestrator writes internal agent-facing prompts under
+    `.remyx-recommendation/` (CONTEXT.md, GUARDRAILS.md, etc.). These
+    must NOT appear in the diff embedded in downgrade-Issue bodies —
+    they leak orchestrator phrasing into a maintainer-facing artifact
+    (REMYX-112). The actual code contribution alongside them MUST still
+    appear."""
+    _init_git_repo(tmp_path)
+    # Real code contribution the agent wrote
+    (tmp_path / "new_module.py").write_text(
+        "def cooperative_guardrail():\n    return 'ok'\n"
+    )
+    # Orchestrator scratchpad files that must be stripped
+    scratchpad = tmp_path / ".remyx-recommendation"
+    scratchpad.mkdir()
+    (scratchpad / "CONTEXT.md").write_text(
+        "# Team's recent shipping history\n- Some experiment\n"
+    )
+    (scratchpad / "GUARDRAILS.md").write_text(
+        "# Honesty rules\n- Don't scaffold\n"
+    )
+    (scratchpad / "PAPER.md").write_text("# Recommended paper\nDoesn't matter\n")
+
+    diff = run._capture_implementation_diff(tmp_path)
+
+    # Real code is included
+    assert "new_module.py" in diff
+    assert "+def cooperative_guardrail()" in diff
+    # Scratchpad files are NOT
+    assert ".remyx-recommendation" not in diff
+    assert "CONTEXT.md" not in diff
+    assert "GUARDRAILS.md" not in diff
+    assert "Honesty rules" not in diff
+    assert "Team's recent shipping history" not in diff
+
+
 # ─── _render_implementation_diff_section ──────────────────────────────────
 
 
