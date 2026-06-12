@@ -101,6 +101,64 @@ def test_parse_returns_none_on_unrecognized_body() -> None:
     assert run._parse_license_state_from_issue_body(None) is None  # type: ignore[arg-type]
 
 
+# ─── Fallback: body-scan when structured License section is absent ───────
+
+
+def test_parse_fallback_picks_up_github_url_without_license_section() -> None:
+    """Older Issue bodies opened before license enrichment was always-on
+    may reference the paper's code repo without the structured License
+    section. The fallback returns a synthetic 'no-enrichment' snapshot
+    with the discovered URL, so the watch can re-check it."""
+    body = (
+        "**Recommended paper**: [Some Paper](https://arxiv.org/abs/2606.99999v1)\n"
+        "## Why this paper is interesting\n\n"
+        "The reference implementation is at https://github.com/some-author/some-repo "
+        "and it covers exactly this approach.\n"
+    )
+    snap = run._parse_license_state_from_issue_body(body)
+    assert snap is not None
+    assert snap["klass"] == "no-enrichment"
+    assert snap["compat"] == 0.30
+    assert snap["source"] == "body-scan"
+    assert snap["code_url"] == "https://github.com/some-author/some-repo"
+
+
+def test_parse_fallback_filters_remyx_self_urls() -> None:
+    """The orchestrator's footer references github.com/remyxai/... links
+    (e.g. the Outrider repo discussions URL). Those should NOT be used
+    as the paper's reference repo — filter them out."""
+    body = (
+        "**Recommended paper**: [Paper](https://arxiv.org/abs/2606.11111v1)\n"
+        "Some discussion at https://github.com/remyxai/outrider/discussions/19.\n"
+    )
+    assert run._parse_license_state_from_issue_body(body) is None
+
+
+def test_parse_fallback_picks_up_hf_model_url() -> None:
+    """HuggingFace model card URLs in the body should also trigger the
+    fallback path."""
+    body = (
+        "**Recommended paper**: [Paper](https://arxiv.org/abs/2606.22222v1)\n"
+        "The released checkpoint is at https://huggingface.co/some-org/some-model\n"
+    )
+    snap = run._parse_license_state_from_issue_body(body)
+    assert snap is not None
+    assert snap["klass"] == "no-enrichment"
+    assert snap["model_url"] == "https://huggingface.co/some-org/some-model"
+
+
+def test_parse_fallback_no_urls_returns_none() -> None:
+    """Body with no License section AND no code URLs → graceful None
+    (matches the canonical 'paper without code release' Issue shape
+    where there's nothing to watch)."""
+    body = (
+        "**Recommended paper**: [Theory-only Paper](https://arxiv.org/abs/2606.33333v1)\n"
+        "Pure theory paper — no code release. The maintainer should decide whether "
+        "the conceptual contribution is worth a write-up.\n"
+    )
+    assert run._parse_license_state_from_issue_body(body) is None
+
+
 # ─── _is_license_newly_viable ─────────────────────────────────────────────
 
 

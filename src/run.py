@@ -6980,30 +6980,72 @@ def _parse_license_state_from_issue_body(body: str) -> dict | None:
 
     Returns a dict with ``spdx``, ``klass``, ``compat`` (float),
     ``code_url`` / ``model_url`` (optional), and ``source`` (optional).
-    Returns ``None`` if no license line can be parsed (e.g. the Issue
-    body shape is unfamiliar — graceful skip rather than crash).
+
+    Two paths:
+
+    - **Structured**: matches the License line that ``_render_license_section``
+      writes ("**License**: ``<spdx>`` (class: ``<klass>``, compat: <c>...)").
+      This is the normal path for current-format Outrider Issues.
+    - **Body-scan fallback**: when the structured line is absent (older
+      Issue formats from before license enrichment was always-on), scan
+      the body for any GitHub or HuggingFace URLs and synthesize a
+      "no-enrichment" snapshot with ``klass="no-enrichment"`` and
+      ``compat=0.30`` (treated as blocked, same severity as
+      ``no-code-link``). The license-watch can then re-check the
+      upstream URL and surface the Issue if the current state is
+      permissive.
+
+    Returns ``None`` only when neither path yields anything usable.
     """
     if not body:
         return None
     m = _LICENSE_BODY_LINE_RE.search(body)
-    if not m:
+    if m:
+        try:
+            compat = float(m.group("compat"))
+        except (TypeError, ValueError):
+            return None
+        snap: dict = {
+            "spdx": (m.group("spdx") or "").strip(),
+            "klass": (m.group("klass") or "").strip(),
+            "compat": compat,
+            "source": m.group("source"),
+        }
+        code = _CODE_BODY_LINE_RE.search(body)
+        if code:
+            snap["code_url"] = code.group("url").rstrip(".,")
+        model = _MODEL_BODY_LINE_RE.search(body)
+        if model:
+            snap["model_url"] = model.group("url").rstrip(".,")
+        return snap
+
+    # Fallback: no structured License section, but the body may still
+    # reference a code URL the agent linked elsewhere (e.g. older Issue
+    # bodies opened before license enrichment was always-on, or agent-
+    # written Issue bodies that linked the repo from a free-form section).
+    # ``_extract_github_urls`` / ``_extract_huggingface_urls`` return
+    # ``owner/repo`` slugs; prepend the host so downstream consumers
+    # (``_recheck_outrider_license_state``) get the full URL shape they
+    # expect.
+    github_slugs = [
+        s for s in _extract_github_urls(body)
+        # Skip Remyx's own URLs — these appear in the orchestrator
+        # footer / call-to-action lines, not the paper's reference repo.
+        if not s.lower().startswith(("remyxai/", "smellslikeml/"))
+    ]
+    hf_slugs = _extract_huggingface_urls(body)
+    if not github_slugs and not hf_slugs:
         return None
-    try:
-        compat = float(m.group("compat"))
-    except (TypeError, ValueError):
-        return None
-    snap: dict = {
-        "spdx": (m.group("spdx") or "").strip(),
-        "klass": (m.group("klass") or "").strip(),
-        "compat": compat,
-        "source": m.group("source"),
+    snap = {
+        "spdx": "",
+        "klass": "no-enrichment",
+        "compat": 0.30,
+        "source": "body-scan",
     }
-    code = _CODE_BODY_LINE_RE.search(body)
-    if code:
-        snap["code_url"] = code.group("url").rstrip(".,")
-    model = _MODEL_BODY_LINE_RE.search(body)
-    if model:
-        snap["model_url"] = model.group("url").rstrip(".,")
+    if github_slugs:
+        snap["code_url"] = f"https://github.com/{github_slugs[0]}"
+    if hf_slugs:
+        snap["model_url"] = f"https://huggingface.co/{hf_slugs[0]}"
     return snap
 
 
