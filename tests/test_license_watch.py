@@ -348,6 +348,91 @@ def test_newly_viable_no_transition_no_event(monkeypatch) -> None:
     assert out == []
 
 
+def test_newly_viable_picks_up_url_from_comments(monkeypatch) -> None:
+    """When the Issue body has no parseable License section AND no body
+    URLs, but a maintainer's comment names the upstream repo, the
+    comment-scan fallback should discover the URL and re-check it.
+
+    Models the InstructSAM case: Issue #87 body has no License section,
+    but the maintainer's licensing-audit comment names
+    `github.com/CircleRadon/InstructSAM` — if that repo now publishes
+    a permissive LICENSE, the watch surfaces it as newly viable."""
+
+    issue = {
+        "number": 87,
+        "title": "[Remyx Recommendation] InstructSAM",
+        "html_url": "https://github.com/o/r/issues/87",
+        # Body lacks the structured License section entirely
+        "body": ISSUE_BODY_NO_LICENSE_SECTION,
+    }
+    monkeypatch.setattr(run, "_remyx_issues", lambda target, state="open": [issue])
+
+    def fake_gh_api(method, path):
+        if "/issues/87/comments" in path:
+            return [
+                {
+                    "user": {"login": "smellslikeml"},
+                    "body": (
+                        "## Licensing block — InstructSAM has no declared license\n\n"
+                        "Checked the redistribution surface:\n\n"
+                        "| Source | License |\n"
+                        "|--|--|\n"
+                        "| [CircleRadon/InstructSAM repo root]"
+                        "(https://github.com/CircleRadon/InstructSAM) | No LICENSE file |"
+                    ),
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(run, "gh_api", fake_gh_api)
+    monkeypatch.setattr(
+        run, "_fetch_repo_license",
+        lambda owner_repo: "Apache-2.0" if owner_repo == "CircleRadon/InstructSAM" else "",
+    )
+
+    out = run._newly_viable_outrider_artifacts(_target())
+    assert len(out) == 1
+    assert out[0]["number"] == 87
+    assert out[0]["prev"]["source"] == "comments-scan"
+    assert "CircleRadon/InstructSAM" in out[0]["prev"]["code_url"]
+    assert out[0]["curr"]["klass"] == "permissive"
+
+
+def test_newly_viable_comments_scan_filters_remyx_self_urls(monkeypatch) -> None:
+    """Comments often reference the orchestrator's own URLs (e.g.
+    'see github.com/remyxai/outrider/discussions/19 for more'). Those
+    must be filtered out so we don't false-positive on a Remyx repo."""
+
+    issue = {
+        "number": 1, "title": "[Remyx Recommendation] Paper",
+        "html_url": "https://github.com/o/r/issues/1",
+        "body": ISSUE_BODY_NO_LICENSE_SECTION,
+    }
+    monkeypatch.setattr(run, "_remyx_issues", lambda target, state="open": [issue])
+
+    def fake_gh_api(method, path):
+        if "/issues/1/comments" in path:
+            return [
+                {
+                    "user": {"login": "smellslikeml"},
+                    "body": (
+                        "See https://github.com/remyxai/outrider/discussions/19 "
+                        "for the broader thread."
+                    ),
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(run, "gh_api", fake_gh_api)
+    monkeypatch.setattr(
+        run, "_fetch_repo_license", lambda owner_repo: "Apache-2.0",
+    )
+
+    out = run._newly_viable_outrider_artifacts(_target())
+    # No paper-code URL found in comments → no transition surfaces
+    assert out == []
+
+
 def test_newly_viable_caps_at_max(monkeypatch) -> None:
     """With many transitioning Issues, the cap is enforced."""
     issues = [

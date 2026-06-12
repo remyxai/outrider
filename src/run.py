@@ -7117,11 +7117,56 @@ def _arxiv_id_from_outrider_body(body: str) -> str:
     return (m.group(1) if m else "").rstrip(").,")
 
 
+def _discover_code_url_from_comments(
+    target: Target, issue_number: int,
+) -> str | None:
+    """Scan an Outrider Issue's comments for a code URL the agent didn't
+    surface in the body.
+
+    Maintainer-written discussion often names the upstream code repo
+    even when the original recommendation came through as ``no-code-link``
+    (e.g. a licensing-audit comment that enumerates the upstream
+    repo's missing LICENSE). Returns the first non-Remyx GitHub URL
+    found, or ``None``.
+
+    Best-effort: any API failure returns ``None`` so the caller
+    proceeds without the comment-discovered URL.
+    """
+    if not issue_number:
+        return None
+    try:
+        comments = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues/{issue_number}/comments?per_page=50",
+        ) or []
+    except Exception:
+        return None
+    for c in comments:
+        body = c.get("body") or ""
+        slugs = [
+            s for s in _extract_github_urls(body)
+            if not s.lower().startswith(("remyxai/", "smellslikeml/"))
+        ]
+        if slugs:
+            return f"https://github.com/{slugs[0]}"
+    return None
+
+
 def _newly_viable_outrider_artifacts(
     target: Target, max_items: int = 5,
 ) -> list[dict]:
     """Iterate open Outrider Issues; surface ones whose license transitioned
     from blocked to viable since recommendation time.
+
+    Lookup order for each Issue:
+
+    1. Parse the structured License line from the body (current-format
+       Outrider Issues written by ``_render_license_section``).
+    2. Fallback: scan the body for any GitHub/HF URLs (older-format
+       Issues where the URL appears outside a structured section).
+    3. Fallback: scan the Issue's comments for a GitHub URL maintainers
+       referenced after recommendation time (e.g. licensing-audit
+       comments that name the upstream repo).
 
     Returns a list of dicts: ``number``, ``title``, ``url``,
     ``arxiv_id``, ``prev`` snapshot, ``curr`` snapshot — capped at
@@ -7138,6 +7183,26 @@ def _newly_viable_outrider_artifacts(
     for item in items:
         body = item.get("body") or ""
         prev = _parse_license_state_from_issue_body(body)
+        # Comment-scan fallback: when the body parse fails OR when the
+        # parsed snapshot has no code URL to re-check against (e.g.
+        # a no-code-link snapshot), look in the comments for one.
+        if (prev is None
+                or (not prev.get("code_url") and not prev.get("model_url"))):
+            discovered = _discover_code_url_from_comments(
+                target, item.get("number"),
+            )
+            if discovered:
+                if prev is None:
+                    prev = {
+                        "spdx": "", "klass": "no-enrichment",
+                        "compat": 0.30, "source": "comments-scan",
+                    }
+                else:
+                    prev["source"] = (
+                        f"{prev.get('source') or 'body'}+comments-scan"
+                    )
+                prev["code_url"] = discovered
+
         if not prev:
             continue
         # Only re-check Issues that were blocked at recommendation time.
