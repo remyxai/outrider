@@ -6567,6 +6567,7 @@ def _compose_weekly_markdown(
     open_items: list[dict],
     drafted: dict | None,
     lifecycle_events: list[dict] | None = None,
+    newly_viable: list[dict] | None = None,
 ) -> str:
     """Assemble the Discussion-comment body.
 
@@ -6634,6 +6635,12 @@ def _compose_weekly_markdown(
     # (REMYX-114). Section omitted entirely when no events occurred.
     if lifecycle_events:
         lines += _render_lifecycle_events_section(lifecycle_events, window_end)
+
+    # Newly-viable recommendations — previously blocked at the license
+    # gate, now resolve to a permissive license. Sibling category to
+    # lifecycle events above; same omit-when-empty shape.
+    if newly_viable:
+        lines += _render_newly_viable_section(newly_viable)
 
     if open_items:
         next_actions = drafted.get("next_actions")
@@ -6939,6 +6946,221 @@ def _render_lifecycle_events_section(
     return lines
 
 
+# ─── License-watch: previously-blocked candidates becoming viable ─────────
+
+
+# Regex for the license line that ``_render_license_section`` always
+# writes into an Outrider Issue/PR body:
+#   - **License**: `<spdx>` (class: `<class>`, compat: <compat>[, source: `<src>`])
+_LICENSE_BODY_LINE_RE = re.compile(
+    r"\*\*License\*\*:\s*`(?P<spdx>[^`]*)`"
+    r"\s*\(class:\s*`(?P<klass>[^`]+)`,"
+    r"\s*compat:\s*(?P<compat>[0-9.]+)"
+    r"(?:,\s*source:\s*`(?P<source>[^`]+)`)?\)",
+    re.IGNORECASE,
+)
+
+# Regex for the code-URL line(s). Outrider writes either
+#   - **Code**: <github url>
+# or
+#   - **Model card**: <hf url>
+# (or both). When neither is found the body has a "no repository" note.
+_CODE_BODY_LINE_RE = re.compile(
+    r"\*\*Code\*\*:\s*(?P<url>https?://github\.com/\S+)",
+    re.IGNORECASE,
+)
+_MODEL_BODY_LINE_RE = re.compile(
+    r"\*\*Model card\*\*:\s*(?P<url>https?://huggingface\.co/\S+)",
+    re.IGNORECASE,
+)
+
+
+def _parse_license_state_from_issue_body(body: str) -> dict | None:
+    """Extract the license-at-recommendation snapshot from an Issue body.
+
+    Returns a dict with ``spdx``, ``klass``, ``compat`` (float),
+    ``code_url`` / ``model_url`` (optional), and ``source`` (optional).
+    Returns ``None`` if no license line can be parsed (e.g. the Issue
+    body shape is unfamiliar — graceful skip rather than crash).
+    """
+    if not body:
+        return None
+    m = _LICENSE_BODY_LINE_RE.search(body)
+    if not m:
+        return None
+    try:
+        compat = float(m.group("compat"))
+    except (TypeError, ValueError):
+        return None
+    snap: dict = {
+        "spdx": (m.group("spdx") or "").strip(),
+        "klass": (m.group("klass") or "").strip(),
+        "compat": compat,
+        "source": m.group("source"),
+    }
+    code = _CODE_BODY_LINE_RE.search(body)
+    if code:
+        snap["code_url"] = code.group("url").rstrip(".,")
+    model = _MODEL_BODY_LINE_RE.search(body)
+    if model:
+        snap["model_url"] = model.group("url").rstrip(".,")
+    return snap
+
+
+def _recheck_outrider_license_state(snap: dict) -> dict | None:
+    """Re-fetch license status for a recommendation given its snapshot.
+
+    ``snap`` is the output of ``_parse_license_state_from_issue_body``.
+    Re-resolves the upstream LICENSE via the existing helpers and
+    returns a parallel dict with the *current* spdx/klass/compat.
+    Returns ``None`` when no code URL is known and no fresh URL can be
+    discovered (nothing to check).
+    """
+    code_url = snap.get("code_url")
+    model_url = snap.get("model_url")
+
+    fresh: dict = {"spdx": "", "klass": "missing", "compat": 0.0, "source": ""}
+    if code_url:
+        owner_repo = code_url.split("github.com/", 1)[-1].rstrip("/")
+        owner_repo = "/".join(owner_repo.split("/")[:2])
+        try:
+            spdx = _fetch_repo_license(owner_repo)
+        except Exception:
+            spdx = ""
+        fresh["spdx"] = (spdx or "").strip()
+        fresh["klass"] = _classify_license(fresh["spdx"])
+        fresh["source"] = "github"
+    if model_url and (not code_url or fresh["klass"] in ("missing", "unknown")):
+        owner_model = model_url.split("huggingface.co/", 1)[-1].rstrip("/")
+        try:
+            spdx = _fetch_hf_license(owner_model)
+        except Exception:
+            spdx = ""
+        if spdx:
+            fresh["spdx"] = spdx.strip()
+            fresh["klass"] = _classify_license(fresh["spdx"])
+            fresh["source"] = "hf"
+    if not code_url and not model_url:
+        # The previous snapshot was "no code link found." Nothing to
+        # re-check until the agent re-discovers a URL — out of scope
+        # for the in-band watch.
+        return None
+    # Score against permissive target (the conservative default; the
+    # interest's actual target class isn't easily reachable here).
+    fresh["compat"] = _license_compat_score(fresh["klass"], "permissive")
+    return fresh
+
+
+def _is_license_newly_viable(prev: dict, curr: dict) -> bool:
+    """True if the recommendation transitioned from blocked to viable.
+
+    "Blocked" = compat < 0.50 (no-code-link, missing, or nc) at the
+    recommendation snapshot. "Viable" = compat >= 1.00 at the re-check
+    (permissive only — copyleft into a permissive target stays a
+    yellow flag, not a green one, and shouldn't fire as "newly viable").
+    """
+    return prev["compat"] < 0.5 <= 1.0 <= curr["compat"]
+
+
+def _arxiv_id_from_outrider_body(body: str) -> str:
+    """Extract the arxiv id from an Outrider Issue/PR body.
+
+    The body always links the paper as ``https://arxiv.org/abs/<id>``
+    near the top (set by the PR/Issue templates). Returns "" when no
+    arxiv link is found.
+    """
+    if not body:
+        return ""
+    m = re.search(r"https?://arxiv\.org/abs/([\w./-]+)", body)
+    return (m.group(1) if m else "").rstrip(").,")
+
+
+def _newly_viable_outrider_artifacts(
+    target: Target, max_items: int = 5,
+) -> list[dict]:
+    """Iterate open Outrider Issues; surface ones whose license transitioned
+    from blocked to viable since recommendation time.
+
+    Returns a list of dicts: ``number``, ``title``, ``url``,
+    ``arxiv_id``, ``prev`` snapshot, ``curr`` snapshot — capped at
+    ``max_items`` so the digest doesn't balloon if many recommendations
+    were unblocked in the same week.
+    """
+    try:
+        items = _remyx_issues(target, state="open") or []
+    except Exception as e:
+        log.debug(f"  newly-viable fetch for {target.repo} failed: {e}")
+        return []
+
+    out: list[dict] = []
+    for item in items:
+        body = item.get("body") or ""
+        prev = _parse_license_state_from_issue_body(body)
+        if not prev:
+            continue
+        # Only re-check Issues that were blocked at recommendation time.
+        if prev["compat"] >= 1.0:
+            continue
+        try:
+            curr = _recheck_outrider_license_state(prev)
+        except Exception as e:
+            log.debug(
+                f"  recheck failed for issue #{item.get('number')}: {e}"
+            )
+            continue
+        if not curr:
+            continue
+        if not _is_license_newly_viable(prev, curr):
+            continue
+        out.append({
+            "number": item.get("number"),
+            "title": item.get("title") or "",
+            "url": item.get("html_url") or "",
+            "arxiv_id": _arxiv_id_from_outrider_body(body),
+            "prev": prev,
+            "curr": curr,
+        })
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _render_newly_viable_section(transitions: list[dict]) -> list[str]:
+    """Render the "Newly viable recommendations" markdown lines.
+
+    Returns ``[]`` when no transitions — caller skips the section header
+    entirely (same shape as the lifecycle-events renderer).
+    """
+    if not transitions:
+        return []
+    lines: list[str] = [
+        "",
+        "### 🟢 Newly viable recommendations",
+        "",
+        "Recommendations previously blocked at the license/code-availability "
+        "gate now resolve to a permissive license. Worth reconsidering:",
+        "",
+    ]
+    for t in transitions:
+        prev = t["prev"]
+        curr = t["curr"]
+        prev_label = (
+            f"`{prev['spdx']}`" if prev["spdx"]
+            else "no declared license"
+        )
+        prev_klass = prev["klass"]
+        curr_spdx = curr["spdx"] or "(detected)"
+        lines.append(
+            f"- [Issue #{t['number']}]({t['url']}) "
+            f"{_short_artifact_title(t['title'])[:80]} — "
+            f"upstream now publishes `{curr_spdx}` "
+            f"(was: {prev_label}, class `{prev_klass}`, compat "
+            f"{prev['compat']:.2f}). Re-run selection to confirm "
+            f"structural fit, then decide whether to draft a PR."
+        )
+    return lines
+
+
 def run_weekly_summary(target: Target) -> dict:
     """Aggregate the past week's runs and post the digest to the
     configured Discussion. The weekly-mode counterpart to
@@ -6972,6 +7194,11 @@ def run_weekly_summary(target: Target) -> dict:
     lifecycle_events = _lifecycle_events_for_outrider_artifacts(
         target, window_start, window_end,
     )
+    # License-watch: re-check upstream license for open Outrider Issues
+    # that were originally blocked at the license/code-availability gate;
+    # surface ones that transitioned to viable (REMYX-115). Sibling
+    # category to the lifecycle events above — shares the same surface.
+    newly_viable = _newly_viable_outrider_artifacts(target)
     agg = _aggregate_week(entries)
     agg["repo"] = target.repo
     prior_digest = _fetch_prior_digest_excerpt(discussion_id)
@@ -6979,6 +7206,7 @@ def run_weekly_summary(target: Target) -> dict:
     body = _compose_weekly_markdown(
         window_start, window_end, agg, open_items, drafted,
         lifecycle_events=lifecycle_events,
+        newly_viable=newly_viable,
     )
     url = _post_discussion_comment(discussion_id, body)
     result.update({
