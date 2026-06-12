@@ -6566,6 +6566,7 @@ def _compose_weekly_markdown(
     agg: dict,
     open_items: list[dict],
     drafted: dict | None,
+    lifecycle_events: list[dict] | None = None,
 ) -> str:
     """Assemble the Discussion-comment body.
 
@@ -6628,6 +6629,11 @@ def _compose_weekly_markdown(
     if trends:
         lines += ["", "### 📈 In the research stream", ""]
         lines += [f"- {t}" for t in trends]
+
+    # Lifecycle events on Outrider Issues/PRs in the past 7 days
+    # (REMYX-114). Section omitted entirely when no events occurred.
+    if lifecycle_events:
+        lines += _render_lifecycle_events_section(lifecycle_events, window_end)
 
     if open_items:
         next_actions = drafted.get("next_actions")
@@ -6714,6 +6720,225 @@ def _compose_weekly_markdown(
     return "\n".join(lines)
 
 
+# ─── Lifecycle events for Outrider-authored artifacts (REMYX-114) ─────────
+
+
+def _is_bot_actor(user: dict | None) -> bool:
+    """True if a GitHub API ``user`` dict belongs to a bot account.
+
+    Filters our own follow-ups out of "lifecycle events" the weekly
+    summary surfaces — comments by ``remyx-ai[bot]`` or
+    ``github-actions[bot]`` aren't new signal for the maintainer.
+    """
+    if not user:
+        return True
+    if (user.get("type") or "").lower() == "bot":
+        return True
+    login = (user.get("login") or "").lower()
+    return login in {"remyx-ai[bot]", "github-actions[bot]", "app/remyx-ai"}
+
+
+def _is_outrider_artifact(item: dict) -> bool:
+    """True if a GitHub Issue/PR was opened by Outrider.
+
+    Matches both historical artifacts (``[Remyx Recommendation]`` title
+    prefix) and new-format artifacts (body marker from the orchestrator-
+    built PR body footer).
+    """
+    title = item.get("title") or ""
+    body = item.get("body") or ""
+    head_ref = (((item.get("pull_request") or {}).get("head") or {}).get("ref")
+                if item.get("pull_request") else None)
+    head_ref = head_ref or ((item.get("head") or {}).get("ref") if item.get("head") else "")
+    return (
+        title.startswith(PR_TITLE_PREFIX)
+        or "Remyx Recommendation" in body
+        or (head_ref and head_ref.startswith(BRANCH_PREFIX))
+    )
+
+
+def _parse_iso(s: str) -> "dt.datetime | None":
+    """Parse a GitHub ISO-8601 timestamp; return None on failure."""
+    if not s:
+        return None
+    try:
+        # GitHub returns 2026-06-12T15:30:00Z; Python's fromisoformat
+        # handles the Z suffix from 3.11+ but we replace for safety.
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _relative_when(when: "dt.datetime", now: "dt.datetime") -> str:
+    """Format a recent past timestamp as 'today' / 'yesterday' / 'N days ago'.
+
+    Caps at 7 days since that's the weekly window — anything older would
+    be a bug (or a freshly-discovered event in a stale artifact).
+    """
+    delta = now - when
+    days = delta.days
+    if days < 0:
+        return "just now"
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "yesterday"
+    return f"{days} days ago"
+
+
+def _lifecycle_events_for_outrider_artifacts(
+    target: Target, window_start: "dt.datetime", window_end: "dt.datetime",
+    max_events: int = 10,
+) -> list[dict]:
+    """Detect state-change events on Outrider-authored Issues/PRs in the window.
+
+    Single-pass over the target repo's recently-updated issues+PRs (the
+    REST ``issues`` endpoint returns both with ``pull_request`` set on
+    PRs), filtered to Outrider-authored. For each, emit events that
+    occurred in ``[window_start, window_end]``:
+
+    - Issue/PR closed or reopened
+    - PR merged (state=closed AND merged_at within window)
+    - New comments from non-bot actors
+    - PR reviews from non-bot actors
+
+    Returns events sorted by recency (newest first), capped at
+    ``max_events`` so the digest doesn't balloon. Terminal events
+    (merged/closed) are prioritized over intermediate ones when the cap
+    is reached.
+    """
+    since_iso = window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        items = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues"
+            f"?state=all&since={since_iso}&per_page=100",
+        ) or []
+    except Exception as e:
+        log.debug(f"  lifecycle events fetch for {target.repo} failed: {e}")
+        return []
+
+    events: list[dict] = []
+    for item in items:
+        if not _is_outrider_artifact(item):
+            continue
+
+        number = item.get("number")
+        title = item.get("title") or ""
+        html_url = item.get("html_url") or ""
+        is_pr = item.get("pull_request") is not None
+        kind_prefix = "PR" if is_pr else "Issue"
+
+        # Terminal state events
+        if item.get("state") == "closed":
+            closed_at = _parse_iso(item.get("closed_at") or "")
+            if closed_at and window_start <= closed_at <= window_end:
+                # PR merged is a distinct, higher-signal terminal event
+                merged_at_str = (item.get("pull_request") or {}).get("merged_at")
+                merged_at = _parse_iso(merged_at_str) if merged_at_str else None
+                if merged_at and window_start <= merged_at <= window_end:
+                    events.append({
+                        "number": number, "title": title, "url": html_url,
+                        "kind_prefix": kind_prefix, "kind": "merged",
+                        "when": merged_at, "actor": "maintainer",
+                        "priority": 0,  # terminal events go first
+                    })
+                else:
+                    closed_by = (item.get("closed_by") or {}).get("login") or "maintainer"
+                    events.append({
+                        "number": number, "title": title, "url": html_url,
+                        "kind_prefix": kind_prefix, "kind": "closed",
+                        "when": closed_at, "actor": closed_by,
+                        "priority": 0,
+                    })
+
+        # Recently-opened Outrider artifacts also count as activity
+        # (the maintainer wants to see "Outrider opened #N this week").
+        created_at = _parse_iso(item.get("created_at") or "")
+        if created_at and window_start <= created_at <= window_end:
+            events.append({
+                "number": number, "title": title, "url": html_url,
+                "kind_prefix": kind_prefix, "kind": "opened",
+                "when": created_at, "actor": "Outrider",
+                "priority": 2,  # informational
+            })
+
+        # Comments from non-bot actors in the window
+        try:
+            comments = gh_api(
+                "GET",
+                f"/repos/{target.repo}/issues/{number}/comments"
+                f"?since={since_iso}&per_page=50",
+            ) or []
+        except Exception:
+            comments = []
+        for c in comments:
+            user = c.get("user") or {}
+            if _is_bot_actor(user):
+                continue
+            when = _parse_iso(c.get("created_at") or "")
+            if not when or when < window_start or when > window_end:
+                continue
+            body = (c.get("body") or "").strip()
+            # First non-empty line as a one-glance summary
+            summary_line = next(
+                (ln.strip() for ln in body.splitlines() if ln.strip()), ""
+            )
+            events.append({
+                "number": number, "title": title, "url": html_url,
+                "kind_prefix": kind_prefix, "kind": "comment",
+                "when": when, "actor": user.get("login") or "?",
+                "summary": summary_line[:120],
+                "priority": 1,
+            })
+
+    # Sort by (priority asc, when desc) — terminal events first within
+    # each artifact, then newest events overall.
+    events.sort(key=lambda e: (e.get("priority", 9), -(e["when"].timestamp())))
+    return events[:max_events]
+
+
+def _render_lifecycle_events_section(
+    events: list[dict], now: "dt.datetime",
+) -> list[str]:
+    """Render the Outrider-artifact lifecycle events as markdown lines.
+
+    Returns ``[]`` when no events were detected — caller skips the
+    section header entirely (no "nothing happened" noise per the
+    REMYX-114 acceptance criteria).
+    """
+    if not events:
+        return []
+    lines: list[str] = [
+        "",
+        "### 🔁 Recent activity on Outrider Issues/PRs",
+        "",
+    ]
+    for e in events:
+        when_label = _relative_when(e["when"], now)
+        actor = e.get("actor") or "?"
+        kind = e.get("kind")
+        prefix = e.get("kind_prefix") or "Item"
+        number = e.get("number")
+        url = e.get("url")
+        short_title = _short_artifact_title(e.get("title") or "")[:80]
+        head = f"- [{prefix} #{number}]({url}) ({short_title})"
+        if kind == "merged":
+            lines.append(f"{head} — merged {when_label}")
+        elif kind == "closed":
+            lines.append(f"{head} — closed by @{actor} {when_label}")
+        elif kind == "opened":
+            lines.append(f"{head} — opened by Outrider {when_label}")
+        elif kind == "comment":
+            summary = (e.get("summary") or "").rstrip(":") or "(no summary)"
+            lines.append(
+                f"{head} — comment by @{actor} {when_label}: {summary}"
+            )
+        else:
+            lines.append(f"{head} — {kind} {when_label}")
+    return lines
+
+
 def run_weekly_summary(target: Target) -> dict:
     """Aggregate the past week's runs and post the digest to the
     configured Discussion. The weekly-mode counterpart to
@@ -6740,12 +6965,20 @@ def run_weekly_summary(target: Target) -> dict:
         key=lambda it: it.get("created_at") or "",
         reverse=True,
     )
+    # Lifecycle events on Outrider-authored Issues/PRs in the window —
+    # state transitions + maintainer comments since the prior digest
+    # (REMYX-114). Empty list when nothing changed; the render code
+    # then omits the section header entirely.
+    lifecycle_events = _lifecycle_events_for_outrider_artifacts(
+        target, window_start, window_end,
+    )
     agg = _aggregate_week(entries)
     agg["repo"] = target.repo
     prior_digest = _fetch_prior_digest_excerpt(discussion_id)
     drafted = _draft_weekly_narrative(agg, open_items, prior_digest)
     body = _compose_weekly_markdown(
         window_start, window_end, agg, open_items, drafted,
+        lifecycle_events=lifecycle_events,
     )
     url = _post_discussion_comment(discussion_id, body)
     result.update({
