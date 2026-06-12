@@ -932,6 +932,19 @@ TEST_INTEGRATION_POLICIES = ("strict", "soft", "off")
 FAILURE_EXIT_STATUSES = {"error", "claude_failed", "weekly_summary_failed"}
 
 
+class IssuesDisabledError(RuntimeError):
+    """The target repo has its Issues tab disabled and the run's token
+    can't re-enable it.
+
+    Enabling Issues requires repo `administration` permission. Scoped
+    GitHub-App installation tokens (how Remyx authenticates the bot) are
+    deliberately *not* granted admin, so we can't flip `has_issues`. Treated
+    as a graceful skip (`skipped_issues_disabled`), not a failure — the run
+    stays green and the user can enable the Issues tab to receive Issue-mode
+    recommendations.
+    """
+
+
 @dataclass
 class Target:
     repo: str                         # "owner/name" — the target repo
@@ -2859,12 +2872,20 @@ def prepare_workdir(target: Target) -> Path:
         ["git", "clone", "--depth", "20", repo_url, str(workdir)],
         check=True, env=clone_env,
     )
+    # The branch head is normally re-authored via the git data API
+    # (see commit_and_push → _recommit_via_api), which stamps the bot
+    # identity itself. This local identity is the fallback: it's what the
+    # already-pushed commit carries if that API path can't run. Use the
+    # bot's canonical GitHub no-reply identity so even the fallback links
+    # to remyx-ai[bot] (id 289541483) — GitHub attributes commits by
+    # matching the author email to an account.
     subprocess.run(
-        ["git", "config", "user.email", "remyx-recommendation@noreply.remyx.ai"],
+        ["git", "config", "user.email",
+         "289541483+remyx-ai[bot]@users.noreply.github.com"],
         cwd=workdir, check=True,
     )
     subprocess.run(
-        ["git", "config", "user.name", "Remyx Recommendation"],
+        ["git", "config", "user.name", "remyx-ai[bot]"],
         cwd=workdir, check=True,
     )
     return workdir
@@ -4742,9 +4763,15 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
 
 
 def commit_and_push(
-    workdir: Path, branch: str, title: str, base_branch: str = "main",
+    workdir: Path, branch: str, title: str, repo: str, base_branch: str = "main",
 ) -> None:
     """Stage all changes, commit, and push the branch to origin.
+
+    The branch's final commit is (re)created through the GitHub git data
+    API with the App installation token so it's attributed to
+    remyx-ai[bot] AND carries the green "Verified" badge — the same
+    mechanism the engine's setup PR and the Claude Code GitHub App
+    (default ``use_commit_signing``) use. See ``_recommit_via_api``.
 
     Two classes of files are scrubbed before staging so they don't end
     up in the PR even when the target repo's .gitignore doesn't cover
@@ -4833,6 +4860,62 @@ def commit_and_push(
         ["git", "push", "-u", "origin", branch],
         cwd=workdir, check=True,
     )
+
+    # Re-author the pushed commit through the git data API so the branch
+    # head is a remyx-ai[bot]-attributed, "Verified" commit. The local
+    # commit above only existed to build the tree object and ship it (plus
+    # its blobs) to the remote; we now point the branch at an identical
+    # tree wrapped in an API-created commit. `head_sha` is the base we
+    # branched from (asserted == origin/<base_branch> above), so it's the
+    # new commit's sole parent.
+    _recommit_via_api(workdir, repo, branch, title, parent_sha=head_sha)
+
+
+def _recommit_via_api(
+    workdir: Path, repo: str, branch: str, title: str, parent_sha: str,
+) -> None:
+    """Replace ``branch``'s head with a bot-authored, signed commit.
+
+    Creates a commit via ``POST /repos/{repo}/git/commits`` with the App
+    installation token (``gh_api`` already uses it) pointing at HEAD's
+    tree, then fast-forwards-or-force the branch ref to it. With the App
+    token and no explicit author/committer, GitHub stamps both as the
+    bot and signs the commit — identical to the engine's setup-PR path.
+
+    Best-effort: if the API path fails (e.g. only the fallback
+    GITHUB_TOKEN is available, or contents:write is missing), the branch
+    keeps the already-pushed local commit so the PR still opens. The
+    local git identity is set to the bot in prepare_workdir, so even that
+    fallback commit is attributed to remyx-ai[bot] — just not Verified.
+    """
+    try:
+        tree_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=workdir, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        # No author/committer → GitHub uses the token's identity (the bot)
+        # for both and signs the commit. Mirrors the engine passing
+        # committer=None on the contents API.
+        commit = gh_api("POST", f"/repos/{repo}/git/commits", {
+            "message": title,
+            "tree": tree_sha,
+            "parents": [parent_sha],
+        })
+        new_sha = commit["sha"]
+        # force=True: the new commit is a sibling of the pushed local
+        # commit (same parent, same tree, different author), not a
+        # descendant, so a plain update would be rejected as non-ff.
+        gh_api("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {
+            "sha": new_sha,
+            "force": True,
+        })
+        log.info(f"  → re-authored {branch} head as remyx-ai[bot] "
+                 f"(verified): {new_sha[:8]}")
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never block the PR
+        log.warning(
+            f"  → could not re-author commit via API ({e}); keeping the "
+            f"pushed commit. PR will open but the commit won't be Verified."
+        )
 
 
 # ─── Downgrade-to-Issue helper ─────────────────────────────────────────────
@@ -5910,7 +5993,9 @@ def process_target(target: Target) -> dict:
                 result.get("test_integration_gate") == "soft_failed"
             ),
         )
-        commit_and_push(workdir, branch, pr_title, base_branch=default_branch)
+        commit_and_push(
+            workdir, branch, pr_title, repo=target.repo, base_branch=default_branch
+        )
         pr_url = open_pr(
             target, branch, pr_title, pr_body, draft=draft, base=default_branch
         )
