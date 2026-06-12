@@ -417,14 +417,14 @@ Required outputs:
    module, exercises the wiring edit you made, and asserts the
    integrated behavior.
 
-4. **README append**: a short "(Capability) — adapted from (Paper Title)"
-   section at the end. Attribute with this exact line (one Markdown
-   link to the customer-facing Remyx product page):
-
-       Contributed via [Remyx Recommendation]({attribution_url}).
-
-   Do NOT use a different URL. The orchestrator's source repo is
-   private; this link is the only one that resolves for external readers.
+4. **README documentation** (only if the repo's convention does this).
+   ORIENTATION.md shows the repo's existing README style — if the
+   convention is to mention new examples/modules in the README, add a
+   short "(Capability) — adapted from (Paper Title)" section in the same
+   shape as the existing entries. If the repo's README doesn't carry
+   per-feature documentation, DON'T add a section. Do NOT add marketing
+   attribution links to the codebase — attribution lives in the PR body
+   footer (handled by the orchestrator), not in the maintainer's repo.
 
 # Honesty rules
 
@@ -1226,6 +1226,32 @@ def gh_graphql(
 def slugify(s: str, max_len: int = 60) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "-", s.lower()).strip("-")
     return s[:max_len]
+
+
+def format_pr_title(rec: "Recommendation") -> str:
+    """Return a clean PR title for the recommendation, no Outrider prefix.
+
+    Drops the historical ``[Remyx Recommendation]`` prefix so the title
+    matches how a human contributor would title the PR. Outrider
+    attribution is preserved in the PR body footer; dedup falls back to
+    body-marker recognition (``"Remyx Recommendation" in body``) for
+    PRs created without the legacy title prefix.
+    """
+    return rec.paper_title
+
+
+def format_branch_name(rec: "Recommendation") -> str:
+    """Return a clean branch name for the recommendation, no Outrider prefix.
+
+    Drops the historical ``remyx-recommendation/`` prefix. Uses a
+    slugified paper title (more human-readable than the bare arxiv id)
+    with the arxiv id as a fallback identifier when the title is empty.
+    Dedup paths that previously matched against ``BRANCH_PREFIX`` now
+    fall back to identifying our PRs via the body marker.
+    """
+    if rec.paper_title:
+        return slugify(rec.paper_title)
+    return rec.arxiv_id or "paper-recommendation"
 
 
 def strip_html(s: str) -> str:
@@ -4986,7 +5012,7 @@ def _open_downgrade_issue(
         default attributes to coding-agent Issue-mode election (the
         legacy default); callers pass the routing-specific text.
     """
-    title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
+    title = format_pr_title(rec)
 
     sections: list[str] = []
     sections.append(
@@ -5234,7 +5260,7 @@ def process_target(target: Target) -> dict:
         if TIER_RANK.get(c.tier.lower(), 0) < min_required:
             dropped_low_conf += 1
             continue
-        c_branch = f"{BRANCH_PREFIX}{c.arxiv_id or slugify(c.paper_title)}"
+        c_branch = format_branch_name(c)
         if existing_pr_for(target, c_branch):
             dropped_pr_exists += 1
             continue
@@ -5558,7 +5584,7 @@ def process_target(target: Target) -> dict:
         # 5. Spec bundle for the chosen candidate. Thread the selection
         # rationale through so pre-flight and the implementer evaluate the
         # same scoped framing the selection pass reasoned about.
-        branch = f"{BRANCH_PREFIX}{rec.arxiv_id or slugify(rec.paper_title)}"
+        branch = format_branch_name(rec)
         write_spec_bundle(
             workdir, target, rec, package,
             selection_note=result.get("selection_reasoning", ""),
@@ -5875,7 +5901,7 @@ def process_target(target: Target) -> dict:
             draft = tests_status != "passed"
 
         # 11. Commit + push + PR
-        pr_title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
+        pr_title = format_pr_title(rec)
         pr_body = build_pr_body(
             target, rec, tests_status, test_output,
             review_section=review_section,

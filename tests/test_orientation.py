@@ -334,3 +334,64 @@ def test_collect_omits_missing_sections(tmp_path: Path) -> None:
     assert "## PR template" not in body
     assert "## Tooling and lint/type config" not in body
     assert "## Existing modules" not in body
+
+
+# ─── Phase 1c — format_pr_title / format_branch_name ──────────────────────
+
+
+def _rec(title: str = "Paper Title", arxiv: str = "2310.12815v4"):
+    """Build a minimal Recommendation for title/branch formatting tests."""
+    return run.Recommendation(
+        paper_title=title,
+        arxiv_id=arxiv,
+        tier="high",
+        z_score=0.0,
+        spec_md="",
+        paper_abstract="",
+        domain_summary="",
+        raw_paper_md="",
+        relevance_score=0.95,
+        reasoning="",
+        suggested_experiment="",
+        interest_name="demo",
+    )
+
+
+def test_format_pr_title_drops_remyx_prefix() -> None:
+    """New PR titles use the paper title directly — no [Remyx Recommendation] prefix."""
+    title = run.format_pr_title(_rec("Formalizing Prompt Injection"))
+    assert title == "Formalizing Prompt Injection"
+    # Specifically, the old prefix should NOT appear
+    assert "[Remyx Recommendation]" not in title
+
+
+def test_format_branch_name_uses_slugified_paper_title() -> None:
+    """New branch names use the slugified paper title, no remyx-recommendation/ prefix."""
+    branch = run.format_branch_name(
+        _rec("Formalizing and Benchmarking Prompt Injection Attacks")
+    )
+    assert "remyx-recommendation/" not in branch
+    # Should be a slugified form of the paper title
+    assert "formalizing" in branch
+    assert "prompt-injection" in branch
+
+
+def test_format_branch_name_falls_back_to_arxiv_when_no_title() -> None:
+    branch = run.format_branch_name(_rec(title="", arxiv="2310.12815v4"))
+    assert branch == "2310.12815v4"
+
+
+def test_format_branch_name_final_fallback() -> None:
+    branch = run.format_branch_name(_rec(title="", arxiv=""))
+    assert branch == "paper-recommendation"
+
+
+def test_invocation_template_drops_marketing_link() -> None:
+    """The agent's INVOCATION.md no longer instructs adding a marketing link."""
+    template = run._INVOCATION_MD_TEMPLATE
+    # The historical marketing-link instruction should be gone
+    assert "Contributed via [Remyx Recommendation]" not in template
+    # But the README documentation guidance should remain (now conditional
+    # on the repo's convention as shown in ORIENTATION.md)
+    assert "README" in template
+    assert "ORIENTATION" in template
