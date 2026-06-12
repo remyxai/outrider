@@ -163,9 +163,15 @@ runs:
 
     - name: Configure git identity
       shell: bash
+      # Global fallback identity. The branch head is normally re-authored
+      # via the git data API with the App token (run.py → _recommit_via_api),
+      # which stamps remyx-ai[bot] and signs the commit. run.py also sets a
+      # repo-local identity in the clone. This global value only applies if
+      # both of those are bypassed; use the bot's GitHub no-reply identity so
+      # it still links to remyx-ai[bot] (id 289541483).
       run: |
-        git config --global user.name "Remyx Recommendation"
-        git config --global user.email "remyx-recommendation@noreply.remyx.ai"
+        git config --global user.name "remyx-ai[bot]"
+        git config --global user.email "289541483+remyx-ai[bot]@users.noreply.github.com"
 
     - name: Recommend + implement + open PR
       id: recommend
