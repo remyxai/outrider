@@ -2211,8 +2211,7 @@ def commit_and_push(
     The branch's final commit is (re)created through the GitHub git data
     API with the App installation token so it's attributed to
     remyx-ai[bot] AND carries the green "Verified" badge — the same
-    mechanism the engine's setup PR and the Claude Code GitHub App
-    (default ``use_commit_signing``) use. See ``_recommit_via_api``.
+    mechanism the engine's setup PR.``.
 
     Two classes of files are scrubbed before staging so they don't end
     up in the PR even when the target repo's .gitignore doesn't cover
