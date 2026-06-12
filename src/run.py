@@ -258,19 +258,65 @@ After the orchestrator validates your work, it checks the diff with
 set, the PR is rejected and your work is not committed.
 """
 
+_ORIENTATION_MD_TEMPLATE = """\
+# Repo orientation — conventions and patterns for this target repo
+
+The orchestrator already read the target repo's convention-defining files
+for you. Use the patterns below to shape your generated code, PR title,
+PR body, and commit messages. Do NOT re-explore these files yourself
+(that's redundant cost) — the relevant content is summarized here.
+
+{contributor_guides_block}
+{pr_template_block}
+{recent_merged_prs_block}
+{tooling_config_block}
+{verification_stack_block}
+{nearby_files_block}
+{nearby_tests_block}
+
+## How to use this orientation
+
+- **PR title**: match the convention shown in the recent merged PRs above
+  (the title pattern — e.g. `<scope>: <verb> <thing>` if that's what
+  recent merges follow). Do not use Remyx-prefixed titles.
+- **PR body**: if the PR template is shown above, conform to its section
+  structure. Otherwise produce a clean summary + test plan.
+- **Code style**: match what the existing nearby files do — import style
+  (relative vs absolute), naming, formatting. The lint config (if shown)
+  is the source of truth for what passes.
+- **Type checking**: if the repo uses mypy or pyright, the orientation
+  block lists the configured strictness. Match the patterns the existing
+  tests use for any TypedDict / async / union narrowing.
+- **Test design**: match the existing test patterns — go through public
+  interfaces, not internal attributes; use the same fixtures and helpers
+  the existing tests use.
+
+If the orientation block is empty or missing a section, that signal is
+informative: either the repo has no contributor guide / PR template /
+lint config (treat as no strict convention to follow) or the orchestrator
+couldn't read it (rare; surface in your summary if so).
+"""
+
 _INVOCATION_MD_TEMPLATE = """\
 You are a coding agent implementing a recommendation from the Remyx
 Recommendation pipeline (attribution URL: {attribution_url}).
 
 Read these files in order:
-  1. .remyx-recommendation/SPEC.md       — the implementation spec (paper,
-                                            why-this-paper, suggested
-                                            experiment, team's research-
-                                            focus body, abstract)
-  2. .remyx-recommendation/PAPER.md      — paper title + abstract
-  3. .remyx-recommendation/CONTEXT.md    — team context (recent merges,
-                                            if Remyx returned any)
-  4. .remyx-recommendation/GUARDRAILS.md — what you may and may not modify
+  1. .remyx-recommendation/SPEC.md         — the implementation spec (paper,
+                                              why-this-paper, suggested
+                                              experiment, team's research-
+                                              focus body, abstract)
+  2. .remyx-recommendation/PAPER.md        — paper title + abstract
+  3. .remyx-recommendation/CONTEXT.md      — team context (recent merges,
+                                              if Remyx returned any)
+  4. .remyx-recommendation/GUARDRAILS.md   — what you may and may not modify
+  5. .remyx-recommendation/ORIENTATION.md  — target repo's contributor guide,
+                                              PR template, recent-merged-PR
+                                              conventions, lint/type config,
+                                              and a few sample existing files
+                                              + tests near the planned call
+                                              site. Use these patterns
+                                              without re-exploring them.
 
 SPEC.md names a PROPOSED CALL SITE under "How this maps onto your repo"
 (the file + function the selection pass judged most implementable). Start
@@ -2806,6 +2852,335 @@ def detect_package_name(workdir: Path) -> str:
     return "src"
 
 
+def _orient_contributor_guides(workdir: Path, cap: int = 3000) -> str:
+    """Read contributor-guide files; concatenate and truncate to ``cap``."""
+    chunks: list[str] = []
+    for name in ("CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"):
+        path = workdir / name
+        if not path.is_file():
+            continue
+        try:
+            body = path.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if not body:
+            continue
+        snippet = body[:cap] + ("\n…[truncated]" if len(body) > cap else "")
+        chunks.append(f"### `{name}`\n\n{snippet}")
+    return "\n\n".join(chunks)
+
+
+def _orient_pr_template(workdir: Path, cap: int = 2000) -> str:
+    """Read PR templates from .github/PULL_REQUEST_TEMPLATE/ or root."""
+    candidates: list[Path] = []
+    tmpl_dir = workdir / ".github" / "PULL_REQUEST_TEMPLATE"
+    if tmpl_dir.is_dir():
+        candidates.extend(sorted(tmpl_dir.glob("*.md")))
+    root_tmpl = workdir / ".github" / "pull_request_template.md"
+    if root_tmpl.is_file():
+        candidates.append(root_tmpl)
+    chunks: list[str] = []
+    for path in candidates[:3]:  # at most 3 templates
+        try:
+            body = path.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if not body:
+            continue
+        rel = path.relative_to(workdir).as_posix()
+        snippet = body[:cap] + ("\n…[truncated]" if len(body) > cap else "")
+        chunks.append(f"### `{rel}`\n\n```markdown\n{snippet}\n```")
+    return "\n\n".join(chunks)
+
+
+def _orient_recent_merged_prs(repo: str, limit: int = 10) -> str:
+    """Pull recent merged PRs via gh_api for title + body convention extraction."""
+    if not repo:
+        return ""
+    try:
+        params = f"state=closed&sort=updated&direction=desc&per_page={limit * 2}"
+        prs = gh_api("GET", f"repos/{repo}/pulls?{params}")
+    except Exception:
+        return ""
+    if not isinstance(prs, list):
+        return ""
+    merged = [p for p in prs if p.get("merged_at")][:limit]
+    if not merged:
+        return ""
+    lines = [f"Last {len(merged)} merged PRs on `{repo}` (most recent first):\n"]
+    for pr in merged:
+        num = pr.get("number")
+        title = (pr.get("title") or "").strip()
+        author = (pr.get("user") or {}).get("login", "?")
+        labels = [
+            (lab.get("name") or "").strip()
+            for lab in (pr.get("labels") or [])
+            if lab.get("name")
+        ]
+        label_str = f"  labels: [{', '.join(labels)}]" if labels else ""
+        lines.append(f"- #{num} (by @{author}): {title}{label_str}")
+    # Include the body of the 3 most-recent merges so the agent can see
+    # the section pattern (Summary / Test plan / etc).
+    lines.append("\nBody samples (3 most recent, truncated):")
+    for pr in merged[:3]:
+        num = pr.get("number")
+        body = (pr.get("body") or "").strip()
+        if not body:
+            continue
+        snippet = body[:800] + ("\n…[truncated]" if len(body) > 800 else "")
+        lines.append(f"\n#### PR #{num} body\n```markdown\n{snippet}\n```")
+    return "\n".join(lines)
+
+
+def _orient_tooling_config(workdir: Path) -> str:
+    """Extract lint/type/test config from common config files."""
+    chunks: list[str] = []
+    # pyproject.toml — extract [tool.X] sections only (keep budget tight)
+    pyproject = workdir / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            body = pyproject.read_text(errors="replace")
+        except OSError:
+            body = ""
+        if body:
+            tool_sections: list[str] = []
+            current_section: list[str] = []
+            in_tool_block = False
+            for line in body.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("["):
+                    if in_tool_block and current_section:
+                        tool_sections.append("\n".join(current_section))
+                    current_section = []
+                    in_tool_block = stripped.startswith("[tool.") or stripped.startswith(
+                        "[project.optional-dependencies"
+                    )
+                if in_tool_block:
+                    current_section.append(line)
+            if in_tool_block and current_section:
+                tool_sections.append("\n".join(current_section))
+            if tool_sections:
+                joined = "\n\n".join(tool_sections)
+                snippet = joined[:2500] + (
+                    "\n…[truncated]" if len(joined) > 2500 else ""
+                )
+                chunks.append(f"### `pyproject.toml` (tool sections)\n\n```toml\n{snippet}\n```")
+
+    # Standalone tool configs (just list presence + first 60 lines each)
+    for name in (".ruff.toml", "ruff.toml", "mypy.ini", "pyrightconfig.json", "tox.ini"):
+        path = workdir / name
+        if not path.is_file():
+            continue
+        try:
+            body = path.read_text(errors="replace")
+        except OSError:
+            continue
+        snippet = "\n".join(body.splitlines()[:60])
+        chunks.append(f"### `{name}`\n\n```\n{snippet}\n```")
+
+    # Makefile — list verification-flavored targets if any
+    mk = workdir / "Makefile"
+    if mk.is_file():
+        try:
+            body = mk.read_text(errors="replace")
+        except OSError:
+            body = ""
+        if body:
+            target_lines = [
+                line for line in body.splitlines()
+                if line and not line.startswith((" ", "\t", "#"))
+                and ":" in line
+            ]
+            verify_targets = [
+                line for line in target_lines
+                if any(kw in line.split(":")[0].lower() for kw in
+                       ("format", "lint", "typecheck", "type-check", "mypy",
+                        "pyright", "test", "check", "sync"))
+            ]
+            if verify_targets:
+                chunks.append(
+                    "### `Makefile` (verification-relevant targets)\n\n```make\n"
+                    + "\n".join(verify_targets) + "\n```"
+                )
+    return "\n\n".join(chunks)
+
+
+def _detect_verification_stack(workdir: Path) -> tuple[str, list[str]]:
+    """Detect package manager + verification commands from repo signals.
+
+    Returns ``(package_manager, commands)``. Commands are listed in the
+    order they should run. Empty list if no verification stack detected.
+    """
+    pkg_mgr = "pip"
+    if (workdir / "uv.lock").is_file():
+        pkg_mgr = "uv"
+    elif (workdir / "poetry.lock").is_file():
+        pkg_mgr = "poetry"
+    elif (workdir / "Pipfile.lock").is_file():
+        pkg_mgr = "pipenv"
+    elif (workdir / "pyproject.toml").is_file():
+        pkg_mgr = "pip+pyproject"
+
+    commands: list[str] = []
+
+    # 1. Makefile targets — most explicit signal
+    mk = workdir / "Makefile"
+    if mk.is_file():
+        try:
+            body = mk.read_text(errors="replace")
+        except OSError:
+            body = ""
+        targets_present = {
+            line.split(":")[0].strip()
+            for line in body.splitlines()
+            if line and not line.startswith((" ", "\t", "#")) and ":" in line
+        }
+        for target in ("format", "lint", "typecheck", "type-check", "tests", "test"):
+            if target in targets_present:
+                commands.append(f"make {target}")
+
+    # 2. tox / nox orchestration
+    if not commands:
+        if (workdir / "tox.ini").is_file():
+            commands.append("tox")
+        elif (workdir / "noxfile.py").is_file():
+            commands.append("nox")
+
+    # 3. Direct invocation from pyproject.toml signals
+    if not commands and (workdir / "pyproject.toml").is_file():
+        try:
+            body = (workdir / "pyproject.toml").read_text(errors="replace")
+        except OSError:
+            body = ""
+        if "[tool.ruff" in body:
+            commands.append("ruff format --check .")
+            commands.append("ruff check .")
+        elif "[tool.black" in body:
+            commands.append("black --check .")
+        if "[tool.mypy" in body:
+            commands.append("mypy .")
+        if (workdir / "pyrightconfig.json").is_file():
+            commands.append("pyright")
+        if "[tool.pytest" in body or "pytest" in body:
+            commands.append("pytest")
+
+    return pkg_mgr, commands
+
+
+def _orient_verification_stack(workdir: Path) -> str:
+    """Format detected verification stack as a markdown section.
+
+    Returns "" when no commands AND no specific package-manager signal
+    were detected (i.e. nothing useful to report). When commands are
+    detected, format as a markdown list. When only the package manager
+    is detected (no commands), report the package manager so the agent
+    knows the dependency-install path.
+    """
+    pkg_mgr, commands = _detect_verification_stack(workdir)
+    if not commands and pkg_mgr == "pip":
+        # Default fallback with no commands — no useful signal to report.
+        return ""
+    lines = [f"Package manager: `{pkg_mgr}`"]
+    if commands:
+        lines.extend(["", "Detected verification commands (run in order):"])
+        for cmd in commands:
+            lines.append(f"  - `{cmd}`")
+    return "\n".join(lines)
+
+
+def _orient_nearby_files(workdir: Path, package: str, cap_files: int = 5) -> str:
+    """List up to ``cap_files`` existing modules in the package root with first docstring line."""
+    pkg_dir = workdir / package
+    if not pkg_dir.is_dir():
+        return ""
+    py_files = sorted(pkg_dir.glob("*.py"))[:cap_files]
+    if not py_files:
+        return ""
+    lines: list[str] = []
+    for path in py_files:
+        rel = path.relative_to(workdir).as_posix()
+        first_lines = ""
+        try:
+            text = path.read_text(errors="replace")
+            doc = ast.get_docstring(ast.parse(text)) or ""
+            first_lines = doc.splitlines()[0] if doc else ""
+        except (SyntaxError, OSError):
+            pass
+        if first_lines:
+            lines.append(f"- `{rel}` — {first_lines[:90]}")
+        else:
+            lines.append(f"- `{rel}`")
+    return "\n".join(lines)
+
+
+def _orient_nearby_tests(workdir: Path, cap_files: int = 5) -> str:
+    """List up to ``cap_files`` test files; include the first ~30 lines of one as a pattern sample."""
+    tests_dir = workdir / "tests"
+    if not tests_dir.is_dir():
+        return ""
+    test_files = sorted(tests_dir.rglob("test_*.py"))[:cap_files]
+    if not test_files:
+        return ""
+    lines: list[str] = []
+    lines.append(f"{len(test_files)} test file(s) listed:")
+    for path in test_files:
+        rel = path.relative_to(workdir).as_posix()
+        lines.append(f"- `{rel}`")
+    # Include a sample of the first test file's imports and one test fn
+    sample = test_files[0]
+    try:
+        text = sample.read_text(errors="replace")
+    except OSError:
+        text = ""
+    if text:
+        sample_lines = text.splitlines()[:40]
+        snippet = "\n".join(sample_lines)
+        lines.append(
+            f"\nSample pattern from `{sample.relative_to(workdir).as_posix()}`:\n```python\n{snippet}\n```"
+        )
+    return "\n".join(lines)
+
+
+def _collect_repo_orientation(workdir: Path, target: Target, package: str) -> str:
+    """Assemble the repo orientation content for ORIENTATION.md.
+
+    Returns the formatted markdown body. Returns "" if no orientation
+    content could be gathered (e.g. fresh repo with no conventions).
+    """
+    def _section(title: str, body: str) -> str:
+        if not body.strip():
+            return ""
+        return f"## {title}\n\n{body}"
+
+    blocks = {
+        "contributor_guides_block": _section(
+            "Contributor guides", _orient_contributor_guides(workdir)
+        ),
+        "pr_template_block": _section("PR template(s)", _orient_pr_template(workdir)),
+        "recent_merged_prs_block": _section(
+            "Recent merged PRs (title + body convention)",
+            _orient_recent_merged_prs(target.repo) if target.repo else "",
+        ),
+        "tooling_config_block": _section(
+            "Tooling and lint/type config", _orient_tooling_config(workdir)
+        ),
+        "verification_stack_block": _section(
+            "Detected verification stack", _orient_verification_stack(workdir)
+        ),
+        "nearby_files_block": _section(
+            f"Existing modules in `{package}/`", _orient_nearby_files(workdir, package)
+        ),
+        "nearby_tests_block": _section(
+            "Existing tests (pattern corpus)", _orient_nearby_tests(workdir)
+        ),
+    }
+    # If every section came up empty, return "" so the caller can skip
+    # writing the file.
+    if not any(v.strip() for v in blocks.values()):
+        return ""
+    return _ORIENTATION_MD_TEMPLATE.format(**blocks)
+
+
 def write_spec_bundle(
     workdir: Path, target: Target, rec: Recommendation, package: str,
     selection_note: str = "",
@@ -2875,6 +3250,15 @@ def write_spec_bundle(
         attribution_url=CANONICAL_ATTRIBUTION_URL,
         issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
     ))
+
+    # ORIENTATION.md — target repo's contributor guides, PR template, recent
+    # merged-PR conventions, lint/type config, detected verification stack,
+    # and a few sample nearby files/tests. Pre-read so the agent doesn't
+    # broad-explore the repo to rediscover conventions. Skipped entirely
+    # when no orientation content can be gathered.
+    orientation_body = _collect_repo_orientation(workdir, target, package)
+    if orientation_body:
+        (bundle / "ORIENTATION.md").write_text(orientation_body)
 
 
 # ─── Claude Code invocation ────────────────────────────────────────────────
