@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -707,6 +708,11 @@ verification bar — explain why in `reasoning`.
 Tools available:
   - `gh code-search "<query>" --repo <repo>` — find call sites
   - `gh api repos/<repo>/contents/<path>` — read a file by path
+  - `gh-graph <file_path>` — list a Python file's imports AND the files
+    that import it (its call sites). After you locate a candidate's likely
+    module, run `gh-graph` on it to walk *outward* to the call sites that
+    depend on it, then read those to verify the I/O contract — this is the
+    fastest way to ground "what plugs into what" rather than guessing.
   - `gh issue list/view` — see open maintainer concerns
   - `remyxai papers list/get` — inspect the ranker pool with reasoning
   - `remyxai interests get` — see the interest's project-summary context
@@ -3393,6 +3399,62 @@ def _run_claude_json(
     return proc.returncode == 0, output
 
 
+def _run_claude_stream(
+    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
+) -> tuple[bool, str, list[dict]]:
+    """Like ``_run_claude_json`` but with the full tool transcript.
+
+    Runs ``claude … --output-format stream-json --verbose -p <prompt>`` and
+    parses the JSONL event stream. Returns ``(ok, text, events)`` where
+    ``text`` is the final result event's answer string (same string the json
+    envelope's ``result`` field carries, so verdict parsing is unchanged) and
+    ``events`` is every parsed stream event — the selection coverage parser
+    walks the ``tool_use`` / ``tool_result`` blocks in it.
+
+    Token/cost usage is recorded exactly once, off the terminal
+    ``{"type": "result", …}`` event (same shape as the json envelope), so
+    accounting matches ``_run_claude_json``. ``--verbose`` is required by the
+    CLI when ``stream-json`` is paired with ``-p``.
+    """
+    cmd = [*cmd_prefix, "--output-format", "stream-json", "--verbose",
+           "-p", prompt]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"claude CLI timed out after {timeout_s}s", []
+    except FileNotFoundError:
+        return False, ("claude CLI not found on PATH "
+                       "(install: npm install -g @anthropic-ai/claude-code)"), []
+    events: list[dict] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(ev, dict):
+            events.append(ev)
+    final = next(
+        (e for e in reversed(events) if e.get("type") == "result"), None
+    )
+    if final is not None:
+        _record_claude_usage(final)
+        text = final.get("result") or ""
+        is_error = bool(final.get("is_error")) or proc.returncode != 0
+        if not text and proc.stderr:
+            text = proc.stderr
+        return (not is_error), text, events
+    # No terminal result event — preserve a usable failure signal.
+    output = (proc.stdout or "") + (
+        "\n--- STDERR ---\n" + proc.stderr if proc.stderr else ""
+    )
+    return proc.returncode == 0, output, events
+
+
 def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     """Invoke the Claude Code CLI in headless mode with the workdir as context.
 
@@ -3432,6 +3494,23 @@ def _run_claude_oneshot(
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     return _run_claude_json(cmd, prompt, workdir, timeout_s)
+
+
+def _run_claude_oneshot_streaming(
+    workdir: Path, prompt: str, timeout_s: int, max_turns: int | None = None
+) -> tuple[bool, str, list[dict]]:
+    """Streaming variant of ``_run_claude_oneshot`` used by the selection pass.
+
+    Returns ``(ok, text, events)`` — same contract as ``_run_claude_oneshot``
+    plus the parsed tool transcript, so the selection pass can compute
+    exploration-coverage telemetry from the agent's actual actions. Only the
+    selection pass uses this; the other one-shot callers (pre-flight,
+    self-review, audit) stay on the cheaper single-envelope runner.
+    """
+    cmd = ["claude", "--dangerously-skip-permissions"]
+    if max_turns is not None:
+        cmd += ["--max-turns", str(max_turns)]
+    return _run_claude_stream(cmd, prompt, workdir, timeout_s)
 
 
 def _extract_json_object(s: str) -> dict | None:
@@ -3717,6 +3796,198 @@ def _render_candidate_brief(
     return "\n\n".join(blocks)
 
 
+# ─── Selection-pass exploration telemetry ──────────────────────────────────
+#
+# The selection pass explores the target repo (searches + file reads) before
+# committing to a verdict. An agent can reach the right files yet stop before
+# reading enough lines to verify the integration shape. These helpers parse
+# the agent's tool transcript into per-run coverage (searches, file reads,
+# lines seen), compute a context-efficiency proxy, and optionally gate a
+# verdict reached on too little reading. The coverage and efficiency fields
+# are added to the run's JSON output for later analysis.
+
+# Shell-segment separators: `||`/`&&` before `|` so the two-char ops win.
+_SHELL_SEGMENT_RE = re.compile(r"\|\||&&|;|\||\n")
+
+# `<path>.py:<line>` citations in the verdict reasoning — the context-
+# efficiency numerator. Anchored to a boundary so it doesn't fire mid-token.
+_CITATION_RE = re.compile(r"""(?:^|[\s(`'"=>])([\w./-]+\.py):(\d+)""")
+
+
+def _classify_shell_segment(seg: str) -> str | None:
+    """Classify one shell segment as ``"search"``, ``"file_read"``, or None.
+
+    Segment-aware so a batched command (``grep …; sed -n FILE; cmd | head``)
+    is scored stage-by-stage: the search and the file read each count, and a
+    pipe-fed pager/filter reading stdin (``… | head``, ``… | grep``) counts
+    as neither. ``gh-graph`` is navigation, not a content read — also neither.
+    """
+    seg = seg.strip()
+    if not seg:
+        return None
+    try:
+        toks = shlex.split(seg)
+    except ValueError:
+        toks = seg.split()
+    if not toks:
+        return None
+    binname = os.path.basename(toks[0])
+    args = toks[1:]
+    nonopt = [a for a in args if not a.startswith("-")]
+    if binname == "gh":
+        if args[:2] == ["search", "code"] or (args and args[0] == "code-search"):
+            return "search"
+        if args and args[0] == "api":
+            joined = " ".join(args)
+            if "/contents/" in joined or joined.rstrip().endswith("/contents"):
+                return "file_read"
+        return None
+    if binname == "gh-graph":
+        return None
+    if binname in ("grep", "rg", "ag"):
+        # pattern + path(s) → searching files; pattern alone → reads stdin.
+        return "search" if len(nonopt) >= 2 else None
+    if binname == "cat":
+        return "file_read" if nonopt else None
+    if binname in ("head", "tail"):
+        # a non-numeric positional is a file; bare/`-n N` reads stdin.
+        return "file_read" if any(not a.isdigit() for a in nonopt) else None
+    if binname == "sed":
+        # `sed -n '1,50p' FILE` carries script + file; script alone = stdin.
+        return "file_read" if len(nonopt) >= 2 else None
+    return None
+
+
+def _classify_shell_command(cmd: str) -> list[str]:
+    """All non-None segment classifications for a Bash command string."""
+    if not cmd:
+        return []
+    out: list[str] = []
+    for seg in _SHELL_SEGMENT_RE.split(cmd):
+        cls = _classify_shell_segment(seg)
+        if cls:
+            out.append(cls)
+    return out
+
+
+def _classify_tool_use(name: str, inp: dict) -> list[str]:
+    """Classifications for one ``tool_use`` block (Bash, Read, Grep, …)."""
+    if name == "Bash":
+        return _classify_shell_command((inp or {}).get("command") or "")
+    if name in ("Read", "WebFetch"):
+        return ["file_read"]
+    if name in ("Grep", "Glob"):
+        return ["search"]
+    return []
+
+
+def _count_result_lines(content: object) -> int:
+    """Line count of a ``tool_result`` payload (string or text-block list)."""
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "\n".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    else:
+        text = str(content)
+    return len(text.splitlines()) if text else 0
+
+
+def _selection_coverage_from_events(events: list[dict]) -> dict:
+    """Parse a stream-json transcript into per-run exploration coverage.
+
+    Pairs each file-read ``tool_use`` with its ``tool_result`` by id so
+    ``visible_lines`` reflects content the agent actually saw. Returns
+    ``searches`` / ``file_reads`` / ``visible_lines`` / ``search_to_read_ratio``.
+    """
+    searches = 0
+    file_reads = 0
+    visible_lines = 0
+    read_ids: set[str] = set()
+    for ev in events:
+        msg = ev.get("message") if isinstance(ev, dict) else None
+        content = (msg or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                classes = _classify_tool_use(
+                    block.get("name") or "", block.get("input") or {}
+                )
+                searches += classes.count("search")
+                reads = classes.count("file_read")
+                file_reads += reads
+                if reads and block.get("id"):
+                    read_ids.add(block["id"])
+            elif btype == "tool_result":
+                if block.get("tool_use_id") in read_ids:
+                    visible_lines += _count_result_lines(block.get("content"))
+    return {
+        "searches": searches,
+        "file_reads": file_reads,
+        "visible_lines": visible_lines,
+        "search_to_read_ratio": round(searches / max(file_reads, 1), 2),
+    }
+
+
+def _selection_context_efficiency(text: str, visible_lines: int) -> float:
+    """Context-efficiency proxy: distinct ``path:line`` citations in the
+    verdict reasoning over total visible lines. A high-coverage /
+    low-efficiency run = "read a lot, used little." 0.0 when nothing was
+    cited.
+    """
+    if not text:
+        return 0.0
+    pairs = set(_CITATION_RE.findall(text))
+    return round(len(pairs) / max(visible_lines, 1), 4)
+
+
+def _apply_coverage_gate(
+    data: dict, coverage: dict, *, higher_floor: bool
+) -> dict:
+    """Flag (and, in enforce mode, block) an under-explored verdict.
+
+    Gates on ``visible_lines`` — the content-grounding signal, robust to how
+    the agent batches its shell calls; ``file_reads`` / ``searches`` ride along
+    as telemetry only. Mode via ``REMYX_SELECTION_COVERAGE_GATE``:
+    ``observe`` (default) flags without blocking; ``enforce`` downgrades an
+    under-explored pick to a skip (``chosen_index=-1`` + ``under_explored``
+    marker, which the caller maps to ``skipped_under_explored``); ``off``
+    disables the check entirely. Always mutates ``coverage`` with the
+    ``under_explored`` verdict (unless ``off``).
+    """
+    mode = os.environ.get(
+        "REMYX_SELECTION_COVERAGE_GATE", "observe"
+    ).lower().strip()
+    if mode == "off":
+        return data
+    if higher_floor:
+        floor = int(os.environ.get(
+            "REMYX_SELECTION_MIN_VISIBLE_LINES_EXTENSION", "300"))
+    else:
+        floor = int(os.environ.get(
+            "REMYX_SELECTION_MIN_VISIBLE_LINES", "150"))
+    under = coverage.get("visible_lines", 0) < floor
+    coverage["under_explored"] = under
+    coverage["min_visible_lines"] = floor
+    if under and mode == "enforce":
+        log.info(
+            f"  selection coverage gate (enforce): visible_lines="
+            f"{coverage.get('visible_lines')} < floor {floor}; downgrading "
+            f"verdict to skip (skipped_under_explored)"
+        )
+        data["chosen_index"] = -1
+        data["under_explored"] = True
+    return data
+
+
 def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
     target: "Target | None" = None,
@@ -3776,7 +4047,9 @@ def select_recommendation(
         f"  → agentic selection over {len(candidates)} candidates "
         f"(max-turns={max_turns}, timeout={timeout_s}s)"
     )
-    ok, output = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=max_turns)
+    ok, output, events = _run_claude_oneshot_streaming(
+        workdir, prompt, timeout_s, max_turns=max_turns,
+    )
     if not ok:
         log.warning(f"  selection call failed: {output[:200]}; "
                     f"falling back to top-ranked candidate")
@@ -3815,7 +4088,7 @@ def select_recommendation(
         retry_max_turns = int(
             os.environ.get("REMYX_SELECTION_RETRY_MAX_TURNS", "5")
         )
-        ok, output = _run_claude_oneshot(
+        ok, output, events = _run_claude_oneshot_streaming(
             workdir, retry_prompt, retry_timeout, max_turns=retry_max_turns,
         )
         if not ok:
@@ -3828,6 +4101,39 @@ def select_recommendation(
                         f"raw: {output[:300]!r}; falling back")
             return None
         log.info("  selection: JSON-parse retry succeeded")
+    # Exploration-coverage telemetry. Computed from the transcript
+    # of whichever attempt produced the parseable verdict, then attached to
+    # `data` BEFORE the branch logic so every return path (in-pool, extension,
+    # external -2, skip -1) carries it. The gate may downgrade an under-
+    # explored pick to -1 in enforce mode; observe (default) only records.
+    coverage = _selection_coverage_from_events(events)
+    reasoning_text = " ".join(
+        str(data.get(k) or "") for k in (
+            "reasoning", "verification_summary",
+            "chosen_call_site", "proposed_call_site",
+        )
+    )
+    context_efficiency = _selection_context_efficiency(
+        reasoning_text, coverage["visible_lines"]
+    )
+    try:
+        _idx_raw = int(data.get("chosen_index"))
+    except (TypeError, ValueError):
+        _idx_raw = None
+    _higher_floor = (
+        (data.get("integration_shape") or "").lower().strip() == "extension"
+        or _idx_raw == -2
+    )
+    _apply_coverage_gate(data, coverage, higher_floor=_higher_floor)
+    data["selection_coverage"] = coverage
+    data["selection_context_efficiency"] = context_efficiency
+    log.info(
+        f"  selection coverage: {coverage['searches']} searches, "
+        f"{coverage['file_reads']} file reads, "
+        f"{coverage['visible_lines']} lines visible, "
+        f"context-efficiency {context_efficiency} "
+        f"(under_explored={coverage.get('under_explored')})"
+    )
     try:
         idx = int(data.get("chosen_index"))
     except (TypeError, ValueError):
@@ -5405,18 +5711,37 @@ def process_target(target: Target) -> dict:
                 workdir, package, viable, target=target,
                 discharged_issues=open_issues,
             )
+            # Attach exploration-coverage telemetry once, before the branch
+            # handling — every downstream path returns this same `result`, so
+            # the fields ride along regardless of the verdict, and the run's
+            # JSON output carries them for later analysis.
+            if selection is not None:
+                if "selection_coverage" in selection:
+                    result["selection_coverage"] = selection["selection_coverage"]
+                if "selection_context_efficiency" in selection:
+                    result["selection_context_efficiency"] = (
+                        selection["selection_context_efficiency"]
+                    )
             if selection is not None and selection.get("chosen_index") == -1:
                 # Agentic selection rejected every candidate after verification.
                 # The honest signal is "skip this run" — not "fall back to the
                 # top-ranked candidate," because that's precisely what
-                # verification just rejected.
-                result["status"] = "skipped_by_selection_verification"
+                # verification just rejected. When the coverage gate (enforce
+                # mode) is what forced the -1, distinguish it as
+                # skipped_under_explored so the telemetry separates "verified
+                # and rejected" from "didn't read enough to decide."
+                if selection.get("under_explored"):
+                    result["status"] = "skipped_under_explored"
+                    log.info("  ✗ skipped_under_explored: coverage gate "
+                             "downgraded an under-explored verdict")
+                else:
+                    result["status"] = "skipped_by_selection_verification"
+                    log.info("  ✗ skipped_by_selection_verification: every "
+                             "candidate failed verification")
                 result["selection_reasoning"] = selection.get("reasoning", "")
                 result["selection_rejected"] = _enrich_selection_rejected(
                     selection.get("rejected") or [], viable
                 )
-                log.info("  ✗ skipped_by_selection_verification: every "
-                         "candidate failed verification")
                 return result
             if selection is not None and selection.get("chosen_index") == -2:
                 # External pick — selection surfaced an out-of-pool candidate
@@ -7467,6 +7792,7 @@ def _write_step_summary(result: dict) -> None:
         "skipped_issue_exists":    "⏭️",
         "skipped_external_issue_exists": "⏭️",
         "skipped_by_selection_verification": "⏭️",
+        "skipped_under_explored":            "⏭️",
         "issue_opened_substitution": "🔁",
         "skipped_test_failure":    "⏭️",
         "claude_failed":           "❌",
