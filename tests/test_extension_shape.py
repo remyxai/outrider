@@ -104,9 +104,9 @@ def test_prompt_schema_documents_extension_specific_fields():
 def _run_selection(monkeypatch, tmp_path, candidates, claude_response):
     """Invoke select_recommendation with a mocked Claude response."""
     def fake_oneshot(workdir, prompt, timeout_s, max_turns=None):
-        return True, json.dumps(claude_response)
+        return True, json.dumps(claude_response), []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     monkeypatch.setattr(run, "_repo_layout_manifest", lambda wd, pkg: "(layout)")
 
     return run.select_recommendation(

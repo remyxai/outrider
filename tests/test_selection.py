@@ -82,11 +82,14 @@ def test_select_single_candidate_short_circuits(tmp_path):
 
 def test_select_parses_chosen_index(tmp_path, monkeypatch):
     geo, count = _make_candidates()
+    # The selection pass runs in streaming mode so it can parse the tool
+    # transcript into coverage; the runner returns `(ok, text, events)`.
+    # Empty events here.
     monkeypatch.setattr(
-        run, "_run_claude_oneshot",
+        run, "_run_claude_oneshot_streaming",
         lambda wd, p, t, **kw: (True, '{"chosen_index": 1, "reasoning": "clear call '
                                       'site in prompts.py", "rejected": [{"index": 0, '
-                                      '"why": "model architecture, no call site"}]}'),
+                                      '"why": "model architecture, no call site"}]}', []),
     )
     sel = run.select_recommendation(tmp_path, "pkg", [geo, count])
     assert sel is not None
@@ -95,25 +98,62 @@ def test_select_parses_chosen_index(tmp_path, monkeypatch):
     assert sel["rejected"][0]["index"] == 0
 
 
+def test_select_attaches_coverage_telemetry(tmp_path, monkeypatch):
+    """Every parseable verdict carries selection_coverage +
+    selection_context_efficiency, computed from the transcript."""
+    geo, count = _make_candidates()
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash",
+             "input": {"command": 'gh search code "load_dataset" --repo o/r'}},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t2", "name": "Bash",
+             "input": {"command": "gh api repos/o/r/contents/src/x.py"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t2",
+             "content": "\n".join(f"line{i}" for i in range(200))},
+        ]}},
+    ]
+    monkeypatch.setattr(
+        run, "_run_claude_oneshot_streaming",
+        lambda wd, p, t, **kw: (
+            True,
+            '{"chosen_index": 1, "reasoning": "verified at src/x.py:10", '
+            '"rejected": []}',
+            events,
+        ),
+    )
+    sel = run.select_recommendation(tmp_path, "pkg", [geo, count])
+    assert sel is not None
+    cov = sel["selection_coverage"]
+    assert cov["searches"] == 1
+    assert cov["file_reads"] == 1
+    assert cov["visible_lines"] == 200
+    assert cov["under_explored"] is False           # 200 ≥ 150 in-pool floor
+    assert sel["selection_context_efficiency"] == round(1 / 200, 4)
+
+
 def test_select_out_of_range_falls_back(tmp_path, monkeypatch):
     geo, count = _make_candidates()
-    monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t, **kw: (True, '{"chosen_index": 9}'))
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming",
+                        lambda wd, p, t, **kw: (True, '{"chosen_index": 9}', []))
     # Out-of-range → None → caller falls back to candidates[0].
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
 def test_select_non_int_index_falls_back(tmp_path, monkeypatch):
     geo, count = _make_candidates()
-    monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t, **kw: (True, '{"chosen_index": "two"}'))
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming",
+                        lambda wd, p, t, **kw: (True, '{"chosen_index": "two"}', []))
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
 def test_select_claude_failure_falls_back(tmp_path, monkeypatch):
     geo, count = _make_candidates()
-    monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t, **kw: (False, "claude CLI timed out"))
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming",
+                        lambda wd, p, t, **kw: (False, "claude CLI timed out", []))
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
@@ -121,8 +161,8 @@ def test_select_unparseable_output_falls_back(tmp_path, monkeypatch):
     """Prose on both the initial call AND the format-only retry → fall
     through to None. Caller's job to substitute a fallback candidate."""
     geo, count = _make_candidates()
-    monkeypatch.setattr(run, "_run_claude_oneshot",
-                        lambda wd, p, t, **kw: (True, "I think candidate 1 is best"))
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming",
+                        lambda wd, p, t, **kw: (True, "I think candidate 1 is best", []))
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
@@ -138,13 +178,13 @@ def test_select_unparseable_initial_then_clean_retry(tmp_path, monkeypatch):
         if calls["n"] == 1:
             return True, ("I now have enough evidence to decide. Let me "
                           "consolidate the maintainer's stated preferences "
-                          "with the candidate pool ...")
+                          "with the candidate pool ..."), []
         # Second call gets the format reminder appended → returns clean JSON.
         assert "OUTPUT FORMAT REMINDER" in p
         return True, ('{"chosen_index": 1, "reasoning": "matches an open RFC", '
-                      '"rejected": []}')
+                      '"rejected": []}'), []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     sel = run.select_recommendation(tmp_path, "pkg", [geo, count])
     assert calls["n"] == 2, "retry should have fired exactly once"
     assert sel is not None
@@ -160,9 +200,9 @@ def test_select_retry_fires_only_once(tmp_path, monkeypatch):
 
     def fake_oneshot(wd, p, t, **kw):
         calls["n"] += 1
-        return True, "still just prose, no JSON here"
+        return True, "still just prose, no JSON here", []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
     assert calls["n"] == 2, "should call exactly twice (initial + 1 retry)"
 
@@ -176,9 +216,9 @@ def test_select_retry_skipped_when_first_call_fails(tmp_path, monkeypatch):
 
     def fake_oneshot(wd, p, t, **kw):
         calls["n"] += 1
-        return False, "claude CLI timed out"
+        return False, "claude CLI timed out", []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
     assert calls["n"] == 1, "no retry on ok=False — that's not a parse problem"
 
@@ -192,10 +232,10 @@ def test_select_retry_handles_second_call_infra_failure(tmp_path, monkeypatch):
     def fake_oneshot(wd, p, t, **kw):
         calls["n"] += 1
         if calls["n"] == 1:
-            return True, "first attempt prose, no JSON"
-        return False, "claude CLI crashed on retry"
+            return True, "first attempt prose, no JSON", []
+        return False, "claude CLI crashed on retry", []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
     assert calls["n"] == 2
 

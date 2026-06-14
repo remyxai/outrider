@@ -257,9 +257,9 @@ def test_selection_prompt_renders_byte_stable_when_no_issues(monkeypatch, tmp_pa
 
     def fake_oneshot(workdir, prompt, timeout_s, max_turns=None):
         captured_prompts.append(prompt)
-        return True, '{"chosen_index": 0, "reasoning": "test"}'
+        return True, '{"chosen_index": 0, "reasoning": "test"}', []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     monkeypatch.setattr(run, "_repo_layout_manifest", lambda wd, pkg: "(layout)")
 
     candidates = [_rec("2605.26102", "A"), _rec("2412.18404", "B")]
@@ -288,9 +288,9 @@ def test_selection_prompt_renders_discharge_section_when_issues_present(
 
     def fake_oneshot(workdir, prompt, timeout_s, max_turns=None):
         captured_prompts.append(prompt)
-        return True, '{"chosen_index": 1, "reasoning": "test"}'
+        return True, '{"chosen_index": 1, "reasoning": "test"}', []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     monkeypatch.setattr(run, "_repo_layout_manifest", lambda wd, pkg: "(layout)")
 
     candidates = [

@@ -275,9 +275,9 @@ def test_end_to_end_maintainer_rfc_discharges_pool_candidate(monkeypatch, tmp_pa
 
     def fake_oneshot(workdir, prompt, timeout_s, max_turns=None):
         captured_prompts.append(prompt)
-        return True, '{"chosen_index": 0, "reasoning": "test"}'
+        return True, '{"chosen_index": 0, "reasoning": "test"}', []
 
-    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_oneshot)
     monkeypatch.setattr(run, "_repo_layout_manifest", lambda wd, pkg: "(layout)")
 
     # Pool has the paper at index 0; maintainer RFC has it discharged
