@@ -190,6 +190,16 @@ runs:
       shell: bash
       run: pip install pytest remyxai
 
+    - name: Install gh-graph selection-pass tool on PATH
+      shell: bash
+      # Dependency-navigation helper the selection agent calls via its Bash
+      # tool (`gh-graph <file>`) to walk a module's imports + reverse-imports.
+      # /usr/local/bin is already on PATH in the runner; the agent runs with
+      # cwd = the cloned target repo, so paths resolve repo-relative.
+      run: |
+        install -m 0755 "${{ github.action_path }}/src/gh_graph.py" /usr/local/bin/gh-graph
+        gh-graph --selftest
+
     - name: Configure git identity
       shell: bash
       # Global fallback identity. The branch head is normally re-authored
