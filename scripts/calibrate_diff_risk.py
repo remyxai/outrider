@@ -158,19 +158,105 @@ def render_table(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
+def score_gh_pr(pr_ref: str, package: str) -> dict:
+    """Score a single GitHub PR by ``owner/repo#NUMBER`` reference.
+
+    Shallow-clones the repo into a temp dir, fetches the PR head + base
+    refs, and runs score_diff_risk with base_ref=<base SHA>. Returns a
+    row dict matching ``score_branch`` format so the same renderer works.
+    """
+    import diff_risk_score
+
+    # Parse "owner/repo#N"
+    try:
+        repo_part, num_part = pr_ref.rsplit("#", 1)
+        owner_repo = repo_part.strip()
+        pr_num = int(num_part.strip())
+    except (ValueError, IndexError):
+        return {"branch": pr_ref, "date": "", "_error": "invalid ref"}
+
+    # gh api → base + head SHAs (gh pr view doesn't expose baseRefOid)
+    import json
+    try:
+        out = subprocess.check_output(
+            ["gh", "api", f"repos/{owner_repo}/pulls/{pr_num}"],
+            text=True,
+        )
+        meta = json.loads(out)
+        base_sha = meta["base"]["sha"]
+        head_sha = meta["head"]["sha"]
+        date = meta.get("created_at", "")
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+        return {"branch": pr_ref, "date": "",
+                "_error": f"gh api failed: {str(e)[:80]}"}
+
+    # Shallow clone into temp; fetch the specific commits.
+    with tempfile.TemporaryDirectory(prefix="diffrisk-gh-") as tmp:
+        tmp_path = Path(tmp) / "repo"
+        clone_url = f"https://github.com/{owner_repo}.git"
+        try:
+            subprocess.run(
+                ["git", "clone", "--quiet", "--no-checkout",
+                 "--filter=blob:none", clone_url, str(tmp_path)],
+                capture_output=True, text=True, check=True,
+            )
+            # Fetch both the base and head commits.
+            subprocess.run(
+                ["git", "fetch", "--quiet", "origin",
+                 base_sha, head_sha],
+                cwd=tmp_path, capture_output=True, text=True, check=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "--quiet", head_sha],
+                cwd=tmp_path, capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            return {"branch": pr_ref, "date": date,
+                    "_error": f"clone/fetch failed: {(e.stderr or '')[:100]}"}
+
+        try:
+            risk = diff_risk_score.score_diff_risk(
+                tmp_path, package, base_ref=base_sha,
+            )
+        except Exception as e:
+            return {"branch": pr_ref, "date": date,
+                    "_error": f"score failed: {str(e)[:100]}"}
+
+    top = max(risk.factors.items(), key=lambda kv: kv[1]) \
+        if risk.factors else (None, 0)
+    return {
+        "branch": pr_ref,
+        "date": date,
+        "score": risk.score,
+        "band": risk.band,
+        "features": risk.features,
+        "top_factor": top[0],
+        "top_factor_contribution": round(top[1], 2),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--pattern", default="remyx-recommendation/*",
-        help="Branch glob to score (default: %(default)s)",
+        help="Branch glob to score in the LOCAL repo (default: %(default)s). "
+             "Ignored when --gh-prs is supplied.",
+    )
+    ap.add_argument(
+        "--gh-prs", nargs="+", default=None,
+        help="Score PRs from arbitrary GitHub repos by reference, "
+             "e.g. 'smellslikeml/Arbor#2 smellslikeml/openai-agents-python-outrider-demo#3'. "
+             "Shallow-clones each repo into a temp dir.",
     )
     ap.add_argument(
         "--base", default="origin/main",
-        help="Base ref for merge-base computation (default: %(default)s)",
+        help="Base ref for merge-base computation, LOCAL mode only "
+             "(default: %(default)s). With --gh-prs the PR's own base is used.",
     )
     ap.add_argument(
         "--limit", type=int, default=None,
-        help="Score only the N most-recent branches by commit date",
+        help="Score only the N most-recent branches by commit date "
+             "(local-pattern mode only)",
     )
     ap.add_argument(
         "--package", default="src",
@@ -183,43 +269,58 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    workdir = REPO_ROOT
-    branches = list_branches(workdir, args.pattern)
-    if not branches:
-        print(f"no branches match {args.pattern!r}", file=sys.stderr)
+    rows: list[dict] = []
+
+    # ── GitHub PR mode (runs alongside local-pattern mode if both given) ──
+    if args.gh_prs:
+        print(
+            f"Scoring {len(args.gh_prs)} GitHub PR(s) via shallow clone...",
+            file=sys.stderr,
+        )
+        for pr_ref in args.gh_prs:
+            print(f"  → {pr_ref}", file=sys.stderr)
+            rows.append(score_gh_pr(pr_ref, args.package))
+
+    # ── Local-pattern mode (default; skipped if only --gh-prs and pattern
+    # would match the repo's own branches like pr-* test refs) ───────────
+    if not args.gh_prs or args.pattern != "remyx-recommendation/*":
+        workdir = REPO_ROOT
+        branches = list_branches(workdir, args.pattern)
+        if branches:
+            dated = [(b, branch_commit_date(workdir, b)) for b in branches]
+            dated.sort(key=lambda bd: bd[1], reverse=True)
+            if args.limit:
+                dated = dated[: args.limit]
+            print(
+                f"Scoring {len(dated)} local branch(es) matching "
+                f"{args.pattern!r} against {args.base}...",
+                file=sys.stderr,
+            )
+            for ref, date in dated:
+                display = ref.split("/", 1)[-1] if ref.startswith("origin/") else ref
+                print(f"  → {display}", file=sys.stderr)
+                base_sha = merge_base(workdir, ref, args.base)
+                if not base_sha:
+                    rows.append({
+                        "branch": display, "date": date,
+                        "_error": f"no merge-base with {args.base}",
+                    })
+                    continue
+                result = score_branch(workdir, ref, base_sha, args.package)
+                if result is None or "_error" in (result or {}):
+                    rows.append({
+                        "branch": display, "date": date,
+                        "_error": (result or {}).get("_error", "score failed"),
+                    })
+                    continue
+                rows.append({"branch": display, "date": date, **result})
+        elif not args.gh_prs:
+            print(f"no branches match {args.pattern!r}", file=sys.stderr)
+            return 1
+
+    if not rows:
+        print("no rows produced", file=sys.stderr)
         return 1
-
-    # Annotate with commit date and sort newest-first; trim to --limit.
-    dated = [(b, branch_commit_date(workdir, b)) for b in branches]
-    dated.sort(key=lambda bd: bd[1], reverse=True)
-    if args.limit:
-        dated = dated[: args.limit]
-
-    print(
-        f"Scoring {len(dated)} branch(es) matching {args.pattern!r} "
-        f"against {args.base}...",
-        file=sys.stderr,
-    )
-
-    rows = []
-    for ref, date in dated:
-        display = ref.split("/", 1)[-1] if ref.startswith("origin/") else ref
-        print(f"  → {display}", file=sys.stderr)
-        base_sha = merge_base(workdir, ref, args.base)
-        if not base_sha:
-            rows.append({
-                "branch": display, "date": date,
-                "_error": f"no merge-base with {args.base}",
-            })
-            continue
-        result = score_branch(workdir, ref, base_sha, args.package)
-        if result is None or "_error" in (result or {}):
-            rows.append({
-                "branch": display, "date": date,
-                "_error": (result or {}).get("_error", "score failed"),
-            })
-            continue
-        rows.append({"branch": display, "date": date, **result})
 
     table = render_table(rows)
     if args.output == "-":
