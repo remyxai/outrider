@@ -30,25 +30,67 @@ import subprocess
 import sys
 
 
-def _module_candidates(rel_path: str) -> tuple[str, str, str]:
-    """Derive the importable names for a repo-relative ``.py`` path.
+def _module_info(abs_path: str) -> tuple[str, str, str, str | None]:
+    """Derive the importable name for a ``.py`` file from its package layout.
 
-    Returns ``(full, parent, leaf)`` where, for ``vqasynth/localize.py``:
-      full   = "vqasynth.localize"   (dotted module path)
-      parent = "vqasynth"            (containing package, "" at repo root)
-      leaf   = "localize"            (module name; package name for __init__)
+    Returns ``(full, parent, leaf, top_pkg_dir)``. The dotted name is built by
+    walking *up* through directories that contain ``__init__.py``, so a
+    src-layout file ``src/agents/agent.py`` yields ``full="agents.agent"`` —
+    not ``"src.agents.agent"``, which nothing imports. ``top_pkg_dir`` is the
+    outermost package directory (used to scope relative-import search); it is
+    None when the file isn't inside any package.
 
-    A package ``vqasynth/__init__.py`` collapses to full="vqasynth",
-    parent="", leaf="vqasynth" so reverse-import search keys on the package.
+    For ``pkg/localize.py`` (pkg is a package): full="pkg.localize",
+    parent="pkg", leaf="localize". For a package's own ``__init__.py``: full
+    and leaf collapse to the package name.
     """
-    parts = rel_path[:-3].split(os.sep) if rel_path.endswith(".py") else \
-        rel_path.split(os.sep)
-    if parts and parts[-1] == "__init__":
-        parts = parts[:-1]
-    full = ".".join(parts)
-    leaf = parts[-1] if parts else ""
-    parent = ".".join(parts[:-1]) if len(parts) > 1 else ""
-    return full, parent, leaf
+    abs_path = os.path.abspath(abs_path)
+    stem = os.path.basename(abs_path)
+    stem = stem[:-3] if stem.endswith(".py") else stem
+    comps: list[str] = []
+    top_pkg_dir: str | None = None
+    d = os.path.dirname(abs_path)
+    while os.path.isfile(os.path.join(d, "__init__.py")):
+        comps.insert(0, os.path.basename(d))
+        top_pkg_dir = d
+        d = os.path.dirname(d)
+    if stem == "__init__":
+        full = ".".join(comps)
+        leaf = comps[-1] if comps else ""
+        parent = ".".join(comps[:-1]) if len(comps) > 1 else ""
+    else:
+        full = ".".join(comps + [stem]) if comps else stem
+        leaf = stem
+        parent = ".".join(comps) if comps else ""
+    return full, parent, leaf, top_pkg_dir
+
+
+def _grep_imports(patterns: list[str], where: str) -> list[tuple[str, int]]:
+    """Run ``grep -rnE`` for ``patterns`` under ``where``; return (abs_file,
+    lineno) pairs. grep exit 1 (no matches) is not an error; >1 is.
+    """
+    if not patterns:
+        return []
+    cmd = ["grep", "-rnE", "--include=*.py"]
+    for pat in patterns:
+        cmd += ["-e", pat]
+    cmd.append(where)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode > 1:
+        return []
+    out: list[tuple[str, int]] = []
+    for line in proc.stdout.splitlines():
+        bits = line.split(":", 2)
+        if len(bits) < 2:
+            continue
+        try:
+            out.append((os.path.abspath(bits[0]), int(bits[1])))
+        except ValueError:
+            continue
+    return out
 
 
 def forward_imports(path: str) -> list[tuple[str, int]]:
@@ -80,54 +122,47 @@ def forward_imports(path: str) -> list[tuple[str, int]]:
 def reverse_imports(rel_path: str, root: str) -> list[tuple[str, int]]:
     """Files under ``root`` that import the module at ``rel_path``.
 
-    Returns ``(repo_relative_file, lineno)`` pairs, excluding the file
-    itself. Implemented with ``grep -rnE`` over ``*.py`` so it stays cheap
-    and dependency-free; matches the three common import spellings:
+    Returns ``(repo_relative_file, lineno)`` pairs, excluding the file itself.
+    Implemented with ``grep -rnE`` over ``*.py`` so it stays cheap and
+    dependency-free. Matches both absolute spellings —
 
-      from <full> import ...      import <full>
-      from <parent> import <leaf>
+      from <full> import ...      import <full>      from <parent> import <leaf>
 
-    Relative imports (``from . import x``) are not resolved — an accepted
-    limitation of the grep approach.
+    — and the intra-package relative spellings (``from .<leaf> import …``,
+    ``from . import <leaf>``, and deeper ``from ..<leaf>``), scoped to the
+    file's package so a same-named module elsewhere doesn't false-match.
     """
-    full, parent, leaf = _module_candidates(rel_path)
-    if not full:
+    root = root or "."
+    abs_path = os.path.join(root, rel_path)
+    full, parent, leaf, top_pkg_dir = _module_info(abs_path)
+    if not full and not leaf:
         return []
-    patterns = [
-        rf"^[[:space:]]*(from|import)[[:space:]]+{full}([[:space:]]|$|\.|,)",
-    ]
+
+    found: list[tuple[str, int]] = []
+    # Absolute imports, across the whole tree.
+    abs_pats: list[str] = []
+    if full:
+        abs_pats.append(
+            rf"^[[:space:]]*(from|import)[[:space:]]+{full}([[:space:]]|$|\.|,)")
     if parent and leaf:
-        patterns.append(
-            rf"^[[:space:]]*from[[:space:]]+{parent}[[:space:]]+import[[:space:]].*\b{leaf}\b"
-        )
-    cmd = ["grep", "-rnE", "--include=*.py"]
-    for pat in patterns:
-        cmd += ["-e", pat]
-    cmd.append(root or ".")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    # grep exit 1 == "no matches" (not an error); >1 is a real failure.
-    if proc.returncode > 1:
-        return []
-    self_abs = os.path.abspath(os.path.join(root or ".", rel_path))
+        abs_pats.append(
+            rf"^[[:space:]]*from[[:space:]]+{parent}[[:space:]]+import[[:space:]].*\b{leaf}\b")
+    found += _grep_imports(abs_pats, root)
+    # Relative imports, scoped to the package directory (where they're valid).
+    if top_pkg_dir and leaf:
+        rel_pats = [
+            rf"^[[:space:]]*from[[:space:]]+\.+{leaf}([[:space:]]|$|\.|,)",
+            rf"^[[:space:]]*from[[:space:]]+\.+[[:space:]]+import[[:space:]].*\b{leaf}\b",
+        ]
+        found += _grep_imports(rel_pats, top_pkg_dir)
+
+    self_abs = os.path.abspath(abs_path)
     out: list[tuple[str, int]] = []
     seen: set[tuple[str, int]] = set()
-    for line in proc.stdout.splitlines():
-        # grep -rn format: <file>:<lineno>:<matched text>
-        bits = line.split(":", 2)
-        if len(bits) < 2:
+    for fabs, lineno in found:
+        if fabs == self_abs:
             continue
-        fname, lineno_s = bits[0], bits[1]
-        if os.path.abspath(fname) == self_abs:
-            continue
-        try:
-            lineno = int(lineno_s)
-        except ValueError:
-            continue
-        rel = os.path.relpath(fname, root or ".")
-        key = (rel, lineno)
+        key = (os.path.relpath(fabs, root), lineno)
         if key in seen:
             continue
         seen.add(key)

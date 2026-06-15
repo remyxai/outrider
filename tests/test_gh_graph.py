@@ -45,6 +45,7 @@ def test_forward_imports_syntax_error_is_empty(tmp_path):
 
 
 def test_reverse_imports_finds_callers(tmp_path):
+    _write(tmp_path / "pkg" / "__init__.py", "")
     _write(tmp_path / "pkg" / "depth.py", "VALUE = 1\n")
     _write(tmp_path / "caller.py",
            "from pkg.depth import VALUE\nimport pkg.depth\n")
@@ -57,14 +58,40 @@ def test_reverse_imports_finds_callers(tmp_path):
     assert "unrelated.py" not in files
 
 
+def test_reverse_imports_relative_sibling(tmp_path):
+    # Intra-package relative imports must be found (both `from .a` spellings).
+    _write(tmp_path / "pkg" / "__init__.py", "")
+    _write(tmp_path / "pkg" / "a.py", "X = 1\n")
+    _write(tmp_path / "pkg" / "b.py", "from .a import X\n")
+    _write(tmp_path / "pkg" / "c.py", "from . import a\n")
+    files = {f for f, _ in gh_graph.reverse_imports("pkg/a.py", str(tmp_path))}
+    assert "pkg/b.py" in files
+    assert "pkg/c.py" in files
+
+
+def test_reverse_imports_src_layout(tmp_path):
+    # src-layout: the module is `pkg.agent`, not `src.pkg.agent`. Both an
+    # absolute import (from outside) and a relative one (a sibling) resolve.
+    _write(tmp_path / "src" / "pkg" / "__init__.py", "")
+    _write(tmp_path / "src" / "pkg" / "agent.py", "class Agent: ...\n")
+    _write(tmp_path / "src" / "pkg" / "run.py", "from .agent import Agent\n")
+    _write(tmp_path / "tests" / "test_it.py", "from pkg.agent import Agent\n")
+    files = {f for f, _ in
+             gh_graph.reverse_imports("src/pkg/agent.py", str(tmp_path))}
+    assert "src/pkg/run.py" in files          # relative sibling
+    assert "tests/test_it.py" in files        # absolute, dotted name has no `src.`
+
+
 def test_reverse_imports_excludes_self(tmp_path):
     # A file that imports a sibling shouldn't list itself as an importer.
+    _write(tmp_path / "pkg" / "__init__.py", "")
     _write(tmp_path / "pkg" / "depth.py", "import pkg.depth\n")
     rev = gh_graph.reverse_imports("pkg/depth.py", str(tmp_path))
     assert all(f != "pkg/depth.py" for f, _ in rev)
 
 
 def test_render_block_shape(tmp_path):
+    _write(tmp_path / "pkg" / "__init__.py", "")
     _write(tmp_path / "pkg" / "depth.py", "import os\n")
     _write(tmp_path / "caller.py", "from pkg.depth import x\n")
     out = gh_graph.render(str(tmp_path / "pkg" / "depth.py"), root=str(tmp_path))
