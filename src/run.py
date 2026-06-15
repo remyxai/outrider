@@ -3958,10 +3958,11 @@ def _apply_coverage_gate(
     the agent batches its shell calls; ``file_reads`` / ``searches`` ride along
     as telemetry only. Mode via ``REMYX_SELECTION_COVERAGE_GATE``:
     ``observe`` (default) flags without blocking; ``enforce`` downgrades an
-    under-explored pick to a skip (``chosen_index=-1`` + ``under_explored``
-    marker, which the caller maps to ``skipped_under_explored``); ``off``
-    disables the check entirely. Always mutates ``coverage`` with the
-    ``under_explored`` verdict (unless ``off``).
+    under-explored pick to a skip (``chosen_index=-1``), which the caller
+    routes through the existing ``skipped_by_selection_verification`` status
+    so the user-facing step summary is unchanged; ``off`` disables the check
+    entirely. The under-explored verdict is recorded on ``coverage`` (unless
+    ``off``) for internal telemetry only.
     """
     mode = os.environ.get(
         "REMYX_SELECTION_COVERAGE_GATE", "observe"
@@ -3981,7 +3982,7 @@ def _apply_coverage_gate(
         log.info(
             f"  selection coverage gate (enforce): visible_lines="
             f"{coverage.get('visible_lines')} < floor {floor}; downgrading "
-            f"verdict to skip (skipped_under_explored)"
+            f"verdict to a skip"
         )
         data["chosen_index"] = -1
         data["under_explored"] = True
@@ -5723,25 +5724,22 @@ def process_target(target: Target) -> dict:
                         selection["selection_context_efficiency"]
                     )
             if selection is not None and selection.get("chosen_index") == -1:
-                # Agentic selection rejected every candidate after verification.
-                # The honest signal is "skip this run" — not "fall back to the
-                # top-ranked candidate," because that's precisely what
-                # verification just rejected. When the coverage gate (enforce
-                # mode) is what forced the -1, distinguish it as
-                # skipped_under_explored so the telemetry separates "verified
-                # and rejected" from "didn't read enough to decide."
-                if selection.get("under_explored"):
-                    result["status"] = "skipped_under_explored"
-                    log.info("  ✗ skipped_under_explored: coverage gate "
-                             "downgraded an under-explored verdict")
-                else:
-                    result["status"] = "skipped_by_selection_verification"
-                    log.info("  ✗ skipped_by_selection_verification: every "
-                             "candidate failed verification")
+                # Agentic selection rejected every candidate after verification
+                # (or, in coverage-gate enforce mode, an under-explored pick
+                # was downgraded to a skip). Either way the user-facing outcome
+                # is the same skip status — the under-explored reason is kept
+                # only in the internal selection_coverage telemetry, never the
+                # user-facing step summary.
+                result["status"] = "skipped_by_selection_verification"
                 result["selection_reasoning"] = selection.get("reasoning", "")
                 result["selection_rejected"] = _enrich_selection_rejected(
                     selection.get("rejected") or [], viable
                 )
+                if selection.get("under_explored"):
+                    log.info("  ✗ skipped (coverage gate: under-explored)")
+                else:
+                    log.info("  ✗ skipped_by_selection_verification: every "
+                             "candidate failed verification")
                 return result
             if selection is not None and selection.get("chosen_index") == -2:
                 # External pick — selection surfaced an out-of-pool candidate
@@ -7792,7 +7790,6 @@ def _write_step_summary(result: dict) -> None:
         "skipped_issue_exists":    "⏭️",
         "skipped_external_issue_exists": "⏭️",
         "skipped_by_selection_verification": "⏭️",
-        "skipped_under_explored":            "⏭️",
         "issue_opened_substitution": "🔁",
         "skipped_test_failure":    "⏭️",
         "claude_failed":           "❌",
