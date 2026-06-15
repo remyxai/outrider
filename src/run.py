@@ -746,8 +746,8 @@ Recovery strategies for missing/broken links (apply BEFORE concluding
          absent from the abstract.
     Treat "no code found" as a verdict you reach AFTER exhausting these,
     not a default. Many engine `github_url: (none)` cases have code
-    reachable via one of these paths (REMYX-100 will fix this at ingest;
-    until then, agent-side recovery is the defense).
+    reachable via one of these paths (ingest-side fixes may improve this
+    over time; until then, agent-side recovery is the defense).
   - **Login-wall detection.** Pages from Colab, Drive, JSTOR, OpenReview
     can return HTTP 200 with sign-in content that LOOKS like real
     content. If a fetched page is < 500 chars of non-nav body AND
@@ -1018,7 +1018,7 @@ class Recommendation:
                                       # on engine.remyx.ai (research focus,
                                       # current goals, what they care about)
     experiment_history: str = ""      # LLM-ready bullets from
-                                      # ExperimentHistory (REMYX-58 format),
+                                      # ExperimentHistory format,
                                       # fetched from the research-interests
                                       # endpoint. Empty when the interest
                                       # has no linked history.
@@ -1768,8 +1768,8 @@ def _fetch_interest_context(interest_id: str) -> tuple[str, str, str]:
     Returns (interest_name, interest_context, experiment_history). The
     context body is the rich text the customer wrote on engine.remyx.ai
     about their research focus / goals. The experiment_history is the
-    LLM-ready bullet summary of the team's shipping trajectory (REMYX-58
-    format) — empty string when the interest has no linked
+    LLM-ready bullet summary of the team's shipping trajectory — empty
+    string when the interest has no linked
     ExperimentHistory or when the engine hasn't deployed the field yet.
 
     Best-effort: on any failure we return empty strings and fall back to
@@ -3283,7 +3283,7 @@ def write_spec_bundle(
         paper_abstract=rec.paper_abstract,
     ))
 
-    # CONTEXT.md — team's shipping history bullets (REMYX-58 format),
+    # CONTEXT.md — team's shipping history bullets,
     # fetched from the research-interests endpoint. Skipped entirely
     # when no history is linked, so INVOCATION.md's "if Remyx returned
     # any" caveat continues to hold.
@@ -7041,8 +7041,8 @@ def _compose_weekly_markdown(
         lines += ["", "### 📈 In the research stream", ""]
         lines += [f"- {t}" for t in trends]
 
-    # Lifecycle events on Outrider Issues/PRs in the past 7 days
-    # (REMYX-114). Section omitted entirely when no events occurred.
+    # Lifecycle events on Outrider Issues/PRs in the past 7 days.
+    # Section omitted entirely when no events occurred.
     if lifecycle_events:
         lines += _render_lifecycle_events_section(lifecycle_events, window_end)
 
@@ -7137,7 +7137,7 @@ def _compose_weekly_markdown(
     return "\n".join(lines)
 
 
-# ─── Lifecycle events for Outrider-authored artifacts (REMYX-114) ─────────
+# ─── Lifecycle events for Outrider-authored artifacts ─────────────────────
 
 
 def _is_bot_actor(user: dict | None) -> bool:
@@ -7321,8 +7321,7 @@ def _render_lifecycle_events_section(
     """Render the Outrider-artifact lifecycle events as markdown lines.
 
     Returns ``[]`` when no events were detected — caller skips the
-    section header entirely (no "nothing happened" noise per the
-    REMYX-114 acceptance criteria).
+    section header entirely (no "nothing happened" noise).
     """
     if not events:
         return []
@@ -7705,15 +7704,15 @@ def run_weekly_summary(target: Target) -> dict:
         reverse=True,
     )
     # Lifecycle events on Outrider-authored Issues/PRs in the window —
-    # state transitions + maintainer comments since the prior digest
-    # (REMYX-114). Empty list when nothing changed; the render code
+    # state transitions + maintainer comments since the prior digest.
+    # Empty list when nothing changed; the render code
     # then omits the section header entirely.
     lifecycle_events = _lifecycle_events_for_outrider_artifacts(
         target, window_start, window_end,
     )
     # License-watch: re-check upstream license for open Outrider Issues
     # that were originally blocked at the license/code-availability gate;
-    # surface ones that transitioned to viable (REMYX-115). Sibling
+    # surface ones that transitioned to viable. Sibling
     # category to the lifecycle events above — shares the same surface.
     newly_viable = _newly_viable_outrider_artifacts(target)
     agg = _aggregate_week(entries)
@@ -7960,10 +7959,10 @@ def _write_step_summary(result: dict) -> None:
 
 
 def _post_run_telemetry(result: dict, target: "Target") -> None:
-    """Best-effort POST of this run's telemetry to the engine (REMYX-68).
+    """Best-effort POST of this run's telemetry to the engine.
 
     Captures the per-run output into the engine's ``recommendation_runs`` table
-    for internal portfolio diagnostics. Never raises and never blocks: any
+    for later analysis. Never raises and never blocks: any
     failure (no API key, endpoint unreachable, non-2xx) is logged and
     swallowed so a telemetry outage can't break a customer's run. Skipped
     outside GitHub Actions, where there's no ``GITHUB_RUN_ID`` to dedup on.
@@ -7992,9 +7991,9 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "recommendation_id": result.get("recommendation_id"),
         "target_repo": target.repo,
         "status": result.get("status"),
-        # Distinguishes real customer runs from the internal eval portfolio
-        # (REMYX-101 sets REMYX_RUN_SOURCE=eval_portfolio in its fork workflows).
-        "source": os.environ.get("REMYX_RUN_SOURCE", "customer"),
+        # The run's origin, so downstream analysis can separate standard
+        # Outrider runs from other run sources. Override via REMYX_RUN_SOURCE.
+        "source": os.environ.get("REMYX_RUN_SOURCE", "outrider"),
         "artifact_url": (
             result.get("pr_url")
             or result.get("issue_url")
@@ -8110,9 +8109,9 @@ def main():
     # customers see cost telemetry without wiring downstream steps.
     _write_step_summary(result)
 
-    # Best-effort: capture this run's telemetry to the engine for internal
-    # portfolio diagnostics (REMYX-68). Only recommend-mode runs map onto the
-    # recommendation_runs schema; weekly-summary runs are skipped. Never blocks.
+    # Best-effort: capture this run's telemetry to the engine for analysis.
+    # Only recommend-mode runs map onto the run schema; weekly-summary runs
+    # are skipped. Never blocks the run.
     if mode == "recommend":
         _post_run_telemetry(result, target)
 
