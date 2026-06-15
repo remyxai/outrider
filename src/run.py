@@ -5887,6 +5887,7 @@ def process_target(target: Target) -> dict:
                     "paper": rec.paper_title,
                     "arxiv": rec.arxiv_id,
                     "tier": rec.tier,
+                    "recommendation_id": rec.recommendation_id or None,
                     "candidates_considered": len(viable),
                     "status": "issue_opened_substitution",
                     "issue_url": issue_url,
@@ -5958,6 +5959,7 @@ def process_target(target: Target) -> dict:
                         "paper": rec.paper_title,
                         "arxiv": rec.arxiv_id,
                         "tier": rec.tier,
+                        "recommendation_id": rec.recommendation_id or None,
                         "candidates_considered": len(viable),
                         "status": "issue_opened_substitution",
                         "issue_url": issue_url,
@@ -5981,6 +5983,7 @@ def process_target(target: Target) -> dict:
             "paper": rec.paper_title,
             "arxiv": rec.arxiv_id,
             "tier": rec.tier,
+            "recommendation_id": rec.recommendation_id or None,
             "candidates_considered": len(viable),
         })
         _record_verdict_fields(result, rec)
@@ -7956,6 +7959,70 @@ def _write_step_summary(result: dict) -> None:
         log.warning(f"Could not write to $GITHUB_STEP_SUMMARY: {e}")
 
 
+def _post_run_telemetry(result: dict, target: "Target") -> None:
+    """Best-effort POST of this run's telemetry to the engine (REMYX-68).
+
+    Captures the per-run output into the engine's ``recommendation_runs`` table
+    for internal portfolio diagnostics. Never raises and never blocks: any
+    failure (no API key, endpoint unreachable, non-2xx) is logged and
+    swallowed so a telemetry outage can't break a customer's run. Skipped
+    outside GitHub Actions, where there's no ``GITHUB_RUN_ID`` to dedup on.
+
+    The fields are read defensively with ``.get`` — a skipped run that never
+    reached the selection pass simply sends nulls for the pool / selection /
+    coverage fields.
+    """
+    run_id_raw = os.environ.get("GITHUB_RUN_ID")
+    if not run_id_raw:
+        log.debug("  run telemetry: no GITHUB_RUN_ID (local run?); skipping POST")
+        return
+    try:
+        run_id = int(run_id_raw)
+    except (TypeError, ValueError):
+        log.debug(f"  run telemetry: GITHUB_RUN_ID {run_id_raw!r} not an int; "
+                  f"skipping POST")
+        return
+
+    reasoning = result.get("selection_reasoning") or ""
+    payload = {
+        "run_id": run_id,
+        # The chosen candidate's engine paper_recommendation UUID, threaded
+        # onto `result` when an in-pool candidate is picked; null for skips and
+        # out-of-pool (search-surfaced) picks, which have no pool row.
+        "recommendation_id": result.get("recommendation_id"),
+        "target_repo": target.repo,
+        "status": result.get("status"),
+        # Distinguishes real customer runs from the internal eval portfolio
+        # (REMYX-101 sets REMYX_RUN_SOURCE=eval_portfolio in its fork workflows).
+        "source": os.environ.get("REMYX_RUN_SOURCE", "customer"),
+        "artifact_url": (
+            result.get("pr_url")
+            or result.get("issue_url")
+            or result.get("discussion_comment_url")
+        ),
+        "broad_pool_size": result.get("broad_pool_size"),
+        "refine_pool_size": result.get("refine_pool_size"),
+        "candidates_considered": result.get("candidates_considered"),
+        "refine_queries": result.get("refine_queries"),
+        "license_class_counts": result.get("license_class_counts"),
+        "selection_reasoning_excerpt": reasoning[:2048] or None,
+        "selection_integration_shape": result.get("selection_integration_shape"),
+        "selection_coverage": result.get("selection_coverage"),
+        "selection_context_efficiency": result.get("selection_context_efficiency"),
+        "cost_usd": result.get("cost_usd"),
+        "input_tokens": result.get("input_tokens"),
+        "output_tokens": result.get("output_tokens"),
+        "claude_calls": result.get("claude_calls"),
+        "error": result.get("error"),
+    }
+    try:
+        _remyx_post("/api/v1.0/outrider/runs", payload)
+        log.info(f"  run telemetry posted (run_id={run_id}, "
+                 f"status={payload['status']})")
+    except Exception as e:
+        log.warning(f"  run telemetry POST failed (non-fatal): {str(e)[:200]}")
+
+
 def main():
     # Mode dispatch: "recommend" is the classic
     # scout-and-implement run; "weekly-summary" aggregates the past week
@@ -8042,6 +8109,12 @@ def main():
     # page — by far the most visible surface, and the one place
     # customers see cost telemetry without wiring downstream steps.
     _write_step_summary(result)
+
+    # Best-effort: capture this run's telemetry to the engine for internal
+    # portfolio diagnostics (REMYX-68). Only recommend-mode runs map onto the
+    # recommendation_runs schema; weekly-summary runs are skipped. Never blocks.
+    if mode == "recommend":
+        _post_run_telemetry(result, target)
 
     # Non-zero exit on genuine failures so the workflow step fails visibly
     # (a green run with no PR/Issue previously masked claude_failed). Issues,
