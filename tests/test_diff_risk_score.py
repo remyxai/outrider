@@ -124,3 +124,60 @@ def test_run_reexports_scorer_and_threshold():
     # The call site imports the capability — these references are the wiring.
     assert run.score_diff_risk is diff_risk_score.score_diff_risk
     assert run.DIFF_RISK_ISSUE_THRESHOLD == diff_risk_score.DIFF_RISK_ISSUE_THRESHOLD
+
+
+# ── branch-vs-base mode (REMYX-107 calibration harness) ────────────────────
+
+
+def test_branch_vs_base_mode_scores_committed_diff():
+    """`base_ref` mode scores commits on a branch vs its merge-base —
+    used to retrospectively score historical PR branches. Working tree
+    is clean; the diff lives in commits on the branch."""
+    wd = _base_repo()
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=wd, text=True,
+    ).strip()
+    # Create a branch with a committed change (mirrors a remyx-recommendation/* branch)
+    _git(wd, "checkout", "-q", "-b", "remyx-recommendation/test")
+    (wd / "vqasynth" / "newcap.py").write_text(
+        "def enhance(x):\n    return x * 2\n"
+    )
+    (wd / "tests" / "test_newcap.py").write_text(
+        "from vqasynth.newcap import enhance\n"
+        "def test_enhance():\n    assert enhance(2) == 4\n"
+    )
+    _git(wd, "add", "-A")
+    _git(wd, "commit", "-qm", "add newcap")
+
+    # Working tree clean; default mode (base_ref=None) sees no diff.
+    risk_default = run.score_diff_risk(wd, "vqasynth")
+    assert risk_default.features["files_touched"] == 0
+    assert risk_default.features["new_callables"] == 0
+
+    # Branch-vs-base mode sees the committed diff.
+    risk_branch = run.score_diff_risk(wd, "vqasynth", base_ref=base)
+    assert risk_branch.features["files_touched"] == 2  # newcap.py + test_newcap.py
+    assert risk_branch.features["new_callables"] >= 1  # enhance + test_enhance
+    assert risk_branch.features["lines_added"] >= 2
+    # New surface with a test file change → not flagged as untested.
+    assert risk_branch.features["untested_new_surface"] is False
+    # Small, tested, non-critical edit → low band.
+    assert risk_branch.band == "low"
+
+
+def test_branch_vs_base_mode_detects_untested_surface():
+    """Branch-vs-base mode correctly flags new callables without tests."""
+    wd = _base_repo()
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=wd, text=True,
+    ).strip()
+    _git(wd, "checkout", "-q", "-b", "remyx-recommendation/untested")
+    (wd / "vqasynth" / "newmod.py").write_text(
+        "def f1(): pass\ndef f2(): pass\ndef f3(): pass\n"
+    )
+    _git(wd, "add", "-A")
+    _git(wd, "commit", "-qm", "untested new module")
+
+    risk = run.score_diff_risk(wd, "vqasynth", base_ref=base)
+    assert risk.features["new_callables"] == 3
+    assert risk.features["untested_new_surface"] is True
