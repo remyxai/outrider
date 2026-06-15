@@ -165,6 +165,67 @@ def test_branch_vs_base_mode_scores_committed_diff():
     assert risk_branch.band == "low"
 
 
+def test_test_functions_excluded_from_new_callables():
+    """`test_X` functions in `tests/` files don't count as new production
+    surface — they're test infrastructure. A PR that adds 1 production
+    callable + 5 test functions should report new_callables=1, not 6.
+    Calibrated against smellslikeml/openai-agents-python-outrider-demo#2
+    where the original count was inflated by 9 test functions."""
+    wd = _base_repo()
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=wd, text=True,
+    ).strip()
+    _git(wd, "checkout", "-q", "-b", "feature/test-vs-prod-callables")
+    (wd / "vqasynth" / "feature.py").write_text(
+        "def f(x):\n    return x\n"
+    )
+    (wd / "tests" / "test_feature.py").write_text(
+        "from vqasynth.feature import f\n"
+        "def test_a():\n    assert f(1) == 1\n"
+        "def test_b():\n    assert f(2) == 2\n"
+        "def test_c():\n    assert f(3) == 3\n"
+        "def test_d():\n    assert f(4) == 4\n"
+        "def test_e():\n    assert f(5) == 5\n"
+    )
+    _git(wd, "add", "-A")
+    _git(wd, "commit", "-qm", "1 prod + 5 tests")
+    risk = run.score_diff_risk(wd, "vqasynth", base_ref=base)
+    # Only the production callable counts; test functions don't inflate.
+    assert risk.features["new_callables"] == 1
+
+
+def test_lines_changed_contribution_is_capped():
+    """A 5000-line PR shouldn't get a linearly-unbounded lines contribution
+    that dominates every other signal. The cap + overflow weight makes the
+    relationship monotonically increasing but flattened above the cap."""
+    # Score-by-direct-call against synthetic features so we can probe the
+    # math without building a 5000-line tree.
+    f_huge = {
+        "files_touched": 1, "lines_added": 5000, "lines_deleted": 0,
+        "lines_changed": 5000, "new_callables": 0,
+        "critical_file_touched": False, "untested_new_surface": False,
+    }
+    f_at_cap = dict(f_huge, lines_added=500, lines_changed=500)
+    # Monkey-patch extract_features to return our synthetic features.
+    import diff_risk_score as drs
+    real_extract = drs.extract_features
+    try:
+        drs.extract_features = lambda *a, **kw: f_huge
+        huge = drs.score_diff_risk(Path("/tmp"), "x")
+        drs.extract_features = lambda *a, **kw: f_at_cap
+        at_cap = drs.score_diff_risk(Path("/tmp"), "x")
+    finally:
+        drs.extract_features = real_extract
+    # The 5000-line diff is riskier than a 500-line diff but not 10x as
+    # contributing — the lines contribution is capped + overflow-weighted.
+    huge_contrib = huge.factors["lines_changed"]
+    cap_contrib = at_cap.factors["lines_changed"]
+    assert huge_contrib > cap_contrib
+    # Without the cap, 5000 lines × 0.004 = 20.0. With cap=500 + overflow:
+    # 500 × 0.004 + 4500 × 0.001 = 2.0 + 4.5 = 6.5.
+    assert huge_contrib < 10.0
+
+
 def test_branch_vs_base_mode_detects_untested_surface():
     """Branch-vs-base mode correctly flags new callables without tests."""
     wd = _base_repo()

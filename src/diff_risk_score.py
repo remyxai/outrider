@@ -71,7 +71,11 @@ CRITICAL_PATH_HINTS = (
 # coverage and blast radius matter more than raw line count.
 _W_INTERCEPT = -2.0
 _W_FILES = 0.18          # per file touched
-_W_LINES = 0.004         # per added+deleted line
+_W_LINES = 0.004         # per added+deleted line UP TO _LINES_CAP
+_LINES_CAP = 500         # contribution saturates here; bigger diffs don't
+                          # linearly dominate the score (diminishing returns)
+_W_LINES_OVERFLOW = 0.001  # per line beyond _LINES_CAP — keeps the signal
+                            # monotonically increasing but flattened
 _W_NEW_CALLABLES = 0.10  # per newly-added public callable
 _W_CRITICAL = 1.6        # any pre-existing critical-path file edited
 _W_UNTESTED = 1.1        # new public surface added with no test-file change
@@ -234,8 +238,16 @@ def extract_features(
         lines_added += a
         lines_deleted += d
 
+    # Count only NEW PRODUCTION callables (test_X functions in tests/ are
+    # test infrastructure, not new production surface — they shouldn't
+    # inflate the score the way a new public API would).
+    def _is_test_path(p: str) -> bool:
+        return p.startswith("tests/") or Path(p).name.startswith("test_")
+
     new_callables = 0
     for p in py_paths:
+        if _is_test_path(p):
+            continue
         new_callables += len(_added_callables(workdir, p, base_ref))
 
     # Critical-path edits only count for files that already existed — a
@@ -286,9 +298,11 @@ def score_diff_risk(
     no sampling, deterministic for a given tree.
     """
     f = extract_features(workdir, package, base_ref=base_ref)
+    capped = min(f["lines_changed"], _LINES_CAP)
+    overflow = max(f["lines_changed"] - _LINES_CAP, 0)
     contributions = {
         "files_touched": _W_FILES * f["files_touched"],
-        "lines_changed": _W_LINES * f["lines_changed"],
+        "lines_changed": _W_LINES * capped + _W_LINES_OVERFLOW * overflow,
         "new_callables": _W_NEW_CALLABLES * f["new_callables"],
         "critical_file_touched": _W_CRITICAL if f["critical_file_touched"] else 0.0,
         "untested_new_surface": _W_UNTESTED if f["untested_new_surface"] else 0.0,
