@@ -319,22 +319,28 @@ def score_diff_risk(
 
 
 def render_risk_detail(risk: DiffRisk) -> str:
-    """Markdown breakdown of a risk score for a downgrade-Issue body."""
+    """Markdown breakdown of a risk score for a downgrade-Issue body.
+
+    The headline (score + band + threshold) stays visible; the feature
+    breakdown collapses into a <details> disclosure so the routing
+    decision reads cleanly. Per-feature logit contributions are not
+    surfaced — they're already in the RUN SUMMARY JSON
+    (`diff_risk_factors`) that flows to Remyx telemetry, which is where
+    weight calibration consumes them. Bare logit numbers without the
+    weights are jargon for customer-facing copy.
+    """
     f = risk.features
-    lines = [
-        f"**Diff Risk Score**: {risk.score:.2f}  (band: **{risk.band}**, "
-        f"auto-land threshold {DIFF_RISK_ISSUE_THRESHOLD:.2f})",
+    return "\n".join([
+        f"**Diff Risk Score**: {risk.score:.2f} / **{risk.band}** band "
+        f"(auto-land threshold {DIFF_RISK_ISSUE_THRESHOLD:.2f})",
         "",
-        "Static-diff features (RADAR-style):",
+        "<details>",
+        "<summary>Diff features scored</summary>",
         "",
         f"- files touched: {f['files_touched']}",
         f"- lines changed: +{f['lines_added']}/-{f['lines_deleted']}",
         f"- new public callables: {f['new_callables']}",
         f"- critical-path file edited: {f['critical_file_touched']}",
         f"- new surface without test change: {f['untested_new_surface']}",
-    ]
-    if risk.factors:
-        top = sorted(risk.factors.items(), key=lambda kv: kv[1], reverse=True)
-        lines += ["", "Top risk contributors (logit):", ""]
-        lines += [f"- `{k}` (+{v:.2f})" for k, v in top]
-    return "\n".join(lines)
+        "</details>",
+    ])
