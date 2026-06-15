@@ -2790,42 +2790,40 @@ def issue_for_paper(open_issues: list[dict], rec: Recommendation) -> dict | None
     return None
 
 
-def recent_remyx_activity_within_rate_limit(target: Target) -> bool:
-    """Return True if any Remyx Recommendation PR OR Issue was opened on
-    the target repo within `rate_limit_days`.
+def open_remyx_artifact_exists(target: Target) -> bool:
+    """Return True if any **open** Remyx Recommendation PR or Issue exists
+    on the target repo.
 
-    Counts both states (open and closed) — a recently-closed artifact
-    still represents a recent customer interruption that the rate-limit
-    is designed to throttle. Counts both PRs (identified by branch
-    prefix) and Issues (identified by title prefix or body marker), so
-    a cadence guard set to e.g. 7 days produces at most one Remyx
-    artifact per week, regardless of whether it lands as a PR or an
-    Issue."""
+    The cadence guard's job is to avoid stacking unresolved work on a
+    maintainer who hasn't engaged with the prior recommendation. Once
+    they merge or close it, the channel is clear and the next run can
+    proceed — engagement IS the signal. Per-paper dedup (a separate
+    gate) already prevents the same recommendation from re-surfacing,
+    so the cadence guard doesn't need its own time window.
+
+    `target.rate_limit_days > 0` enables this gate; `<= 0` disables it.
+    The numeric value is otherwise ignored — preserved as an on/off bit
+    so existing `outrider.yml` workflows continue to work unchanged.
+    """
     if target.rate_limit_days <= 0:
         return False
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=target.rate_limit_days)
 
-    # PRs — identified by branch prefix.
+    # PRs — identified by branch prefix. Only open PRs block.
     prs = gh_api(
-        "GET", f"/repos/{target.repo}/pulls?state=all&per_page=20"
-    )
+        "GET", f"/repos/{target.repo}/pulls?state=open&per_page=50"
+    ) or []
     for pr in prs:
         ref = pr.get("head", {}).get("ref", "")
         if not ref.startswith(BRANCH_PREFIX):
             continue
-        created = dt.datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
-        if created > cutoff:
-            log.info(
-                f"  rate-limit hit (PR): {pr['html_url']} opened "
-                f"{(dt.datetime.now(dt.timezone.utc) - created).days}d ago"
-            )
-            return True
+        log.info(f"  open Remyx PR exists: {pr['html_url']}")
+        return True
 
     # Issues — identified by title prefix or body attribution marker.
     # GitHub's /issues endpoint also returns PRs (they carry a
     # 'pull_request' key); filter those out so we don't double-count.
     issues = gh_api(
-        "GET", f"/repos/{target.repo}/issues?state=all&per_page=50"
+        "GET", f"/repos/{target.repo}/issues?state=open&per_page=50"
     ) or []
     for it in issues:
         if it.get("pull_request"):
@@ -2834,13 +2832,8 @@ def recent_remyx_activity_within_rate_limit(target: Target) -> bool:
         body = it.get("body") or ""
         if not (title.startswith(PR_TITLE_PREFIX) or "Remyx Recommendation" in body):
             continue
-        created = dt.datetime.fromisoformat(it["created_at"].replace("Z", "+00:00"))
-        if created > cutoff:
-            log.info(
-                f"  rate-limit hit (Issue): {it['html_url']} opened "
-                f"{(dt.datetime.now(dt.timezone.utc) - created).days}d ago"
-            )
-            return True
+        log.info(f"  open Remyx Issue exists: {it['html_url']}")
+        return True
 
     return False
 
@@ -5552,10 +5545,11 @@ def process_target(target: Target) -> dict:
     skip:
 
         skipped_low_confidence            — tier below min_confidence
-        skipped_rate_limit                — any Remyx artifact (PR or
-                                            Issue) opened within
-                                            rate-limit-days; the gate is
-                                            a global cadence guard
+        skipped_open_artifact             — an open Remyx PR or Issue
+                                            from a prior run still
+                                            exists on the target; the
+                                            cadence guard avoids
+                                            stacking unresolved work
         skipped_pr_exists                 — every candidate already has an
                                             open PR (or a mix of open PRs/Issues)
         skipped_issue_exists              — every candidate already has an
@@ -5596,16 +5590,14 @@ def process_target(target: Target) -> dict:
     """
     result: dict = {"repo": target.repo, "status": "unknown"}
 
-    # 1. Rate-limit (cadence guard) — cheapest gate, before any
-    #    candidate work or checkout. Counts BOTH Remyx PRs and Issues
-    #    opened within rate-limit-days; if any exists, skip the run.
-    #    This makes the rate-limit a true global cadence guard:
-    #    customers see at most one Remyx artifact per N days regardless
-    #    of which route (PR or Issue) it takes. The earlier version
-    #    counted only PRs, which let Issues open daily during PR
-    #    throttle — that was high-noise on daily crons.
-    if recent_remyx_activity_within_rate_limit(target):
-        result["status"] = "skipped_rate_limit"
+    # 1. Cadence guard — cheapest gate, before any candidate work or
+    #    checkout. Skip if any *open* Remyx artifact exists on the
+    #    target. Engagement (merge/close) IS the signal that the
+    #    channel is clear; the guard exists to avoid stacking
+    #    unresolved work, not to enforce a time window. Per-paper
+    #    dedup (further down) handles same-recommendation retries.
+    if open_remyx_artifact_exists(target):
+        result["status"] = "skipped_open_artifact"
         return result
 
     # 2. Query the candidate pool over the lookback window (default: the
@@ -7832,7 +7824,7 @@ def _write_step_summary(result: dict) -> None:
         "issue_opened_no_test_integration": "🟡",
         "issue_opened_self_review":        "🟡",
         "skipped_low_confidence":  "⏭️",
-        "skipped_rate_limit":      "⏭️",
+        "skipped_open_artifact":   "⏭️",
         "skipped_pr_exists":       "⏭️",
         "skipped_issue_exists":    "⏭️",
         "skipped_external_issue_exists": "⏭️",

@@ -60,12 +60,16 @@ inputs:
     default: 'always'
   rate-limit-days:
     description: |
-      Cadence guard: skip the run if any Remyx Recommendation artifact
-      (PR or Issue) was opened on the target repo within this many
-      days. Counts both routes so customers see at most one Remyx
-      artifact per `rate-limit-days` regardless of whether it lands as
-      a PR or as a discussion Issue. Default 7 (weekly cadence). Set
-      to 0 to disable and rely only on per-paper dedup.
+      Cadence guard: skip the run if an *open* Remyx Recommendation
+      artifact (PR or Issue) from a prior run still exists on the
+      target repo. Engagement (merge or close) signals the channel is
+      clear and the next run can proceed. Per-paper dedup (a separate
+      gate) handles same-recommendation retries — this guard is purely
+      about not stacking unresolved work. Any value > 0 enables the
+      guard; 0 disables it. The numeric value is otherwise ignored
+      (retained as an on/off bit so existing workflow files continue
+      to work unchanged; pre-2026-06 versions interpreted it as a
+      sliding "opened within N days" window).
     required: false
     default: '7'
   guardrails-allowlist:
@@ -134,7 +138,7 @@ outputs:
   status:
     description: |
       Run outcome: "pr_opened" | "pr_opened_draft" | "issue_opened" |
-      "skipped_low_confidence" | "skipped_rate_limit" | "skipped_pr_exists" |
+      "skipped_low_confidence" | "skipped_open_artifact" | "skipped_pr_exists" |
       "skipped_issue_exists" | "skipped_test_failure" | "claude_failed" |
       "rejected_path_violations" | "error". In weekly-summary mode:
       "weekly_summary_posted" | "weekly_summary_skipped_no_discussion_id" |

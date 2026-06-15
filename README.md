@@ -19,7 +19,7 @@ Scouts the arXiv frontier for your repo and picks the next paper most implementa
 - **RFC-shape Issues** when the team has signaled openness to a new capability (a README roadmap section, an open `[RFC]` Issue, a CONTEXT.md investment pattern) and a candidate fits as an extension — a clear proposal instead of speculation
 - **No duplicate work** — the same paper isn't re-recommended once any Outrider or maintainer Issue references it; reopen the Issue to re-engage
 - **A selection narrative** in the run's GitHub Actions step summary explaining why this paper (or why nothing actionable this run) — visible at a glance, not buried in logs
-- **One artifact per `rate-limit-days`** by default — no Issue spam
+- **No stacking unresolved work** by default — a new run skips while a prior Remyx PR or Issue is still open; engagement (merge or close) releases the gate
 
 ## Setup
 
@@ -84,7 +84,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 | `github-token` | `${{ github.token }}` | Override only for cross-repo controller patterns |
 | `min-confidence` | `moderate` | Tier gate: `high` / `moderate` / `low` |
 | `draft-mode` | `always` | `always` / `on_test_failure` / `never` |
-| `rate-limit-days` | `7` | Cadence guard. Skip the run if any Remyx artifact (PR **or** Issue) was opened within this window. Set `0` to disable. |
+| `rate-limit-days` | `7` | Cadence guard. Any value > 0 enables: skip the run if any **open** Remyx PR or Issue exists on the target. Engagement (merge or close) releases the gate. Set `0` to disable. The numeric value is otherwise ignored — kept as an on/off bit for compatibility with workflow files written for the prior sliding-window semantics. |
 | `guardrails-allowlist` | `''` | Extra path globs Claude Code may modify, **added on top of** the defaults (`*.py`, `.remyx-recommendation/**`, `**/*.md`). Most repos won't need this. |
 | `test-integration-policy` | `strict` | `strict` (demote to Issue if new tests don't import an existing module) / `soft` (open draft PR with warning) / `off` (skip the gate). Use `soft` for layer/component repos where standalone modules are the contribution. |
 | `lookback` | `week` | Candidate pool window: `today` / `week` / `month` |
@@ -113,7 +113,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 - **Remyx API**: included in your engine.remyx.ai subscription.
 - **GitHub Actions**: ~6–8 min on `ubuntu-latest` per run.
 
-At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
+With the default cadence guard (gate enabled), expect ~$2–4/mo Claude at typical engagement patterns.
 
 <details>
 <summary><b>Status codes</b></summary>
@@ -130,7 +130,7 @@ At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 | `issue_opened_self_review` | Self-review judged the new code an orphan, unreachable from production. Body preserves Claude's implementation diff so the maintainer can review or apply it manually |
 | `issue_opened_substitution` | Selection identified a replacement / pipeline-simplification / extension candidate (vs. additive drop-in); routed to Issue because the swap needs dep changes the PR guardrails block, or there's no existing call site to anchor against |
 | `skipped_low_confidence` | Recommendation below `min-confidence` |
-| `skipped_rate_limit` | A Remyx PR or Issue was opened within `rate-limit-days` |
+| `skipped_open_artifact` | An open Remyx PR or Issue from a prior run still exists on the target — engagement (merge or close) releases the gate |
 | `skipped_pr_exists` | Every candidate already has an open PR |
 | `skipped_issue_exists` | Every candidate already has a prior Issue referencing the arxiv id — Outrider-opened OR maintainer-opened, open OR closed. Step summary differentiates "Already in flight" (open) vs "Already addressed" (closed). Reopen the Issue to re-engage |
 | `skipped_external_issue_exists` | Selection pass surfaced an out-of-pool candidate but it's already in the team's attention — same Outrider/Maintainer × open/closed differentiation as above |
