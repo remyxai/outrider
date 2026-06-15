@@ -26,7 +26,7 @@ import run  # noqa: E402
 
 def test_get_asset_returns_dict_on_success(monkeypatch):
     """Direct lookup returns the asset envelope as-is when the engine
-    has the asset (the InstructSAM-shaped case from REMYX-91 + REMYX-90).
+    has the asset (the InstructSAM-shaped case).
     """
     asset = {
         "arxiv_id": "2605.26102",

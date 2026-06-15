@@ -108,8 +108,8 @@ def test_capture_diff_excludes_remyx_recommendation_scratchpad(tmp_path):
     """The orchestrator writes internal agent-facing prompts under
     `.remyx-recommendation/` (CONTEXT.md, GUARDRAILS.md, etc.). These
     must NOT appear in the diff embedded in downgrade-Issue bodies —
-    they leak orchestrator phrasing into a maintainer-facing artifact
-    (REMYX-112). The actual code contribution alongside them MUST still
+    they leak orchestrator phrasing into a maintainer-facing artifact.
+    The actual code contribution alongside them MUST still
     appear."""
     _init_git_repo(tmp_path)
     # Real code contribution the agent wrote

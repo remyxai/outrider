@@ -1,4 +1,4 @@
-"""Unit tests for the best-effort run-telemetry POST (REMYX-68 Outrider half).
+"""Unit tests for the best-effort run-telemetry POST.
 
 Covers payload mapping from the `result` dict, the source/env handling,
 artifact-url fallback, reasoning truncation, the local-run skip (no
@@ -60,7 +60,7 @@ def test_posts_full_payload(monkeypatch):
     assert body["run_id"] == 12345 and isinstance(body["run_id"], int)
     assert body["target_repo"] == "remyxai/example"
     assert body["status"] == "pr_opened"
-    assert body["source"] == "customer"                      # default
+    assert body["source"] == "outrider"                      # default
     assert body["recommendation_id"] is None
     assert body["artifact_url"].endswith("/pull/1")
     assert body["refine_queries"] == ["q1", "q2"]
@@ -106,10 +106,10 @@ def test_best_effort_swallows_post_failure(monkeypatch):
 
 def test_source_env_override(monkeypatch):
     monkeypatch.setenv("GITHUB_RUN_ID", "12345")
-    monkeypatch.setenv("REMYX_RUN_SOURCE", "eval_portfolio")
+    monkeypatch.setenv("REMYX_RUN_SOURCE", "outrider_eval")
     calls = _capture(monkeypatch)
     run._post_run_telemetry(_result(), _target())
-    assert calls[0][1]["source"] == "eval_portfolio"
+    assert calls[0][1]["source"] == "outrider_eval"
 
 
 def test_artifact_url_falls_back_to_issue(monkeypatch):

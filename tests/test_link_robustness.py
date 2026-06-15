@@ -1,5 +1,5 @@
 """Tests for v1.5.1 missing-link recovery strategies in the selection
-prompt (REMYX-104).
+prompt.
 
 These tests lock in the *presence* of the recovery-strategy guidance —
 the selection-pass agent (Claude Code) reads the prompt and applies the
@@ -10,7 +10,7 @@ edits.
 
 A follow-up release will add CLI helpers (`arxiv-fetch`,
 `web-fetch-resilient`) and instrument `failed_lookups` in the result
-dict per the full REMYX-104 ticket; tests for those land then.
+dict per the full link-robustness work; tests for those land then.
 
 Run with: pytest tests/ -q
 """
@@ -77,7 +77,7 @@ def test_prompt_documents_missing_github_url_recovery_chain():
 
     This is the load-bearing protection against rejecting viable
     candidates that the engine mis-labeled as code-less — the failure
-    mode that surfaced REMYX-104 in the first place."""
+    mode that surfaced this in the first place."""
     prompt = _unwrap(run._SELECTION_PROMPT_TEMPLATE)
     assert "Engine reports `github_url: (none)`" in prompt
     # Tells the agent explicitly not to trust the null

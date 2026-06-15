@@ -1,4 +1,4 @@
-"""Tests for the weekly-summary lifecycle-events helpers (REMYX-114).
+"""Tests for the weekly-summary lifecycle-events helpers.
 
 Covers:
   - `_is_bot_actor` — bot detection across the GitHub user-dict shapes
