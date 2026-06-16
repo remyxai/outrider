@@ -194,36 +194,43 @@ def test_test_functions_excluded_from_new_callables():
     assert risk.features["new_callables"] == 1
 
 
-def test_lines_changed_contribution_is_capped():
-    """A 5000-line PR shouldn't get a linearly-unbounded lines contribution
-    that dominates every other signal. The cap + overflow weight makes the
-    relationship monotonically increasing but flattened above the cap."""
+def test_lines_changed_contribution_scales_modestly():
+    """A typical Outrider scaffold (~1000 lines) shouldn't have a lines
+    contribution that dominates the categorical risk signals. The v1.7.0
+    recalibration cut `_W_LINES` 8× (from 0.004 to 0.0005) precisely so
+    size-of-diff stays well below the categorical weights for the diff
+    sizes Outrider actually produces."""
     # Score-by-direct-call against synthetic features so we can probe the
     # math without building a 5000-line tree.
-    f_huge = {
-        "files_touched": 1, "lines_added": 5000, "lines_deleted": 0,
-        "lines_changed": 5000, "new_callables": 0,
-        "critical_file_touched": False, "untested_new_surface": False,
-    }
-    f_at_cap = dict(f_huge, lines_added=500, lines_changed=500)
-    # Monkey-patch extract_features to return our synthetic features.
     import diff_risk_score as drs
     real_extract = drs.extract_features
     try:
-        drs.extract_features = lambda *a, **kw: f_huge
+        # Typical Outrider scaffold: ~1000 lines
+        drs.extract_features = lambda *a, **kw: {
+            "files_touched": 10, "lines_added": 1000, "lines_deleted": 0,
+            "lines_changed": 1000, "new_callables": 8,
+            "critical_file_touched": False, "untested_new_surface": False,
+        }
+        typical = drs.score_diff_risk(Path("/tmp"), "x")
+        # Outlier 5000-line refactor
+        drs.extract_features = lambda *a, **kw: {
+            "files_touched": 10, "lines_added": 5000, "lines_deleted": 0,
+            "lines_changed": 5000, "new_callables": 8,
+            "critical_file_touched": False, "untested_new_surface": False,
+        }
         huge = drs.score_diff_risk(Path("/tmp"), "x")
-        drs.extract_features = lambda *a, **kw: f_at_cap
-        at_cap = drs.score_diff_risk(Path("/tmp"), "x")
     finally:
         drs.extract_features = real_extract
-    # The 5000-line diff is riskier than a 500-line diff but not 10x as
-    # contributing — the lines contribution is capped + overflow-weighted.
-    huge_contrib = huge.factors["lines_changed"]
-    cap_contrib = at_cap.factors["lines_changed"]
-    assert huge_contrib > cap_contrib
-    # Without the cap, 5000 lines × 0.004 = 20.0. With cap=500 + overflow:
-    # 500 × 0.004 + 4500 × 0.001 = 2.0 + 4.5 = 6.5.
-    assert huge_contrib < 10.0
+    # Monotonic: more lines → higher contribution
+    assert huge.factors["lines_changed"] > typical.factors["lines_changed"]
+    # Bounded for typical scaffolds: 1000 lines × 0.0005 = 0.5 — well below
+    # the categorical weights (_W_CRITICAL=1.5, _W_UNTESTED=1.7) which
+    # should dominate when they fire.
+    assert typical.factors["lines_changed"] < drs._W_CRITICAL
+    assert typical.factors["lines_changed"] < drs._W_UNTESTED
+    # The 5000-line outlier IS allowed to weigh in heavily — but only after
+    # the linear scaling carries it there (not via a discontinuous cap+overflow).
+    assert huge.factors["lines_changed"] == 5 * typical.factors["lines_changed"]
 
 
 def test_branch_vs_base_mode_detects_untested_surface():
