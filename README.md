@@ -19,6 +19,7 @@ Scouts the arXiv frontier for your repo and picks the next paper most implementa
 - **RFC-shape Issues** when the team has signaled openness to a new capability (a README roadmap section, an open `[RFC]` Issue, a CONTEXT.md investment pattern) and a candidate fits as an extension — a clear proposal instead of speculation
 - **No duplicate work** — the same paper isn't re-recommended once any Outrider or maintainer Issue references it; reopen the Issue to re-engage
 - **A selection narrative** in the run's GitHub Actions step summary explaining why this paper (or why nothing actionable this run) — visible at a glance, not buried in logs
+- **Actionable failure guidance**, not opaque errors — when the agent fails on a recognizable cause (Anthropic credit-balance exhausted, invalid API key, rate-limit), the step-summary panel renders the specific remediation (top-up link, key-setup hint, retry note) instead of a buried log line
 - **No stacking unresolved work** by default — a new run skips while a prior Remyx PR or Issue is still open; engagement (merge or close) releases the gate
 
 ## Setup
@@ -129,8 +130,10 @@ With the default cadence guard (gate enabled), expect ~$2–4/mo Claude at typic
 | `issue_opened_no_test_integration` | New tests don't import from any pre-existing module |
 | `issue_opened_self_review` | Self-review judged the new code an orphan, unreachable from production. Body preserves Claude's implementation diff so the maintainer can review or apply it manually |
 | `issue_opened_substitution` | Selection identified a replacement / pipeline-simplification / extension candidate (vs. additive drop-in); routed to Issue because the swap needs dep changes the PR guardrails block, or there's no existing call site to anchor against |
+| `issue_opened_high_risk` | Diff Risk Score gate routed to a human-review Issue instead of a PR (implementation diff preserved in the Issue body). See [Diff Risk Score](#diff-risk-score--adapted-from-automating-low-risk-code-review-at-meta-radar-risk-calibration-and-review-efficiency) |
 | `skipped_low_confidence` | Recommendation below `min-confidence` |
 | `skipped_open_artifact` | An open Remyx PR or Issue from a prior run still exists on the target — engagement (merge or close) releases the gate |
+| `skipped_issues_disabled` | The target repo has its Issues tab disabled (default on forks) and the scoped App token can't re-enable it. Enable with `gh repo edit <repo> --enable-issues` and the next run proceeds |
 | `skipped_pr_exists` | Every candidate already has an open PR |
 | `skipped_issue_exists` | Every candidate already has a prior Issue referencing the arxiv id — Outrider-opened OR maintainer-opened, open OR closed. Step summary differentiates "Already in flight" (open) vs "Already addressed" (closed). Reopen the Issue to re-engage |
 | `skipped_external_issue_exists` | Selection pass surfaced an out-of-pool candidate but it's already in the team's attention — same Outrider/Maintainer × open/closed differentiation as above |
@@ -252,7 +255,11 @@ Setup:
 
 1. **Enable Discussions** on your repo if it isn't already on:
    *Settings → General → Features → ☑ Discussions*. (Repos — forks
-   especially — have Discussions off by default.)
+   especially — have Discussions off by default; the same is true for
+   the Issues tab, which Outrider needs for Issue-route recommendations.
+   When Issues are disabled the run exits cleanly with
+   `skipped_issues_disabled` and a hint to run `gh repo edit <repo>
+   --enable-issues`.)
 2. **Create (or pick) a Discussion** on your repo to host the digests, and
    note its number from the URL.
 3. **Add a second scheduled job** (weekly cron) that calls the action in
