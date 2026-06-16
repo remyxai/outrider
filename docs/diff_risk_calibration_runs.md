@@ -2,7 +2,7 @@
 
 Each row is a `remyx-recommendation/*` branch scored against its merge-base with `origin/main`. Sorted by score descending so disputed-band candidates surface first.
 
-## v1.7.0 weights (current)
+## v1.6.1 weights (current)
 
 Recalibrated 2026-06-16 after a cross-portfolio re-scoring exercise across ~20 fork targets showed v1.6.0 over-routing to the high band. The gate triages "draft PR for review vs RFC Issue for discussion" — not "is this diff risky" — so the bar for downgrade-to-Issue is now much higher. The size of an Outrider scaffold (9-12 files, 500-1000 lines, module + tests + wiring + docs) is the expected output shape, not a risk signal; categorical signals (`critical_file_touched`, `untested_new_surface`) carry the routing decisions.
 
@@ -17,7 +17,7 @@ Recalibrated 2026-06-16 after a cross-portfolio re-scoring exercise across ~20 f
 
 Distribution: **1 elevated / 5 low / 0 high**.
 
-† Two Outrider runs of the **same** recommendation (arxiv 2606.06460v1, "Will the Agent Recuse Itself?") on the same target. Under v1.6.0 weights they routed to different bands (one high, one elevated) because the scaffolds differed in size (1013 LOC across 9 files vs 360 LOC across 3 files); under v1.7.0 they both land in `low`. The size variance no longer changes the routing — both are draft PRs for human review, which matches the gate's actual job. Run-to-run variance is the gate's blind spot today; tightening it is future work.
+† Two Outrider runs of the **same** recommendation (arxiv 2606.06460v1, "Will the Agent Recuse Itself?") on the same target. Under v1.6.0 weights they routed to different bands (one high, one elevated) because the scaffolds differed in size (1013 LOC across 9 files vs 360 LOC across 3 files); under v1.6.1 they both land in `low`. The size variance no longer changes the routing — both are draft PRs for human review, which matches the gate's actual job. Run-to-run variance is the gate's blind spot today; tightening it is future work.
 
 ## v1.6.0 weights (historical — pre-recalibration)
 
@@ -34,9 +34,9 @@ The original v1.6.0 scores are preserved here for reference. The recalibration w
 
 v1.6.0 distribution: **2 high / 3 elevated / 1 low**.
 
-## Weight changes (v1.6.0 → v1.7.0)
+## Weight changes (v1.6.0 → v1.6.1)
 
-| Weight | v1.6.0 | v1.7.0 | Change |
+| Weight | v1.6.0 | v1.6.1 | Change |
 |---|---:|---:|---|
 | `_W_INTERCEPT` | -2.0 | -2.5 | Lower baseline |
 | `_W_FILES` | 0.18 | 0.02 | 9× less |

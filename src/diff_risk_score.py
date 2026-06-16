@@ -62,19 +62,22 @@ CRITICAL_PATH_HINTS = (
 
 # ── Logistic feature weights ───────────────────────────────────────────────
 #
-# Recalibrated 2026-06-16 from REMYX-101 sprint-1 data: 9 of 11 artifact-
-# producing runs (82%) routed to high-band Issue under the original weights,
-# net zero PRs. The gate triages "draft PR for review vs RFC Issue for
-# discussion", NOT "is this diff risky" — Outrider never auto-merges, so
-# downgrade-to-Issue is reserved for cases the maintainer needs to discuss
-# before reviewing a diff, not "the diff is big." Size of an Outrider
-# scaffold (9-12 files, 500-1000 lines) IS the expected output shape, not
-# a risk signal.
+# Recalibrated 2026-06-16 from a cross-portfolio re-scoring exercise that
+# showed the prior weights mechanically over-routed to high band: every
+# typical Outrider scaffold (9-12 files, 500-1000 lines for module + tests
+# + wiring + docs) crossed the high threshold by feature accumulation
+# alone, before the categorical risk signals weighed in.
+#
+# The gate triages "draft PR for review vs RFC Issue for discussion",
+# NOT "is this diff risky" — Outrider never auto-merges, so downgrade-
+# to-Issue is reserved for cases the maintainer needs to discuss before
+# reviewing a diff, not "the diff is big." The size of an Outrider
+# scaffold IS its expected output shape, not a risk signal.
 #
 # Categorical signals (critical-path edit, untested new surface) remain
 # the dominant risk drivers. The previous _LINES_CAP / _W_LINES_OVERFLOW
-# pair is removed since the linear weight is now small enough not to need
-# cap behaviour.
+# pair is removed since the linear weight is now small enough not to
+# need cap behaviour.
 _W_INTERCEPT = -2.5
 _W_FILES = 0.02          # per file touched
 _W_LINES = 0.0005        # per added+deleted line (linear, no cap)

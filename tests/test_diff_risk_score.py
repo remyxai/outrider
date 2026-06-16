@@ -196,7 +196,7 @@ def test_test_functions_excluded_from_new_callables():
 
 def test_lines_changed_contribution_scales_modestly():
     """A typical Outrider scaffold (~1000 lines) shouldn't have a lines
-    contribution that dominates the categorical risk signals. The v1.7.0
+    contribution that dominates the categorical risk signals. The v1.6.1
     recalibration cut `_W_LINES` 8× (from 0.004 to 0.0005) precisely so
     size-of-diff stays well below the categorical weights for the diff
     sizes Outrider actually produces."""
