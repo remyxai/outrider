@@ -146,3 +146,64 @@ def test_renders_above_cost_line(tmp_path, monkeypatch):
         "cost_usd": 1.23,
     }, tmp_path, monkeypatch)
     assert out.index("Why this selection") < out.index("Cost & tokens")
+
+
+# ── claude_failed rendering (REMYX-106) ────────────────────────────────────
+
+
+def test_step_summary_credit_balance_renders_topup_section(tmp_path, monkeypatch):
+    out = _capture({
+        "status": "claude_failed",
+        "claude_log_tail": "ERROR: Credit balance is too low to make request",
+        "claude_calls": 4,
+    }, tmp_path, monkeypatch)
+    assert "Anthropic credit balance exhausted" in out
+    assert "console.anthropic.com/settings/billing" in out
+    assert "4 Claude calls" in out
+
+
+def test_step_summary_invalid_key_renders_secret_section(tmp_path, monkeypatch):
+    out = _capture({
+        "status": "claude_failed",
+        "claude_log_tail": "401 Authentication error: invalid x-api-key",
+    }, tmp_path, monkeypatch)
+    assert "ANTHROPIC_API_KEY secret invalid" in out
+    assert "console.anthropic.com/settings/keys" in out
+    assert "gh secret set ANTHROPIC_API_KEY" in out
+
+
+def test_step_summary_rate_limit_renders_no_action_section(tmp_path, monkeypatch):
+    out = _capture({
+        "status": "claude_failed",
+        "claude_log_tail": "HTTP 429 Too Many Requests rate_limit_error",
+    }, tmp_path, monkeypatch)
+    assert "Rate limited" in out
+    assert "no action needed" in out
+    assert "next scheduled run will retry" in out
+
+
+def test_step_summary_unknown_failure_renders_tail(tmp_path, monkeypatch):
+    out = _capture({
+        "status": "claude_failed",
+        "claude_log_tail": "Unexpected error: model returned malformed json",
+    }, tmp_path, monkeypatch)
+    # Generic failures fall through to a collapsed details block with the tail.
+    assert "Claude agent failure tail" in out
+    assert "malformed json" in out
+    # Specific-action sections should NOT fire.
+    assert "Anthropic credit balance" not in out
+    assert "ANTHROPIC_API_KEY secret invalid" not in out
+
+
+def test_step_summary_succeeds_when_claude_log_tail_missing(tmp_path, monkeypatch):
+    # claude_failed without a log tail shouldn't crash; just no extra block.
+    out = _capture({
+        "status": "claude_failed",
+        "claude_calls": 0,
+    }, tmp_path, monkeypatch)
+    # Headline still renders even without the tail-derived action block.
+    assert "claude_failed" in out
+    # No specific-action section fires when there's no tail content.
+    assert "Anthropic credit balance" not in out
+    assert "ANTHROPIC_API_KEY secret invalid" not in out
+    assert "Claude agent failure tail" not in out

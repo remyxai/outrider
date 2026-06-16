@@ -145,6 +145,13 @@ BUNDLE_DIR_NAME = ".remyx-recommendation"
 BRANCH_PREFIX = "remyx-recommendation/"
 PR_TITLE_PREFIX = "[Remyx Recommendation]"
 
+# Vendor-console URLs surfaced in step_summary when the agent fails with a
+# recognizable cause. Currently Anthropic-only; when alternative agent CLIs
+# land, these become a per-agent lookup (`_AGENT_URLS = {"claude": ...,
+# "aider": ...}`) keyed by the agent type recorded in the result dict.
+_ANTHROPIC_BILLING_URL = "https://console.anthropic.com/settings/billing"
+_ANTHROPIC_KEYS_URL = "https://console.anthropic.com/settings/keys"
+
 # Files that are NEVER allowed to be touched. Blocked by ROLE (filename /
 # type), not by directory, so the policy doesn't encode any one repo's
 # layout: a Dockerfile is off-limits whether it sits at the root, under
@@ -7775,6 +7782,62 @@ def run_weekly_summary(target: Target) -> dict:
     return result
 
 
+def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[str]:
+    """Render a list of step_summary markdown lines for a ``claude_failed``
+    status, dispatching on the agent's log tail.
+
+    Currently agent-specific to Claude Code (Anthropic). When alternative
+    agent CLIs land (Aider, Goose, Copilot, Codex), this helper grows a
+    per-agent patterns + URLs lookup keyed on ``agent`` — the call site
+    in ``_write_step_summary`` doesn't change.
+    """
+    tail = (log_tail or "").lower()
+    lines: list[str] = []
+    if "credit balance is too low" in tail:
+        lines.append("\n> ### 🪙 Action required: Anthropic credit balance exhausted\n>")
+        lines.append(
+            f"> All {claude_calls} Claude calls this run failed with "
+            "\"Credit balance is too low\"."
+        )
+        lines.append(
+            "> The `ANTHROPIC_API_KEY` secret authenticated — the account "
+            "just has no remaining credits."
+        )
+        lines.append(">")
+        lines.append(f"> **Top up at:** {_ANTHROPIC_BILLING_URL}")
+        lines.append(">")
+        lines.append(
+            "> The next scheduled run will retry automatically once "
+            "credits are available.\n"
+        )
+    elif "401" in tail and (
+        "authentication" in tail
+        or "invalid api key" in tail
+        or "invalid x-api-key" in tail
+    ):
+        lines.append("\n> ### 🔑 Action required: ANTHROPIC_API_KEY secret invalid\n>")
+        lines.append(
+            "> The key configured as the `ANTHROPIC_API_KEY` repo secret "
+            "didn't authenticate."
+        )
+        lines.append(
+            f"> Check the key at {_ANTHROPIC_KEYS_URL} and update the "
+            "secret via"
+        )
+        lines.append("> `gh secret set ANTHROPIC_API_KEY --repo <this-repo>`.\n")
+    elif "429" in tail or "rate_limit" in tail or "too many requests" in tail:
+        lines.append("\n> ### ⏱️ Rate limited — no action needed\n>")
+        lines.append(
+            "> The Anthropic API rate-limited this run. The next "
+            "scheduled run will retry.\n"
+        )
+    elif tail:
+        lines.append("\n<details><summary>Claude agent failure tail</summary>\n")
+        lines.append(f"\n```\n{log_tail[:1500]}\n```\n")
+        lines.append("\n</details>\n")
+    return lines
+
+
 def _write_step_summary(result: dict) -> None:
     """Render the run outcome as Markdown into $GITHUB_STEP_SUMMARY.
 
@@ -7985,6 +8048,13 @@ def _write_step_summary(result: dict) -> None:
         if len(rejected) > 10:
             lines.append(f"- _…and {len(rejected) - 10} more_")
         lines.append("\n</details>\n")
+
+    if status == "claude_failed":
+        lines.extend(_agent_failure_blocks(
+            agent="claude",
+            log_tail=result.get("claude_log_tail") or "",
+            claude_calls=claude_calls,
+        ))
 
     if err:
         lines.append("\n**Error**\n")
