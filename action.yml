@@ -138,7 +138,8 @@ outputs:
   status:
     description: |
       Run outcome: "pr_opened" | "pr_opened_draft" | "issue_opened" |
-      "skipped_low_confidence" | "skipped_open_artifact" | "skipped_pr_exists" |
+      "skipped_low_confidence" | "skipped_open_artifact" |
+      "skipped_issues_disabled" | "skipped_pr_exists" |
       "skipped_issue_exists" | "skipped_test_failure" | "claude_failed" |
       "rejected_path_violations" | "error". In weekly-summary mode:
       "weekly_summary_posted" | "weekly_summary_skipped_no_discussion_id" |

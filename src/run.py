@@ -5036,9 +5036,24 @@ def open_issue(
         # disabled". Enable it and retry once rather than failing the run.
         msg = str(e)
         if "Issues has been disabled" in msg or "HTTP 410" in msg:
-            log.warning("  Issues disabled on repo; enabling and retrying")
-            gh_api("PATCH", f"/repos/{target.repo}", {"has_issues": True})
-            issue = gh_api("POST", f"/repos/{target.repo}/issues", payload)
+            log.warning("  Issues disabled on repo; attempting to enable")
+            try:
+                gh_api("PATCH", f"/repos/{target.repo}", {"has_issues": True})
+                issue = gh_api("POST", f"/repos/{target.repo}/issues", payload)
+            except RuntimeError as patch_err:
+                # PATCH /repos requires `administration: write`, which the
+                # scoped App installation token doesn't carry. Raise the
+                # documented graceful-skip exception so process_target can
+                # convert it to a `skipped_issues_disabled` status instead
+                # of a generic error.
+                if "403" in str(patch_err) or "Resource not accessible" in str(patch_err):
+                    raise IssuesDisabledError(
+                        f"Issues tab disabled on {target.repo} and the bot's "
+                        f"installation token lacks admin scope to enable it. "
+                        f"Enable Issues manually: "
+                        f"`gh repo edit {target.repo} --enable-issues`."
+                    ) from patch_err
+                raise
         else:
             raise
     return issue["html_url"]
@@ -5605,6 +5620,27 @@ def process_target(target: Target) -> dict:
     #    dedup (further down) handles same-recommendation retries.
     if open_remyx_artifact_exists(target):
         result["status"] = "skipped_open_artifact"
+        return result
+
+    # 1b. Issues-disabled pre-flight — GitHub disables the Issues tab on
+    #     forks (and some repos) by default; without it, every Issue-route
+    #     artifact this run might emit (high-risk downgrade, no-integration,
+    #     stub-density, self-review, substitution, preflight, OPEN_AS_ISSUE)
+    #     fails at the POST /issues step. The scoped App token can't
+    #     re-enable Issues (PATCH /repos requires `administration: write`,
+    #     not granted), so a single GET here saves a full selection +
+    #     scaffold pass that would be wasted at the Issue step. The race
+    #     where Issues get disabled mid-run is caught by IssuesDisabledError
+    #     below (see open_issue + the except handler before the finally).
+    try:
+        repo_meta = gh_api("GET", f"/repos/{target.repo}")
+    except RuntimeError as e:
+        log.warning(f"  repo metadata fetch failed ({e}); assuming Issues enabled")
+        repo_meta = {"has_issues": True}
+    if not repo_meta.get("has_issues", True):
+        log.info(f"  Issues disabled on {target.repo}; skipping. "
+                 f"Enable: gh repo edit {target.repo} --enable-issues")
+        result["status"] = "skipped_issues_disabled"
         return result
 
     # 2. Query the candidate pool over the lookback window (default: the
@@ -6373,6 +6409,18 @@ def process_target(target: Target) -> dict:
         result["status"] = "pr_opened_draft" if draft else "pr_opened"
         result["pr_url"] = pr_url
         log.info(f"  ✓ {result['status']}: {pr_url}")
+        return result
+
+    except IssuesDisabledError as e:
+        # Race: Issues were enabled at the pre-flight check but got disabled
+        # mid-run, so open_issue's PATCH-to-enable hit 403. Catch here so
+        # the run ends with a graceful skipped_issues_disabled status
+        # instead of a generic error — selection-pass + scaffold work is
+        # already done; surfacing the actionable hint is the best we can
+        # do for this rare path.
+        log.warning(f"  ↪ Issues became disabled mid-run: {e}")
+        result["status"] = "skipped_issues_disabled"
+        result["error"] = str(e)
         return result
 
     finally:
@@ -7890,6 +7938,7 @@ def _write_step_summary(result: dict) -> None:
         "issue_opened_self_review":        "🟡",
         "skipped_low_confidence":  "⏭️",
         "skipped_open_artifact":   "⏭️",
+        "skipped_issues_disabled": "⏭️",
         "skipped_pr_exists":       "⏭️",
         "skipped_issue_exists":    "⏭️",
         "skipped_external_issue_exists": "⏭️",
