@@ -62,23 +62,25 @@ CRITICAL_PATH_HINTS = (
 
 # ── Logistic feature weights ───────────────────────────────────────────────
 #
-# Signs and magnitudes are calibrated (not trained) so that a small,
-# tested, non-critical wiring PR lands in "low", a moderate or untested
-# change lands in "elevated", and a sprawling multi-file rewrite or an
-# untested critical-path edit crosses into "high". The two categorical
-# signals (critical-path edit, new surface shipped without any test change)
-# are the dominant risk drivers, mirroring RADAR's finding that test
-# coverage and blast radius matter more than raw line count.
-_W_INTERCEPT = -2.0
-_W_FILES = 0.18          # per file touched
-_W_LINES = 0.004         # per added+deleted line UP TO _LINES_CAP
-_LINES_CAP = 500         # contribution saturates here; bigger diffs don't
-                          # linearly dominate the score (diminishing returns)
-_W_LINES_OVERFLOW = 0.001  # per line beyond _LINES_CAP — keeps the signal
-                            # monotonically increasing but flattened
-_W_NEW_CALLABLES = 0.10  # per newly-added public callable
-_W_CRITICAL = 1.6        # any pre-existing critical-path file edited
-_W_UNTESTED = 1.1        # new public surface added with no test-file change
+# Recalibrated 2026-06-16 from REMYX-101 sprint-1 data: 9 of 11 artifact-
+# producing runs (82%) routed to high-band Issue under the original weights,
+# net zero PRs. The gate triages "draft PR for review vs RFC Issue for
+# discussion", NOT "is this diff risky" — Outrider never auto-merges, so
+# downgrade-to-Issue is reserved for cases the maintainer needs to discuss
+# before reviewing a diff, not "the diff is big." Size of an Outrider
+# scaffold (9-12 files, 500-1000 lines) IS the expected output shape, not
+# a risk signal.
+#
+# Categorical signals (critical-path edit, untested new surface) remain
+# the dominant risk drivers. The previous _LINES_CAP / _W_LINES_OVERFLOW
+# pair is removed since the linear weight is now small enough not to need
+# cap behaviour.
+_W_INTERCEPT = -2.5
+_W_FILES = 0.02          # per file touched
+_W_LINES = 0.0005        # per added+deleted line (linear, no cap)
+_W_NEW_CALLABLES = 0.05  # per newly-added public callable
+_W_CRITICAL = 1.5        # any pre-existing critical-path file edited
+_W_UNTESTED = 1.7        # new public surface added with no test-file change
 
 
 @dataclass
@@ -298,11 +300,9 @@ def score_diff_risk(
     no sampling, deterministic for a given tree.
     """
     f = extract_features(workdir, package, base_ref=base_ref)
-    capped = min(f["lines_changed"], _LINES_CAP)
-    overflow = max(f["lines_changed"] - _LINES_CAP, 0)
     contributions = {
         "files_touched": _W_FILES * f["files_touched"],
-        "lines_changed": _W_LINES * capped + _W_LINES_OVERFLOW * overflow,
+        "lines_changed": _W_LINES * f["lines_changed"],
         "new_callables": _W_NEW_CALLABLES * f["new_callables"],
         "critical_file_touched": _W_CRITICAL if f["critical_file_touched"] else 0.0,
         "untested_new_surface": _W_UNTESTED if f["untested_new_surface"] else 0.0,
