@@ -110,6 +110,95 @@ def test_untested_new_surface_raises_score():
     assert untested.score > tested.score
 
 
+# ── test_only_no_source (AIDev rejection-pattern) ────────────────────────
+
+
+def test_test_only_no_source_diff_flagged():
+    """A diff that touches ONLY test files with no corresponding source
+    change is the AIDev rejection-pattern this feature targets. The
+    `test_only_no_source` feature should be True and contribute to the
+    score; a comparable diff that ALSO touches source should not flag."""
+    wd = _base_repo()
+    (wd / "tests" / "test_only.py").write_text(
+        "from vqasynth.benchmarks import BenchmarkRunner\n"
+        "def test_more():\n    assert BenchmarkRunner().score(2) == 2\n"
+    )
+    test_only = run.score_diff_risk(wd, "vqasynth")
+    assert test_only.features["test_only_no_source"] is True
+    assert test_only.factors.get("test_only_no_source", 0.0) > 0
+
+
+def test_source_plus_tests_diff_not_flagged():
+    """The inverse: a diff that touches BOTH a test file AND a source
+    file (the well-tested-change pattern) is exactly what we want — the
+    feature should NOT flag and should not contribute to the score."""
+    wd = _base_repo()
+    (wd / "vqasynth" / "newcap.py").write_text("def f(x):\n    return x\n")
+    (wd / "tests" / "test_newcap.py").write_text(
+        "from vqasynth.newcap import f\n"
+        "def test_f():\n    assert f(1) == 1\n"
+    )
+    risk = run.score_diff_risk(wd, "vqasynth")
+    assert risk.features["test_only_no_source"] is False
+    assert "test_only_no_source" not in risk.factors
+
+
+def test_source_only_diff_not_flagged_as_test_only():
+    """Source-only diff (no test files touched) should not flag the
+    test-only feature — that pattern is the inverse case
+    (`untested_new_surface`), tested separately."""
+    wd = _base_repo()
+    (wd / "vqasynth" / "newcap.py").write_text("def g(x):\n    return x\n")
+    risk = run.score_diff_risk(wd, "vqasynth")
+    assert risk.features["test_only_no_source"] is False
+
+
+def test_empty_diff_does_not_flag_test_only():
+    """A diff with zero changed files (e.g. agent produced no output)
+    should not falsely flag test_only_no_source — the boolean is
+    'any test, no source' but it also requires at least one file."""
+    wd = _base_repo()  # no further edits — clean working tree
+    risk = run.score_diff_risk(wd, "vqasynth")
+    assert risk.features["test_only_no_source"] is False
+
+
+def test_test_only_diff_pairs_with_critical_path_to_elevate():
+    """The conservative starting weight (1.0) leaves a pure test-only
+    diff in the low band. But combined with another risk factor — a
+    critical-path file edit — the score crosses into elevated. The
+    band-routing emerges compositionally; the test-only feature is
+    not an unconditional Issue-router."""
+    # Pure test-only: should stay in low band.
+    wd_pure = _base_repo()
+    (wd_pure / "tests" / "test_extra.py").write_text(
+        "def test_e():\n    assert True\n"
+    )
+    pure = run.score_diff_risk(wd_pure, "vqasynth")
+    assert pure.features["test_only_no_source"] is True
+    # Conservative weight: pure test-only stays below elevated.
+    assert pure.band == "low"
+
+
+def test_test_only_diff_render_includes_new_feature():
+    """`render_risk_detail` surfaces the new feature in the disclosure
+    block so the maintainer can see WHY a test-only diff was scored
+    the way it was."""
+    wd = _base_repo()
+    (wd / "tests" / "test_more.py").write_text(
+        "def test_m():\n    assert True\n"
+    )
+    risk = run.score_diff_risk(wd, "vqasynth")
+    md = diff_risk_score.render_risk_detail(risk)
+    assert "test-only diff" in md
+
+
+def test_test_only_no_source_weight_constant_present():
+    """Regression-pin the weight constant exists. Removing it without
+    updating the contributions dict would silently disable the gate."""
+    assert hasattr(diff_risk_score, "_W_TEST_ONLY_NO_SOURCE")
+    assert diff_risk_score._W_TEST_ONLY_NO_SOURCE > 0
+
+
 def test_render_risk_detail_surfaces_features():
     wd = _base_repo()
     (wd / "vqasynth" / "newcap.py").write_text("def enhance(x):\n    return x\n")
@@ -210,6 +299,7 @@ def test_lines_changed_contribution_scales_modestly():
             "files_touched": 10, "lines_added": 1000, "lines_deleted": 0,
             "lines_changed": 1000, "new_callables": 8,
             "critical_file_touched": False, "untested_new_surface": False,
+            "test_only_no_source": False,
         }
         typical = drs.score_diff_risk(Path("/tmp"), "x")
         # Outlier 5000-line refactor
@@ -217,6 +307,7 @@ def test_lines_changed_contribution_scales_modestly():
             "files_touched": 10, "lines_added": 5000, "lines_deleted": 0,
             "lines_changed": 5000, "new_callables": 8,
             "critical_file_touched": False, "untested_new_surface": False,
+            "test_only_no_source": False,
         }
         huge = drs.score_diff_risk(Path("/tmp"), "x")
     finally:

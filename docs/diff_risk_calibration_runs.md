@@ -2,6 +2,12 @@
 
 Each row is a `remyx-recommendation/*` branch scored against its merge-base with `origin/main`. Sorted by score descending so disputed-band candidates surface first.
 
+## test_only_no_source feature (2026-06-17, +1.0 weight)
+
+Added a symmetric counterpart to `untested_new_surface` for the AIDev rejection-pattern (arXiv:2606.13468) of agentic PRs that touch only test files with no corresponding source change. Conservative starting weight (`_W_TEST_ONLY_NO_SOURCE = 1.0`) leaves a pure test-only diff in the **low band** (logit −2.5 + 1.0 = −1.5 → score ≈ 0.18) — the flag is observability-and-routing-additive, not unconditional-Issue-router. Combined with another risk signal (critical-path edit, large lines) the feature contributes the nudge into elevated draft for human review.
+
+Worth recalibrating after 4–6 weeks of operation: if test-only PRs continue to merge at similar rates as code-bearing PRs, the weight is over-conservative and can drop. If they reject at higher rates as the AIDev paper predicts, the weight is right or under-conservative and could rise.
+
 ## v1.6.1 weights (current)
 
 Recalibrated 2026-06-16 after a cross-portfolio re-scoring exercise across ~20 fork targets showed v1.6.0 over-routing to the high band. The gate triages "draft PR for review vs RFC Issue for discussion" — not "is this diff risky" — so the bar for downgrade-to-Issue is now much higher. The size of an Outrider scaffold (9-12 files, 500-1000 lines, module + tests + wiring + docs) is the expected output shape, not a risk signal; categorical signals (`critical_file_touched`, `untested_new_surface`) carry the routing decisions.

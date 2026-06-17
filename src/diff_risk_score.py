@@ -85,6 +85,20 @@ _W_NEW_CALLABLES = 0.05  # per newly-added public callable
 _W_CRITICAL = 1.5        # any pre-existing critical-path file edited
 _W_UNTESTED = 1.7        # new public surface added with no test-file change
 
+# Symmetric to _W_UNTESTED, addressing a separate rejection pattern from
+# the AIDev study (arXiv:2606.13468) of agentic PRs: a diff that touches
+# ONLY test files with no corresponding source change. The pattern shows
+# up as agents adding tests for code that doesn't exist yet, writing
+# tests that exercise the wrong thing, or producing scaffolding without
+# the implementation it claims to validate. Legitimate uses exist
+# (regression tests for an upstream bugfix already in main, retroactive
+# coverage of existing behavior), so the weight is conservative — at
+# 1.0 a pure test-only diff scores well below the elevated threshold
+# in isolation, but pairs with another risk factor (critical-path edit,
+# large lines) to nudge into elevated draft. The band routes; the score
+# itself doesn't block.
+_W_TEST_ONLY_NO_SOURCE = 1.0
+
 
 @dataclass
 class DiffRisk:
@@ -263,11 +277,19 @@ def extract_features(
 
     # Test-coverage impact: new public surface shipped without any change to
     # a test file is the classic under-reviewed pattern RADAR flags.
-    test_changed = any(
-        p.startswith("tests/") or Path(p).name.startswith("test_")
-        for p in paths
-    )
+    test_changed = any(_is_test_path(p) for p in paths)
     untested = new_callables > 0 and not test_changed
+
+    # Symmetric pattern from the AIDev rejection study: a diff that touches
+    # ONLY test files with no corresponding source change. Agents adding
+    # tests for code that doesn't exist, exercising the wrong thing, or
+    # producing scaffolding without the implementation. The band-routing
+    # logic nudges these to elevated draft when paired with another risk
+    # factor; the score alone (at the conservative starting weight) leaves
+    # legitimate cases (regression tests for upstream bugfixes already in
+    # main, retroactive coverage of existing behavior) in the low band.
+    non_test_changed = any(not _is_test_path(p) for p in paths)
+    test_only_no_source = bool(paths) and test_changed and not non_test_changed
 
     return {
         "files_touched": len(paths),
@@ -277,6 +299,7 @@ def extract_features(
         "new_callables": new_callables,
         "critical_file_touched": critical,
         "untested_new_surface": untested,
+        "test_only_no_source": test_only_no_source,
     }
 
 
@@ -309,6 +332,9 @@ def score_diff_risk(
         "new_callables": _W_NEW_CALLABLES * f["new_callables"],
         "critical_file_touched": _W_CRITICAL if f["critical_file_touched"] else 0.0,
         "untested_new_surface": _W_UNTESTED if f["untested_new_surface"] else 0.0,
+        "test_only_no_source": (
+            _W_TEST_ONLY_NO_SOURCE if f["test_only_no_source"] else 0.0
+        ),
     }
     z = _W_INTERCEPT + sum(contributions.values())
     score = 1.0 / (1.0 + math.exp(-z))
@@ -345,5 +371,6 @@ def render_risk_detail(risk: DiffRisk) -> str:
         f"- new public callables: {f['new_callables']}",
         f"- critical-path file edited: {f['critical_file_touched']}",
         f"- new surface without test change: {f['untested_new_surface']}",
+        f"- test-only diff (no source change): {f['test_only_no_source']}",
         "</details>",
     ])
