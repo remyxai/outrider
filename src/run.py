@@ -70,6 +70,10 @@ from diff_risk_score import (
     render_risk_detail,
     score_diff_risk,
 )
+from exploration_structure import (
+    exploration_structure_from_events,
+    structure_enabled,
+)
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -4032,12 +4036,22 @@ def _selection_coverage_from_events(events: list[dict]) -> dict:
             elif btype == "tool_result":
                 if block.get("tool_use_id") in read_ids:
                     visible_lines += _count_result_lines(block.get("content"))
-    return {
+    coverage = {
         "searches": searches,
         "file_reads": file_reads,
         "visible_lines": visible_lines,
         "search_to_read_ratio": round(searches / max(file_reads, 1), 2),
     }
+    # Exploration-structure dimension (arXiv:2606.11976): classify the same
+    # ordered stream as linear (one read per step, single subsystem) vs
+    # non-linear/domain-scoped (branching across subsystems). Rides along as
+    # telemetry beside the count/ratio dimensions; gating still keys off
+    # visible_lines.
+    if structure_enabled():
+        coverage["exploration_structure"] = exploration_structure_from_events(
+            events
+        )
+    return coverage
 
 
 def _selection_context_efficiency(text: str, visible_lines: int) -> float:
@@ -4231,12 +4245,15 @@ def select_recommendation(
     _apply_coverage_gate(data, coverage, higher_floor=_higher_floor)
     data["selection_coverage"] = coverage
     data["selection_context_efficiency"] = context_efficiency
+    _struct = coverage.get("exploration_structure") or {}
     log.info(
         f"  selection coverage: {coverage['searches']} searches, "
         f"{coverage['file_reads']} file reads, "
         f"{coverage['visible_lines']} lines visible, "
         f"context-efficiency {context_efficiency} "
-        f"(under_explored={coverage.get('under_explored')})"
+        f"(under_explored={coverage.get('under_explored')}, "
+        f"structure={_struct.get('structure', 'n/a')}, "
+        f"domains={_struct.get('domains', 0)})"
     )
     try:
         idx = int(data.get("chosen_index"))
