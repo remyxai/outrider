@@ -1307,11 +1307,33 @@ def _scrub_outbound_payload(payload: Any, _path: str = "") -> None:
     if isinstance(payload, str):
         hits = _scan_for_secrets(payload)
         if hits:
+            # Diagnostic: log per-pattern match counts and lengths before
+            # raising. Lengths discriminate real-token matches (typically
+            # 40-100+ chars) from prose false positives (near the regex
+            # minimum — e.g. 32-40 chars on the bearer pattern). The
+            # matched content itself is never logged or included in the
+            # exception message; only the lengths leave the runner.
+            lengths_by_pattern: dict[str, list[int]] = {}
+            for name, pat in _OUTBOUND_SECRET_PATTERNS:
+                if name in hits:
+                    lengths_by_pattern[name] = [
+                        m.end() - m.start() for m in pat.finditer(payload)
+                    ]
+            detail = ", ".join(
+                f"{n}(lens={lengths_by_pattern[n]})" for n in hits
+            )
+            log.error(
+                f"outbound-payload scrubber matched at field {_path!r}: "
+                f"{detail}; refusing to send"
+            )
             raise OutboundSecretError(
                 f"Outbound payload field {_path!r} matched credential "
                 f"pattern(s) {hits}; refusing to send the API request. "
                 f"Investigate the body-assembly path before retrying — "
-                f"this is a leak-prevention abort, not a content issue."
+                f"this is a leak-prevention abort, not a content issue. "
+                f"See preceding log line for match lengths per pattern; "
+                f"a match length near the regex minimum often indicates "
+                f"a prose false positive vs. a real credential."
             )
         return
     if isinstance(payload, dict):

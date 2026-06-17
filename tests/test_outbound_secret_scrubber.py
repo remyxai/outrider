@@ -198,6 +198,96 @@ def test_outbound_secret_error_inherits_from_runtime_error():
 # ─── End-to-end: gh_api refuses to send a body containing a token ─
 
 
+# ─── Diagnostic logging (v1.6.8) ─────────────────────────────────
+
+
+def test_scrub_logs_pattern_lengths_before_raising(monkeypatch, caplog):
+    """When the scrubber raises, it must log the match lengths per
+    pattern at ERROR level so the operator can triage false positives
+    (typically near the regex minimum) vs. real tokens (40+ chars)."""
+    import logging
+    import run as run_module
+
+    body = {"body": f"see {_SYNTH_SK_ANT} for context"}
+    caplog.set_level(logging.ERROR, logger=run_module.log.name)
+    with pytest.raises(OutboundSecretError):
+        _scrub_outbound_payload(body)
+    # Diagnostic line should mention the field path, the pattern name,
+    # and the match lengths.
+    log_text = " ".join(r.message for r in caplog.records if r.levelno >= logging.ERROR)
+    assert "body" in log_text
+    assert "anthropic_api_key" in log_text
+    assert "lens=" in log_text
+
+
+def test_scrub_diagnostic_does_not_leak_match_content(monkeypatch, caplog):
+    """The diagnostic log line must contain ONLY pattern name + match
+    lengths — never the matched content. If the log itself leaked
+    secrets, the defense would propagate them further than the
+    original API call would have."""
+    import logging
+    import run as run_module
+
+    body = {"body": f"prefix {_SYNTH_SK_ANT} suffix"}
+    caplog.set_level(logging.ERROR, logger=run_module.log.name)
+    with pytest.raises(OutboundSecretError):
+        _scrub_outbound_payload(body)
+    log_text = " ".join(r.message for r in caplog.records if r.levelno >= logging.ERROR)
+    # The synthetic payload was many 'A's; no consecutive run of As
+    # should appear in the diagnostic.
+    assert "AAAA" not in log_text
+
+
+def test_scrub_diagnostic_distinguishes_multiple_pattern_hits(monkeypatch, caplog):
+    """When multiple patterns match (e.g. both github_token and
+    bearer_token in the same body), the diagnostic must report lengths
+    for each pattern separately — so the operator can see at a glance
+    which one was likely a false positive."""
+    import logging
+    import run as run_module
+
+    body = {"body": f"{_SYNTH_GHS} and {_SYNTH_BEARER}"}
+    caplog.set_level(logging.ERROR, logger=run_module.log.name)
+    with pytest.raises(OutboundSecretError):
+        _scrub_outbound_payload(body)
+    log_text = " ".join(r.message for r in caplog.records if r.levelno >= logging.ERROR)
+    assert "github_token" in log_text
+    assert "authorization_header" in log_text or "bearer_token" in log_text
+
+
+def test_scrub_diagnostic_reports_length_close_to_regex_minimum(monkeypatch, caplog):
+    """Prose false positives match near the regex minimum (e.g.
+    `Bearer <32-char-prose>`); real tokens are typically 40-100+
+    chars. The diagnostic length tells the two apart at a glance.
+    Verify the reported length matches the actual match length."""
+    import logging
+    import run as run_module
+
+    # Synthesize a minimum-length bearer match: "Bearer " + exactly 32 chars.
+    near_min = "Bearer " + ("A" * 32)
+    body = {"body": near_min}
+    caplog.set_level(logging.ERROR, logger=run_module.log.name)
+    with pytest.raises(OutboundSecretError):
+        _scrub_outbound_payload(body)
+    log_text = " ".join(r.message for r in caplog.records if r.levelno >= logging.ERROR)
+    # The full match includes "Bearer " + 32 As = 39 chars.
+    assert "lens=[39]" in log_text or "39" in log_text
+
+
+def test_exception_message_references_log_diagnostic(monkeypatch):
+    """The exception message itself should point the operator to the
+    preceding log line for length details — readers of the exception
+    alone (without log access) shouldn't have to guess where to look."""
+    body = {"body": _SYNTH_GHS}
+    with pytest.raises(OutboundSecretError) as excinfo:
+        _scrub_outbound_payload(body)
+    msg = str(excinfo.value)
+    assert "preceding log" in msg or "log line" in msg
+
+
+# ─── Existing gh_api end-to-end ──────────────────────────────────
+
+
 def test_gh_api_refuses_to_send_payload_with_anthropic_key(monkeypatch):
     """If a body with a leaked token reaches gh_api, the request must
     be aborted before any network call. urlopen would have to NOT be
