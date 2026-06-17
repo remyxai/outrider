@@ -4291,14 +4291,22 @@ def select_recommendation(
     # observed via eval that 15 is too tight on repos with zero open
     # Issues (the loop spends turns hunting context that doesn't exist).
     max_turns = int(os.environ.get("REMYX_SELECTION_MAX_TURNS", "25"))
-    # Wall-clock budget for the selection pass. Default 360s gives the
+    # Wall-clock budget for the selection pass. Default 480s gives the
     # agentic loop room for 20-25 verification turns including code
-    # searches + per-candidate contract checks; 180s was too tight after
-    # the v1.3.4 / v1.3.5 prompt extensions and caused selection to
-    # time out and fall back to the top-ranked candidate (observed on
-    # remyxai/VQASynth run #7 on 2026-06-04).
+    # searches + per-candidate contract checks. History:
+    #   - 180s was too tight after the v1.3.4 / v1.3.5 prompt extensions
+    #     (observed on remyxai/VQASynth run #7 on 2026-06-04).
+    #   - 360s held until v1.6.5 (CONTEXT.md orientation block) +
+    #     v1.6.6 (code-override carve-out) extended the prompt and
+    #     introduced extra per-candidate verification work; the
+    #     2026-06-17 remyxai/outrider self-dogfood run on a 34-candidate
+    #     pool hit the 360s ceiling and fell back to the top-ranked
+    #     candidate, losing the override mechanism.
+    # 480s preserves the same headroom-per-candidate ratio at the new
+    # prompt size; further bumps should track new feature land that
+    # extends the agent's per-candidate verification cost.
     if timeout_s is None:
-        timeout_s = int(os.environ.get("REMYX_SELECTION_TIMEOUT_S", "360"))
+        timeout_s = int(os.environ.get("REMYX_SELECTION_TIMEOUT_S", "480"))
     log.info(
         f"  → agentic selection over {len(candidates)} candidates "
         f"(max-turns={max_turns}, timeout={timeout_s}s)"
