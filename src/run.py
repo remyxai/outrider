@@ -1178,8 +1178,104 @@ def _github_token() -> str:
     return os.environ.get("GITHUB_TOKEN", "").strip()
 
 
+# Defense-in-depth: refuse to send any GitHub API body whose string
+# fields contain content matching known credential shapes (Anthropic
+# API keys, GitHub PAT/App/OAuth tokens, Remyx API keys, JWTs, Bearer
+# headers, env-var-style leaks). Outbound PR/Issue/Discussion bodies
+# get assembled from many upstream paths — agent self-review, test
+# stdout, pre-flight reasoning, file-fallback content — and a
+# regression in any of them could otherwise leak a secret into a
+# public repo via the GitHub API. Catching it at the API boundary is
+# the one place that covers every upstream variant.
+#
+# Fails closed: raises ``OutboundSecretError`` rather than scrubbing
+# in-place, because partial redaction risks letting variant token
+# shapes through. The exception message reports the JSON path and a
+# pattern identifier — never the matched secret itself.
+_OUTBOUND_SECRET_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("anthropic_api_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("github_token", re.compile(r"\bgh[psoaru]_[A-Za-z0-9]{20,}\b")),
+    ("github_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+    ("remyx_api_key", re.compile(r"\brmxu_[A-Za-z0-9_-]{20,}\b")),
+    (
+        "jwt",
+        re.compile(
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+        ),
+    ),
+    (
+        "authorization_header",
+        re.compile(r"(?i)Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{16,}"),
+    ),
+    ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_.-]{32,}")),
+    (
+        "env_var_leak",
+        re.compile(
+            r"\b(?:ANTHROPIC_API_KEY|REMYX_API_KEY|GITHUB_TOKEN|"
+            r"INPUT_GITHUB_TOKEN)\s*=\s*[A-Za-z0-9_.-]{16,}"
+        ),
+    ),
+)
+
+
+class OutboundSecretError(RuntimeError):
+    """A GitHub API call was refused because the request payload
+    matched credential patterns. Investigate the body-assembly path
+    (PR template, Issue body, GraphQL variables, comment text) before
+    retrying. The exception message includes only the JSON path and a
+    pattern identifier — never the actual matched secret."""
+
+
+def _scan_for_secrets(text: str) -> list[str]:
+    """Return pattern identifiers for any credential shapes found in
+    ``text``. Empty when clean. The actual matched secret is never
+    included in the return value, so a log message built from this
+    can't propagate the leaked credential further."""
+    if not text:
+        return []
+    hits: list[str] = []
+    for name, pat in _OUTBOUND_SECRET_PATTERNS:
+        if pat.search(text):
+            hits.append(name)
+    return hits
+
+
+def _scrub_outbound_payload(payload: Any, _path: str = "") -> None:
+    """Recursively scan ``payload`` for secret-shape strings and raise
+    ``OutboundSecretError`` if any are found. No-op for ``None``.
+
+    Used by ``gh_api`` and ``gh_graphql`` to refuse outbound requests
+    whose bodies contain content matching credential patterns. Fails
+    closed: the exception aborts the API call entirely rather than
+    silently redacting, so the operator must investigate the upstream
+    leak before the next request goes out."""
+    if payload is None:
+        return
+    if isinstance(payload, str):
+        hits = _scan_for_secrets(payload)
+        if hits:
+            raise OutboundSecretError(
+                f"Outbound payload field {_path!r} matched credential "
+                f"pattern(s) {hits}; refusing to send the API request. "
+                f"Investigate the body-assembly path before retrying — "
+                f"this is a leak-prevention abort, not a content issue."
+            )
+        return
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            child = f"{_path}.{k}" if _path else str(k)
+            _scrub_outbound_payload(v, child)
+        return
+    if isinstance(payload, list):
+        for i, v in enumerate(payload):
+            _scrub_outbound_payload(v, f"{_path}[{i}]")
+        return
+    # Numbers, bools, etc. pass through silently.
+
+
 def gh_api(method: str, path: str, body: dict | None = None) -> Any:
     """Minimal GitHub API wrapper."""
+    _scrub_outbound_payload(body)
     token = _github_token()
     if not token:
         raise RuntimeError(
@@ -1223,6 +1319,7 @@ def gh_graphql(
     token — used by the Discussion-post permission fallback. Returns the
     ``data`` object.
     """
+    _scrub_outbound_payload(variables)
     token = token or _github_token()
     if not token:
         raise RuntimeError(
