@@ -71,10 +71,24 @@ def test_whitelist_excludes_remyx_api_key():
     assert "REMYX_API_KEY" not in run._CLAUDE_ENV_WHITELIST
 
 
-def test_whitelist_excludes_github_token():
-    """The GitHub installation token is the bot's PR/Issue auth — needed
-    by the orchestrator (gh_api) but never by the agent's subprocess."""
-    assert "GITHUB_TOKEN" not in run._CLAUDE_ENV_WHITELIST
+def test_whitelist_includes_workflow_github_token():
+    """The workflow's built-in GITHUB_TOKEN is allowed through so the
+    selection-pass agent's `gh` CLI invocations can authenticate
+    (REMYX-131 Path B). Without it, the agent falls back to
+    unauthenticated GitHub API at 60 req/hr per shared runner IP and
+    can't view private-repo content. Trade-off justified by the
+    egress defenses (v1.6.4 scrubber + v1.6.8 diagnostic + v1.6.10
+    prompt redaction)."""
+    assert "GITHUB_TOKEN" in run._CLAUDE_ENV_WHITELIST
+
+
+def test_whitelist_excludes_bot_installation_token():
+    """The bot's installation token arrives via INPUT_GITHUB_TOKEN
+    (the orchestrator uses it for PR/Issue creation through gh_api).
+    The agent must NOT see this token — it's strictly more
+    privileged than the workflow built-in (cross-repo, write scopes
+    the bot was granted). Keeping it stripped preserves the
+    least-privilege principle even after restoring GITHUB_TOKEN."""
     assert "INPUT_GITHUB_TOKEN" not in run._CLAUDE_ENV_WHITELIST
 
 
@@ -90,14 +104,24 @@ def test_whitelist_excludes_action_inputs():
 
 
 def test_whitelist_excludes_github_metadata_vars():
-    """GITHUB_* identifies the runner, the actor, and ship history. These
-    aren't secrets per se but they don't belong in the agent's env either;
-    legitimate cases (repo identity) are passed through prompt context."""
+    """Most GITHUB_* vars identify the runner, the actor, and ship
+    history. They aren't secrets per se but they don't belong in the
+    agent's env either; legitimate cases (repo identity) are passed
+    through prompt context.
+
+    Two exceptions are allowed: ``GITHUB_ACTIONS`` (informational CI
+    sentinel) and ``GITHUB_TOKEN`` (workflow built-in token for the
+    agent's ``gh`` CLI verification tooling — see the
+    ``test_whitelist_includes_workflow_github_token`` test for the
+    rationale)."""
+    allowed_github_prefix = {"GITHUB_ACTIONS", "GITHUB_TOKEN"}
     for name in run._CLAUDE_ENV_WHITELIST:
-        assert not name.startswith("GITHUB_") or name == "GITHUB_ACTIONS", (
-            f"GITHUB_* var {name!r} in whitelist (other than GITHUB_ACTIONS "
-            f"sentinel) — these should be stripped"
-        )
+        if name.startswith("GITHUB_"):
+            assert name in allowed_github_prefix, (
+                f"GITHUB_* var {name!r} in whitelist (not one of the "
+                f"two intentional exceptions {allowed_github_prefix}) "
+                f"— these should be stripped"
+            )
 
 
 # ─── _claude_subprocess_env: builds the minimal env dict ─────────
@@ -111,8 +135,9 @@ def test_subprocess_env_returns_only_whitelisted(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     monkeypatch.setenv("HOME", "/home/runner")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_workflow_token")
     monkeypatch.setenv("REMYX_API_KEY", "rmxu_secret")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghs_secret")
+    monkeypatch.setenv("INPUT_GITHUB_TOKEN", "ghs_bot_installation_token")
     monkeypatch.setenv("INPUT_INTEREST_ID", "uuid-here")
     monkeypatch.setenv("RANDOM_UNRELATED_VAR", "should-not-appear")
 
@@ -122,10 +147,14 @@ def test_subprocess_env_returns_only_whitelisted(monkeypatch):
     assert env["ANTHROPIC_API_KEY"] == "sk-test-key"
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["HOME"] == "/home/runner"
+    # Workflow GITHUB_TOKEN is whitelisted for the agent's `gh` CLI auth
+    # (REMYX-131 Path B). The bot's installation token (via
+    # INPUT_GITHUB_TOKEN) stays stripped.
+    assert env["GITHUB_TOKEN"] == "ghs_workflow_token"
 
     # Forbidden vars absent.
     assert "REMYX_API_KEY" not in env
-    assert "GITHUB_TOKEN" not in env
+    assert "INPUT_GITHUB_TOKEN" not in env
     assert "INPUT_INTEREST_ID" not in env
 
     # Unknown vars absent (would-be-fine but shouldn't appear).
@@ -198,14 +227,20 @@ def test_run_claude_stream_passes_stripped_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(run.subprocess, "run", fake_run)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghs_should-not-leak")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_workflow_token")
+    monkeypatch.setenv("INPUT_GITHUB_TOKEN", "ghs_bot_installation_token")
     monkeypatch.setenv("INPUT_INTEREST_ID", "uuid")
 
     run._run_claude_stream(["claude"], "prompt", tmp_path, 60)
 
     assert captured["env"] is not None, "env= must be passed; got None"
     assert "ANTHROPIC_API_KEY" in captured["env"]
-    assert "GITHUB_TOKEN" not in captured["env"]
+    # Workflow GITHUB_TOKEN passes through for the agent's `gh` auth.
+    assert captured["env"]["GITHUB_TOKEN"] == "ghs_workflow_token"
+    # Bot installation token (via INPUT_GITHUB_TOKEN) and other INPUT_*
+    # action inputs stay stripped — they're strictly higher-privilege
+    # than the agent needs.
+    assert "INPUT_GITHUB_TOKEN" not in captured["env"]
     assert "INPUT_INTEREST_ID" not in captured["env"]
 
 
@@ -215,13 +250,20 @@ def test_run_claude_stream_passes_stripped_env(monkeypatch, tmp_path):
 def test_env_strip_complements_outbound_scrubber():
     """The env strip and the outbound scrubber are independent layers
     of defense — neither replaces the other. Verify both helpers
-    exist and the env strip doesn't accidentally include any of the
-    same secret patterns the scrubber catches at egress."""
+    exist and the env strip's TOKEN-shaped whitelist entries are
+    intentional (not accidental inclusions).
+
+    Two TOKEN-shaped entries are intentional:
+      - ANTHROPIC_API_KEY: the Claude CLI's auth requirement
+      - GITHUB_TOKEN: the workflow built-in for the agent's `gh` CLI
+        verification tooling (REMYX-131 Path B)
+    Any other TOKEN-shaped entry should be reviewed before landing."""
     assert hasattr(run, "_scrub_outbound_payload")
     assert hasattr(run, "_claude_subprocess_env")
-    # Sanity: the whitelist itself doesn't accidentally name something
-    # secret-shaped (would be a strange whitelist entry).
+    intentional_token_entries = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN"}
     for name in run._CLAUDE_ENV_WHITELIST:
-        assert "TOKEN" not in name.upper() or name == "ANTHROPIC_API_KEY", (
-            f"Whitelist entry {name!r} looks token-shaped — review"
-        )
+        if "TOKEN" in name.upper() or "KEY" in name.upper():
+            assert name in intentional_token_entries, (
+                f"Whitelist entry {name!r} looks token-shaped but isn't on "
+                f"the intentional list {intentional_token_entries} — review"
+            )

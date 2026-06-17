@@ -3650,10 +3650,12 @@ def _record_claude_usage(env: dict) -> None:
 # inherits whatever env we pass; if we passed `os.environ` verbatim, the
 # agent's tool calls (Bash, `printenv`, `git config --list`, `curl -v`)
 # could echo secrets the parent runner holds — REMYX_API_KEY,
-# GITHUB_TOKEN / INPUT_GITHUB_TOKEN, INPUT_* action inputs, GITHUB_ACTOR,
-# etc. Stripping at the launch boundary stops secrets from entering the
-# agent's context in the first place; pairs with v1.6.4's outbound-body
-# scrubber (which catches secrets at egress).
+# INPUT_GITHUB_TOKEN (the bot's installation token), INPUT_* action
+# inputs, GITHUB_ACTOR, etc. Stripping at the launch boundary stops
+# those from entering the agent's context in the first place; pairs
+# with v1.6.4's outbound-body scrubber (catches secrets at egress),
+# v1.6.8's per-pattern diagnostic logging, and v1.6.10's narrow
+# prompt-level redaction rules.
 #
 # Whitelist contains only what the CLI legitimately needs:
 #   - Auth: ANTHROPIC_API_KEY (required), plus optional ANTHROPIC_BASE_URL
@@ -3663,6 +3665,34 @@ def _record_claude_usage(env: dict) -> None:
 #   - Temp dirs: TMPDIR / TMP / TEMP
 #   - XDG paths for the CLI's per-user state
 #   - CI sentinels (CI, GITHUB_ACTIONS) — informational, carry no secrets
+#   - GitHub auth for the agent's `gh` CLI verification tools — see
+#     REMYX-131 / Path B below
+#
+# GITHUB_TOKEN (the workflow's built-in runner token, NOT the bot's
+# installation token) is included so the selection-pass agent's `gh`
+# CLI invocations (gh code-search, gh issue list, gh api repos/.../
+# contents/..., gh issue view) can authenticate. Without it, the agent
+# falls back to unauthenticated GitHub API at 60 req/hr per shared
+# runner IP and can't view private-repo content at all — observed
+# verification-quality degradation in the 2026-06-17 v1.6.10 dispatch
+# whose selection_reasoning explicitly noted "Search and issue tools
+# are unauthenticated here."
+#
+# Trade-off: the workflow GITHUB_TOKEN is repo-scoped (the agent
+# can't reach other repos with it) but its scope is set by the
+# workflow's `permissions:` block, which currently includes
+# `pull-requests: write` / `issues: write`. That's broader than
+# read-only verification needs, and the leak vector is real if the
+# agent echoes the value verbatim. We accept the trade-off because
+# the egress defenses landed in v1.6.4 / v1.6.8 / v1.6.10 catch the
+# echo at multiple layers, and the bot's installation token (via
+# INPUT_GITHUB_TOKEN) stays stripped — the agent never sees the
+# higher-privilege cross-repo token the orchestrator uses for PR /
+# Issue creation.
+#
+# REMYX-131 Path A (engine-side scoped read-only token mint) is the
+# principled long-term fix; this whitelist entry is the Path B fast
+# unblock pending that work.
 #
 # If a Claude CLI feature legitimately requires a new env var, add it
 # explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
@@ -3689,6 +3719,11 @@ _CLAUDE_ENV_WHITELIST: tuple[str, ...] = (
     "XDG_CACHE_HOME",
     "CI",
     "GITHUB_ACTIONS",
+    # Workflow built-in token — repo-scoped — for the agent's `gh`
+    # verification tooling. NOT the bot's installation token (that
+    # arrives via INPUT_GITHUB_TOKEN, which stays stripped). See the
+    # comment block above for the trade-off rationale.
+    "GITHUB_TOKEN",
 )
 
 
