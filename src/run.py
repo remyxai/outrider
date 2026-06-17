@@ -527,6 +527,29 @@ Route to ISSUE only if any of these is likely true of THAT scoped slice:
 
 Otherwise route to PR.
 
+NEVER include token-shaped strings in any JSON field — the JSON you
+write here flows verbatim into a public-repo PR or Issue body, and a
+credential pattern in that body aborts the run via the outbound
+scrubber. Specifically:
+
+  - If a tool result contains an `Authorization:` header (e.g. from
+    `curl -v`, `wget -d`, or any HTTP-debug output), do not quote the
+    header verbatim. Describe what the call did instead.
+  - If `git config --list` or a similar command exposes
+    `http.https://github.com/.extraheader`, do not include the value
+    in any field.
+  - Do not run `env`, `printenv`, or `cat` against any `.env`,
+    `credentials*`, or `*.key` file. If you happen to see such content
+    in tool output, do not quote it.
+  - If any string in any tool result looks like a credential (starts
+    with `sk-ant-`, `ghp_`, `ghs_`, `gho_`, `gha_`, `github_pat_`, or
+    `rmxu_`; or matches `Bearer` followed by 32+ random characters),
+    replace it with `[REDACTED]` before including any surrounding
+    context in your output.
+
+Honest summarization of what tools did is fine and encouraged; only
+verbatim quotes of headers / env values / tokens are forbidden.
+
 Output a single JSON object. Start with `{` and end with `}`. No
 Markdown fences, no prose before or after. Schema:
 
@@ -953,6 +976,29 @@ a CLI, an existing module) now invokes your new code, set is_orphan=false.
 Separately, list under scoped_out the parts of the paper you deliberately
 left for later (e.g. a trainer/model the repo can't host) — you are not
 required to reproduce the paper's full method, only to deliver its result.
+
+NEVER include token-shaped strings in any JSON field — the JSON you
+write here flows verbatim into a public-repo PR or Issue body, and a
+credential pattern in that body aborts the run via the outbound
+scrubber. Specifically:
+
+  - If a tool result contains an `Authorization:` header (e.g. from
+    `curl -v`, `wget -d`, or any HTTP-debug output), do not quote the
+    header verbatim. Describe what the call did instead.
+  - If `git config --list` or a similar command exposes
+    `http.https://github.com/.extraheader`, do not include the value
+    in any field.
+  - Do not run `env`, `printenv`, or `cat` against any `.env`,
+    `credentials*`, or `*.key` file. If you happen to see such content
+    in tool output, do not quote it.
+  - If any string in any tool result looks like a credential (starts
+    with `sk-ant-`, `ghp_`, `ghs_`, `gho_`, `gha_`, `github_pat_`, or
+    `rmxu_`; or matches `Bearer` followed by 32+ random characters),
+    replace it with `[REDACTED]` before including any surrounding
+    context in your output.
+
+Honest summarization of what tools did is fine and encouraged; only
+verbatim quotes of headers / env values / tokens are forbidden.
 
 --- Diff ---
 
