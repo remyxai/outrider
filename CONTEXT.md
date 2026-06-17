@@ -1,3 +1,9 @@
+---
+type: project_context
+description: Active investigation areas, stable architecture, and out-of-scope boundaries for the Outrider Action.
+tags: [outrider, ai-coding-agent, github-action]
+---
+
 # CONTEXT.md
 
 ## What this file is

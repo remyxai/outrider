@@ -204,6 +204,14 @@ CANONICAL_ATTRIBUTION_URL = "https://engine.remyx.ai"
 ISSUE_FALLBACK_FILENAME = f"{BUNDLE_DIR_NAME}/OPEN_AS_ISSUE.md"
 
 _SPEC_MD_TEMPLATE = """\
+---
+type: implementation_spec
+arxiv_id: {arxiv_id}
+arxiv_url: https://arxiv.org/abs/{arxiv_id}
+tier: {tier}
+relevance_score: {relevance_score:.2f}
+---
+
 # Implementation spec — drafted by Remyx Recommendation
 
 **Recommended paper**: [{paper_title}](https://arxiv.org/abs/{arxiv_id})
@@ -234,6 +242,12 @@ _SPEC_MD_TEMPLATE = """\
 """
 
 _PAPER_MD_TEMPLATE = """\
+---
+type: paper
+arxiv_id: {arxiv_id}
+arxiv_url: https://arxiv.org/abs/{arxiv_id}
+---
+
 # {paper_title}
 
 arxiv: https://arxiv.org/abs/{arxiv_id}
@@ -244,6 +258,11 @@ arxiv: https://arxiv.org/abs/{arxiv_id}
 """
 
 _CONTEXT_MD_TEMPLATE = """\
+---
+type: team_history
+description: Recent shipping history from the team's experiment trajectory.
+---
+
 # Team's recent shipping history
 
 These are experiments the team has actually shipped — ground your
@@ -255,6 +274,11 @@ existing iteration_chain or starts a new one.
 """
 
 _GUARDRAILS_MD_TEMPLATE = """\
+---
+type: path_guardrails
+description: Path allowlist + blocked paths for the implementation pass.
+---
+
 # Path guardrails for this PR
 
 You MAY create files matching:
@@ -278,6 +302,11 @@ set, the PR is rejected and your work is not committed.
 """
 
 _ORIENTATION_MD_TEMPLATE = """\
+---
+type: repo_orientation
+description: Target-repo conventions — contributor guides, PR template, lint config, verification stack, nearby files.
+---
+
 # Repo orientation — conventions and patterns for this target repo
 
 The orchestrator already read the target repo's convention-defining files
@@ -317,6 +346,11 @@ couldn't read it (rare; surface in your summary if so).
 """
 
 _INVOCATION_MD_TEMPLATE = """\
+---
+type: agent_invocation
+description: Headless prompt for the Claude Code CLI invocation.
+---
+
 You are a coding agent implementing a recommendation from the Remyx
 Recommendation pipeline (attribution URL: {attribution_url}).
 
