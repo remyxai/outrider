@@ -27,10 +27,11 @@ from run import Target  # noqa: E402
 # ─── _orient_contributor_guides ───────────────────────────────────────────
 
 
-def test_contributor_guides_reads_all_three(tmp_path: Path) -> None:
+def test_contributor_guides_reads_all_four(tmp_path: Path) -> None:
     (tmp_path / "CLAUDE.md").write_text("# Claude Guide\nUse the verification stack.\n")
     (tmp_path / "AGENTS.md").write_text("# Agents Guide\nFollow these rules.\n")
     (tmp_path / "CONTRIBUTING.md").write_text("# Contributing\nWelcome contributors.\n")
+    (tmp_path / "CONTEXT.md").write_text("# Context\nActive investigation areas.\n")
 
     body = run._orient_contributor_guides(tmp_path)
 
@@ -40,6 +41,46 @@ def test_contributor_guides_reads_all_three(tmp_path: Path) -> None:
     assert "Follow these rules." in body
     assert "`CONTRIBUTING.md`" in body
     assert "Welcome contributors." in body
+    assert "`CONTEXT.md`" in body
+    assert "Active investigation areas." in body
+
+
+def test_contributor_guides_reads_context_md_alone(tmp_path: Path) -> None:
+    """A repo that ships only CONTEXT.md (no CLAUDE.md / AGENTS.md /
+    CONTRIBUTING.md) still gets its team-direction signal into the
+    orientation block. Targets the lessons-from-CONTEXT.md case: the
+    file types the orientation pass surfaces shouldn't gate each other."""
+    (tmp_path / "CONTEXT.md").write_text(
+        "# Outrider CONTEXT.md\nActive investigation areas: …\n"
+    )
+
+    body = run._orient_contributor_guides(tmp_path)
+
+    assert "`CONTEXT.md`" in body
+    assert "Active investigation areas" in body
+    # No other files present → only the CONTEXT.md block.
+    assert "`CLAUDE.md`" not in body
+    assert "`AGENTS.md`" not in body
+    assert "`CONTRIBUTING.md`" not in body
+
+
+def test_contributor_guides_precedence_order(tmp_path: Path) -> None:
+    """When all four files exist, output order is the precedence order:
+    CLAUDE.md → AGENTS.md → CONTRIBUTING.md → CONTEXT.md. Stable order
+    matters so the agent's context-window position for the most-specific
+    guide is consistent across runs."""
+    (tmp_path / "CLAUDE.md").write_text("claude")
+    (tmp_path / "AGENTS.md").write_text("agents")
+    (tmp_path / "CONTRIBUTING.md").write_text("contributing")
+    (tmp_path / "CONTEXT.md").write_text("context")
+
+    body = run._orient_contributor_guides(tmp_path)
+
+    pos_claude = body.index("`CLAUDE.md`")
+    pos_agents = body.index("`AGENTS.md`")
+    pos_contrib = body.index("`CONTRIBUTING.md`")
+    pos_context = body.index("`CONTEXT.md`")
+    assert pos_claude < pos_agents < pos_contrib < pos_context
 
 
 def test_contributor_guides_returns_empty_when_none_present(tmp_path: Path) -> None:

@@ -3013,9 +3013,18 @@ def detect_package_name(workdir: Path) -> str:
 
 
 def _orient_contributor_guides(workdir: Path, cap: int = 3000) -> str:
-    """Read contributor-guide files; concatenate and truncate to ``cap``."""
+    """Read contributor-guide files; concatenate and truncate to ``cap``.
+
+    Includes ``CONTEXT.md`` for repos that ship it: it carries
+    team-direction signal (active investigation areas, stable
+    architecture, out-of-scope boundaries) that the implementation
+    pass can use alongside style-shaped guides like ``CLAUDE.md`` and
+    ``AGENTS.md``. Order is precedence-from-most-specific: per-agent
+    files first, then generic agentic conventions, then human
+    contributor docs, then team-direction context.
+    """
     chunks: list[str] = []
-    for name in ("CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"):
+    for name in ("CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md", "CONTEXT.md"):
         path = workdir / name
         if not path.is_file():
             continue
