@@ -74,6 +74,7 @@ from exploration_structure import (
     exploration_structure_from_events,
     structure_enabled,
 )
+from instruction_files import render_instruction_files
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -3084,30 +3085,23 @@ def detect_package_name(workdir: Path) -> str:
 
 
 def _orient_contributor_guides(workdir: Path, cap: int = 3000) -> str:
-    """Read contributor-guide files; concatenate and truncate to ``cap``.
+    """Read the canonical agent-instruction files; concatenate, truncate to ``cap``.
 
-    Includes ``CONTEXT.md`` for repos that ship it: it carries
-    team-direction signal (active investigation areas, stable
-    architecture, out-of-scope boundaries) that the implementation
-    pass can use alongside style-shaped guides like ``CLAUDE.md`` and
-    ``AGENTS.md``. Order is precedence-from-most-specific: per-agent
-    files first, then generic agentic conventions, then human
-    contributor docs, then team-direction context.
+    Covers the full canonical set documented by the Instructions-as-Code
+    study and the major coding-agent vendors — per-agent files
+    (``CLAUDE.md``, ``AGENTS.md``, ``.cursorrules``,
+    ``.github/copilot-instructions.md``), then human contributor docs
+    (``CONTRIBUTING.md``), then team-direction context (``CONTEXT.md``,
+    which carries active investigation areas, stable architecture, and
+    out-of-scope boundaries). Order is precedence-from-most-specific so the
+    agent's context-window position for each guide is stable across runs.
+    Each chunk is annotated with a structural-signal line (length + section
+    count), the dimension the study found predictive of merge-rate gains.
+
+    Delegates to :mod:`instruction_files`; repos without these files are
+    unaffected (empty string out).
     """
-    chunks: list[str] = []
-    for name in ("CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md", "CONTEXT.md"):
-        path = workdir / name
-        if not path.is_file():
-            continue
-        try:
-            body = path.read_text(errors="replace").strip()
-        except OSError:
-            continue
-        if not body:
-            continue
-        snippet = body[:cap] + ("\n…[truncated]" if len(body) > cap else "")
-        chunks.append(f"### `{name}`\n\n{snippet}")
-    return "\n\n".join(chunks)
+    return render_instruction_files(workdir, cap=cap)
 
 
 def _orient_pr_template(workdir: Path, cap: int = 2000) -> str:
