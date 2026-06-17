@@ -96,8 +96,13 @@ def test_coverage_counts_and_ratio():
 
 def test_coverage_empty_transcript():
     cov = run._selection_coverage_from_events([])
-    assert cov == {"searches": 0, "file_reads": 0, "visible_lines": 0,
-                   "search_to_read_ratio": 0.0}
+    # The exploration-structure dimension rides along; assert the count/ratio
+    # core directly and the structure shape separately.
+    assert cov["searches"] == 0
+    assert cov["file_reads"] == 0
+    assert cov["visible_lines"] == 0
+    assert cov["search_to_read_ratio"] == 0.0
+    assert cov["exploration_structure"]["structure"] == "none"
 
 
 def test_coverage_result_lines_only_for_reads():
