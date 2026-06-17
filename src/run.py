@@ -3523,6 +3523,68 @@ def _record_claude_usage(env: dict) -> None:
     )
 
 
+# Subprocess env whitelist for Claude Code invocations. The Claude CLI
+# inherits whatever env we pass; if we passed `os.environ` verbatim, the
+# agent's tool calls (Bash, `printenv`, `git config --list`, `curl -v`)
+# could echo secrets the parent runner holds — REMYX_API_KEY,
+# GITHUB_TOKEN / INPUT_GITHUB_TOKEN, INPUT_* action inputs, GITHUB_ACTOR,
+# etc. Stripping at the launch boundary stops secrets from entering the
+# agent's context in the first place; pairs with v1.6.4's outbound-body
+# scrubber (which catches secrets at egress).
+#
+# Whitelist contains only what the CLI legitimately needs:
+#   - Auth: ANTHROPIC_API_KEY (required), plus optional ANTHROPIC_BASE_URL
+#     / ANTHROPIC_MODEL for routing / model overrides
+#   - System: PATH / HOME / USER / LOGNAME / TERM
+#   - Locale: LANG / LC_*
+#   - Temp dirs: TMPDIR / TMP / TEMP
+#   - XDG paths for the CLI's per-user state
+#   - CI sentinels (CI, GITHUB_ACTIONS) — informational, carry no secrets
+#
+# If a Claude CLI feature legitimately requires a new env var, add it
+# explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
+# wildcards — future Anthropic env vars may carry telemetry tokens the
+# agent shouldn't see verbatim.
+_CLAUDE_ENV_WHITELIST: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "CI",
+    "GITHUB_ACTIONS",
+)
+
+
+def _claude_subprocess_env() -> dict[str, str]:
+    """Build the env dict for Claude CLI subprocess invocations.
+
+    Returns a minimal whitelist of the parent env, stripping every var
+    not on ``_CLAUDE_ENV_WHITELIST``. Defense in depth at the launch
+    boundary — the v1.6.4 outbound-body scrubber catches secrets at
+    egress; this stops them from entering the agent's context at all.
+    """
+    env: dict[str, str] = {}
+    for name in _CLAUDE_ENV_WHITELIST:
+        v = os.environ.get(name)
+        if v is not None:
+            env[name] = v
+    return env
+
+
 def _run_claude_json(
     cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
 ) -> tuple[bool, str]:
@@ -3538,7 +3600,8 @@ def _run_claude_json(
     cmd = [*cmd_prefix, "--output-format", "json", "-p", prompt]
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+            cmd, cwd=cwd, env=_claude_subprocess_env(),
+            capture_output=True, text=True, timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
         return False, f"claude CLI timed out after {timeout_s}s"
@@ -3585,7 +3648,8 @@ def _run_claude_stream(
            "-p", prompt]
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+            cmd, cwd=cwd, env=_claude_subprocess_env(),
+            capture_output=True, text=True, timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
         return False, f"claude CLI timed out after {timeout_s}s", []
