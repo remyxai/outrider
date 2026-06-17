@@ -141,7 +141,8 @@ outputs:
       "skipped_low_confidence" | "skipped_open_artifact" |
       "skipped_issues_disabled" | "skipped_pr_exists" |
       "skipped_issue_exists" | "skipped_test_failure" | "claude_failed" |
-      "rejected_path_violations" | "error". In weekly-summary mode:
+      "rejected_path_violations" | "aborted_secret_in_payload" |
+      "error". In weekly-summary mode:
       "weekly_summary_posted" | "weekly_summary_skipped_no_discussion_id" |
       "weekly_summary_failed".
     value: ${{ steps.recommend.outputs.status }}

@@ -1002,7 +1002,16 @@ TEST_INTEGRATION_POLICIES = ("strict", "soft", "off")
 # outcome. `claude_failed` used to exit 0, so a run that produced no PR/Issue
 # looked green; it now fails visibly. `weekly_summary_failed` is the
 # weekly-summary mode's analog: a run that posted nothing should be red.
-FAILURE_EXIT_STATUSES = {"error", "claude_failed", "weekly_summary_failed"}
+FAILURE_EXIT_STATUSES = {
+    "error",
+    "claude_failed",
+    "weekly_summary_failed",
+    # Outbound credential-scrubber abort. Not a graceful skip — the
+    # operator needs to investigate the body-assembly path (whatever
+    # upstream content produced credential-shaped text). Surfaces red
+    # in CI rather than silently green so the signal isn't lost.
+    "aborted_secret_in_payload",
+}
 
 
 class IssuesDisabledError(RuntimeError):
@@ -1277,7 +1286,23 @@ class OutboundSecretError(RuntimeError):
     matched credential patterns. Investigate the body-assembly path
     (PR template, Issue body, GraphQL variables, comment text) before
     retrying. The exception message includes only the JSON path and a
-    pattern identifier — never the actual matched secret."""
+    pattern identifier — never the actual matched secret.
+
+    Structured attrs (``path`` and ``patterns``) let ``process_target``
+    route the abort to the dedicated ``aborted_secret_in_payload``
+    status and surface the diagnostic in step-summary + run telemetry
+    without parsing the message string."""
+
+    def __init__(
+        self,
+        msg: str,
+        *,
+        path: str = "",
+        patterns: list[str] | None = None,
+    ) -> None:
+        super().__init__(msg)
+        self.path = path
+        self.patterns = patterns or []
 
 
 def _scan_for_secrets(text: str) -> list[str]:
@@ -1334,7 +1359,9 @@ def _scrub_outbound_payload(payload: Any, _path: str = "") -> None:
                 f"this is a leak-prevention abort, not a content issue. "
                 f"See preceding log line for match lengths per pattern; "
                 f"a match length near the regex minimum often indicates "
-                f"a prose false positive vs. a real credential."
+                f"a prose false positive vs. a real credential.",
+                path=_path,
+                patterns=hits,
             )
         return
     if isinstance(payload, dict):
@@ -6737,6 +6764,28 @@ def process_target(target: Target) -> dict:
         result["error"] = str(e)
         return result
 
+    except OutboundSecretError as e:
+        # The v1.6.4 outbound-body scrubber fired — assembled PR / Issue /
+        # comment body contained content matching credential patterns,
+        # and the API request was refused at gh_api before any data left
+        # the runner. Route to the dedicated `aborted_secret_in_payload`
+        # status (in FAILURE_EXIT_STATUSES → red in CI) so the operator
+        # sees this as a real abort requiring investigation, not a
+        # graceful skip. Surface the path + matched-pattern identifiers
+        # in the result so step_summary + run telemetry can render the
+        # diagnostic without parsing the message string. Match content
+        # itself is never propagated — only path + pattern names + the
+        # length diagnostic emitted by `_scrub_outbound_payload`.
+        log.error(
+            f"  ↪ outbound-secret-scrubber aborted the request at "
+            f"field {e.path!r} (patterns={e.patterns})"
+        )
+        result["status"] = "aborted_secret_in_payload"
+        result["error"] = str(e)
+        result["scrubber_path"] = e.path
+        result["scrubber_patterns"] = e.patterns
+        return result
+
     finally:
         # Clean up tmpdir unless DEBUG_KEEP_WORKDIR set
         if not os.environ.get("DEBUG_KEEP_WORKDIR"):
@@ -8262,6 +8311,7 @@ def _write_step_summary(result: dict) -> None:
         "claude_failed":           "❌",
         "rejected_path_violations":"❌",
         "error":                   "❌",
+        "aborted_secret_in_payload": "🛑",
         "weekly_summary_posted":   "🟢",
         "weekly_summary_skipped_no_discussion_id": "⏭️",
         "weekly_summary_failed":   "❌",
@@ -8418,6 +8468,36 @@ def _write_step_summary(result: dict) -> None:
             log_tail=result.get("claude_log_tail") or "",
             claude_calls=claude_calls,
         ))
+
+    if status == "aborted_secret_in_payload":
+        scrubber_path = result.get("scrubber_path") or "(unknown)"
+        scrubber_patterns = result.get("scrubber_patterns") or []
+        patterns_str = (
+            ", ".join(f"`{p}`" for p in scrubber_patterns)
+            if scrubber_patterns else "(unspecified)"
+        )
+        lines.append("\n### 🛑 Outbound credential-scrubber fired\n")
+        lines.append(
+            f"The assembled payload included content matching credential "
+            f"patterns ({patterns_str}) in field `{scrubber_path}`. The API "
+            f"request was aborted at the runner — no body left the host. "
+            f"This is leak-prevention, not a content issue.\n"
+        )
+        lines.append(
+            "**To investigate**: check the run logs above for the "
+            "`outbound-payload scrubber matched` line, which lists "
+            "per-pattern match lengths.\n"
+        )
+        lines.append(
+            "* A match length near the regex minimum (32–40 chars for the "
+            "bearer pattern) typically indicates a prose false positive — "
+            "tighten the pattern or fix the body-assembly path producing "
+            "the matching text.\n"
+            "* A match length of 40+ chars typically indicates a real "
+            "credential. Identify which upstream (agent self-review, test "
+            "stdout, pre-flight reasoning) produced it and add a redaction "
+            "or env-strip there.\n"
+        )
 
     if err:
         lines.append("\n**Error**\n")
