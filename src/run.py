@@ -777,6 +777,42 @@ Recovery strategies for missing/broken links (apply BEFORE concluding
     document the failed lookups in `reasoning` and reject the
     candidate rather than burning the turn budget guessing.
 
+**Overriding the no-code penalty.** When a candidate has no code link
+(license class `no-code-link`, compat 0.30) you MAY still pick it if
+ALL THREE conditions hold:
+
+  1. **Method is conceptually self-contained.** The abstract and any
+     method-section text in the candidate brief contain enough detail
+     that a competent implementer could reproduce the contribution
+     without reference code. Empirical / analytical papers proposing a
+     classification scheme, signal, or measurement typically qualify;
+     complex algorithmic methods (novel attention variants, kernel
+     tricks, training recipes with non-obvious hyperparameters)
+     typically do not.
+
+  2. **Verified existing call site with a clear contract match.** Same
+     bar as a code-bearing addition — locate the existing function /
+     module the new code would integrate into and confirm the I/O
+     contract aligns.
+
+  3. **Integration shape is `addition` or `simplification`, NOT
+     `replacement` or `extension`.** Replacement touches code already
+     in production, where the bar for borrowing from a no-code paper
+     is much higher. Extension lacks a call site at all — combining
+     "no code" + "no anchoring call site" is speculation, not a
+     contract-anchored override.
+
+When all three hold, set `chosen_index` to the candidate, classify the
+shape, AND populate the new `code_override_justification` field with a
+1-2 sentence audit trail explaining WHY this specific paper's method
+is self-contained enough to implement from its description. The
+override fires only when justification is explicit — lazy
+justifications ("method is clear enough" without specifics about
+which scheme/signal/measurement is being ported) are not durable and
+will be reviewed downstream. When the no-code candidate does NOT meet
+all three conditions, reject it in `rejected[]` with the standard
+reason; the override is a narrow carve-out, not a general permission.
+
 Stop iterating once you have enough evidence to pick (verified one
 candidate fits one of the three shapes) OR to reject all (every
 candidate has a structural mismatch). Don't burn turns on diminishing
@@ -835,6 +871,19 @@ fences, no prose before or after. Schema:
                             torchtune/training/quantization/_quantize.py
                             hosts the bit-allocation step the paper
                             extends'>",
+  "code_override_justification": "<OPTIONAL: REQUIRED when the chosen
+                                   candidate has license_class=`no-code-link`
+                                   (compat 0.30) AND you are picking it as
+                                   `addition` or `simplification` per the
+                                   override carve-out documented above.
+                                   1-2 sentences naming the specific
+                                   self-contained signal/scheme/measurement
+                                   being ported and why it does not need
+                                   reference code to disambiguate. Omit
+                                   when the chosen candidate has a code
+                                   link, when chosen_index < 0, or when
+                                   the integration_shape is `replacement`
+                                   or `extension`.>",
   "reasoning": "<2-3 sentences: why this candidate's contribution maps
                  cleanly onto the verified call site (addition) or why
                  the contract match is clean (replacement /
@@ -4313,6 +4362,50 @@ def select_recommendation(
             f"  selection: extension pick — direction signal: {tds[:100]!r}, "
             f"adjacent call site: {pcs[:80]!r}"
         )
+    # Code-override audit (Path B from REMYX-130): when the chosen
+    # candidate has no code link (compat <= 0.30) AND the agent
+    # populated code_override_justification, validate the override is
+    # restricted to the eligible archetypes (addition / simplification)
+    # per the prompt contract. If the agent overrode for replacement
+    # or extension, the override is invalid — fall back to skip rather
+    # than silently allowing a no-code pick in an archetype where the
+    # bar should be higher.
+    #
+    # When the override is empty AND the candidate is no-code, the
+    # current behavior holds — the agent is expected to either justify
+    # explicitly via this field or reject in `rejected[]`. We don't
+    # auto-fail no-code picks without an explicit justification field;
+    # this is the carve-out path, not a hard requirement.
+    override_just = (data.get("code_override_justification") or "").strip()
+    # Normalize: drop empty / whitespace-only justification so downstream
+    # consumers don't have to treat "field present but blank" as a special
+    # case. Same effect as the field being absent.
+    if "code_override_justification" in data and not override_just:
+        data.pop("code_override_justification", None)
+    if idx >= 0 and 0 <= idx < len(candidates) and override_just:
+        cand_compat = getattr(candidates[idx], "license_compat", 1.0)
+        if cand_compat > 0.3:
+            log.warning(
+                f"  selection: code_override_justification set on a "
+                f"candidate with code link (compat={cand_compat:.2f}); "
+                f"justification ignored — override only applies to "
+                f"no-code-link candidates"
+            )
+            data.pop("code_override_justification", None)
+        elif shape not in ("addition", "simplification"):
+            log.warning(
+                f"  selection: code_override_justification set but "
+                f"integration_shape={shape!r} (must be addition or "
+                f"simplification); rejecting override"
+            )
+            data["chosen_index"] = -1
+            return data
+        else:
+            log.info(
+                f"  selection: code-override fired — archetype={shape}, "
+                f"justification={override_just[:160]!r}"
+            )
+
     # Agentic selection may surface an out-of-pool candidate via
     # broadening-search (chosen_index: -2). Validate the required
     # external_* fields are present; if they're missing, the agent
@@ -5886,6 +5979,16 @@ def process_target(target: Target) -> dict:
                 if "selection_context_efficiency" in selection:
                     result["selection_context_efficiency"] = (
                         selection["selection_context_efficiency"]
+                    )
+                # Code-override audit field (REMYX-130 Path B) — attached
+                # once before the branch logic so every downstream path
+                # (in-pool, extension, external, skip) carries it. Field
+                # is only set when the agent populated and validated it
+                # (`select_recommendation` drops it on contract violations
+                # and on non-no-code candidates).
+                if selection.get("code_override_justification"):
+                    result["selection_code_override_justification"] = (
+                        selection["code_override_justification"]
                     )
             if selection is not None and selection.get("chosen_index") == -1:
                 # Agentic selection rejected every candidate after verification
