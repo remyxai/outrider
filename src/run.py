@@ -5937,13 +5937,33 @@ def _open_downgrade_issue(
 def _enrich_selection_rejected(
     raw: list, viable: "list[Recommendation]"
 ) -> list[dict]:
-    """Map selection-pass `{index, why}` entries to `{arxiv_id, title, reason}`
-    using the viable-candidates list as the index target.
+    """Map selection-pass `{index, why}` entries to structured per-paper
+    rejection records using the viable-candidates list as the index target.
+
+    Each enriched entry carries:
+
+      - ``arxiv_id`` — paper identity (engine resolves additional metadata)
+      - ``title`` — for the local step-summary renderer
+      - ``reason`` — free-form one-line agent rationale (rich enough for
+        downstream LLM-classification or embedding-based clustering)
+      - ``license_class`` — the candidate's license classification at run
+        time (``permissive`` / ``copyleft`` / ``nc`` / ``missing`` /
+        ``no-code-link`` / ``unknown``). Structured so cross-customer
+        analysis can measure "rejection rate by license_class" without
+        parsing prose
+      - ``license_compat`` — float in [0, 1] from the same per-paper
+        classifier; pairs with ``license_class`` for finer slicing
 
     Used by both the happy-path (chosen_index ≥ 0) and the all-rejected path
     (chosen_index = -1) so downstream consumers (the $GITHUB_STEP_SUMMARY
-    renderer, any external tooling parsing the result dict) get
-    self-describing entries.
+    renderer, the engine-side ``recommendation_runs`` telemetry, any
+    external tooling parsing the result dict) get self-describing entries.
+
+    The license fields are the empirically-load-bearing axis identified by
+    the REMYX-101 cross-portfolio sprint (21 of 25 high-tier rejected
+    candidates were ``no-code-link``). Including them in the per-rejected
+    record makes that signal queryable at engine scale rather than only
+    visible in the per-run step summary.
     """
     enriched = []
     for r in raw:
@@ -5954,14 +5974,55 @@ def _enrich_selection_rejected(
                 "arxiv_id": cand.arxiv_id,
                 "title": cand.paper_title,
                 "reason": r.get("why", ""),
+                "license_class": cand.license_class,
+                "license_compat": cand.license_compat,
             })
         else:
             enriched.append({
                 "arxiv_id": "",
                 "title": "(candidate index out of range)",
                 "reason": r.get("why", ""),
+                "license_class": "unknown",
+                "license_compat": 0.0,
             })
     return enriched
+
+
+def _compact_selection_rejected_for_telemetry(
+    enriched: list[dict] | None,
+    max_entries: int = 50,
+    max_reason_chars: int = 300,
+) -> list[dict] | None:
+    """Compact projection of ``_enrich_selection_rejected``'s output for
+    the engine-side telemetry payload (``recommendation_runs.selection_rejected``).
+
+    Differences from the local step-summary representation:
+
+      - ``title`` is dropped — engine resolves paper metadata by
+        ``arxiv_id``, no need to duplicate per-run
+      - ``reason`` is truncated to ``max_reason_chars`` to keep the
+        payload bounded even on runs that produce 30+ rejections with
+        rich rationales
+      - Top-level list is capped at ``max_entries`` defensively (the
+        agent's max-turns ceiling makes >30 rejections rare, but a
+        misbehaving model could in principle emit a much larger list)
+
+    Returns ``None`` when no rejections were captured, so the engine
+    can distinguish "rejection list was empty" from "rejection list
+    wasn't shipped this version" via the column being null vs ``[]``.
+    """
+    if not enriched:
+        return None
+    compact = []
+    for entry in enriched[:max_entries]:
+        reason = (entry.get("reason") or "")[:max_reason_chars]
+        compact.append({
+            "arxiv_id": entry.get("arxiv_id", ""),
+            "license_class": entry.get("license_class", "unknown"),
+            "license_compat": entry.get("license_compat", 0.0),
+            "reason": reason,
+        })
+    return compact
 
 
 def _resolve_external_candidate(selection: dict) -> "Recommendation | None":
@@ -8675,6 +8736,17 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "selection_integration_shape": result.get("selection_integration_shape"),
         "selection_coverage": result.get("selection_coverage"),
         "selection_context_efficiency": result.get("selection_context_efficiency"),
+        # Per-rejected-candidate structured rationale. Engine-side
+        # ``recommendation_runs.selection_rejected`` (JSONB) accumulates
+        # these for cross-customer analysis: baseline code-availability
+        # rate, per-(paper, customer) rejection patterns, deeper-research
+        # prioritization (REMYX-7 / REMYX-100 / REMYX-105). Title is
+        # omitted from the wire payload — engine resolves it from
+        # ``arxiv_id``; per-rejection reason is truncated to keep payload
+        # bounded on rich runs.
+        "selection_rejected": _compact_selection_rejected_for_telemetry(
+            result.get("selection_rejected")
+        ),
         "cost_usd": result.get("cost_usd"),
         "input_tokens": result.get("input_tokens"),
         "output_tokens": result.get("output_tokens"),
