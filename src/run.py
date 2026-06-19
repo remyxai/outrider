@@ -6025,6 +6025,32 @@ def _compact_selection_rejected_for_telemetry(
     return compact
 
 
+def _candidate_enrichment(candidates: "list[Recommendation]") -> list[dict]:
+    """Per-candidate code/model/license metadata for the run-telemetry payload.
+
+    Lets the recommendation service fill gaps in a paper's stored metadata from
+    what this run resolved. ``license_compat`` is omitted on purpose: it's
+    scored relative to the target repository, not a property of the paper.
+    Only candidates with a resolved code/model URL or license are included, to
+    keep the payload small.
+    """
+    out = []
+    for c in candidates:
+        if not c.arxiv_id:
+            continue
+        if not (c.paper_github_url or c.paper_huggingface_url or c.paper_license):
+            continue
+        out.append({
+            "arxiv_id": c.arxiv_id,
+            "github": c.paper_github_url or "",
+            "huggingface": c.paper_huggingface_url or "",
+            "paper_license": c.paper_license or "",
+            "license_source": c.license_source or "",
+            "license_class": c.license_class or "",
+        })
+    return out
+
+
 def _resolve_external_candidate(selection: dict) -> "Recommendation | None":
     """Construct a synthetic Recommendation from the selection pass's
     external_* fields. Used when chosen_index = -2 — selection surfaced
@@ -6229,6 +6255,10 @@ def process_target(target: Target) -> dict:
              f"(dropped {dropped_low_conf} low-confidence, "
              f"{dropped_pr_exists} open PRs, "
              f"{dropped_issue_exists} prior Issues)")
+
+    # Per-candidate code/model/license metadata for the run-telemetry payload.
+    # Set once here (viable is final) so every return path carries it.
+    result["candidate_enrichment"] = _candidate_enrichment(viable)
 
     # 4. Workdir + selection. Clone first (the selection pass needs the
     #    repo's module layout), then let Claude pick the candidate most
@@ -8732,6 +8762,7 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "candidates_considered": result.get("candidates_considered"),
         "refine_queries": result.get("refine_queries"),
         "license_class_counts": result.get("license_class_counts"),
+        "candidate_enrichment": result.get("candidate_enrichment"),
         "selection_reasoning_excerpt": reasoning[:2048] or None,
         "selection_integration_shape": result.get("selection_integration_shape"),
         "selection_coverage": result.get("selection_coverage"),
