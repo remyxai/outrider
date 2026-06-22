@@ -3895,7 +3895,16 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     if max_turns:
         cmd += ["--max-turns", max_turns]
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
-    return ok, text[-4000:]   # last 4KB for log brevity
+    if not ok:
+        # The returned `text` is tail-truncated downstream (telemetry keeps
+        # only the last ~1KB), which can clip the CLI's real failure cause.
+        # Emit the full output to the action log here — CI captures stdout
+        # untruncated — so the complete error (e.g. usage limit / credit
+        # balance) is always recoverable from the run logs.
+        log.error(
+            "Claude Code implementation call failed — full output:\n%s", text
+        )
+    return ok, text[-4000:]   # last 4KB retained for the telemetry log tail
 
 
 # ─── Pre-flight routing + self-review (§4, §6) ─────────────────────────────
