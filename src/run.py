@@ -2557,8 +2557,8 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
     a lower-ranked candidate is a clean drop-in. Returning the full pool
     lets ``select_recommendation`` pick the most implementable candidate.
 
-    See ``GET /api/v1.0/papers/recommended`` in remyxai/remyx
-    (engine/app/api/papers.py).
+    Backed by the Remyx engine's ``GET /api/v1.0/papers/recommended``
+    endpoint.
     """
     if not target.interest_id:
         raise RuntimeError(
@@ -3666,7 +3666,7 @@ def _record_claude_usage(env: dict) -> None:
 #   - XDG paths for the CLI's per-user state
 #   - CI sentinels (CI, GITHUB_ACTIONS) — informational, carry no secrets
 #   - GitHub auth for the agent's `gh` CLI verification tools — see
-#     REMYX-131 / Path B below
+#     the note below
 #
 # GITHUB_TOKEN (the workflow's built-in runner token, NOT the bot's
 # installation token) is included so the selection-pass agent's `gh`
@@ -3690,9 +3690,9 @@ def _record_claude_usage(env: dict) -> None:
 # higher-privilege cross-repo token the orchestrator uses for PR /
 # Issue creation.
 #
-# REMYX-131 Path A (engine-side scoped read-only token mint) is the
-# principled long-term fix; this whitelist entry is the Path B fast
-# unblock pending that work.
+# An engine-side scoped read-only token mint is the principled
+# long-term fix; this whitelist entry is the fast unblock pending
+# that work.
 #
 # If a Claude CLI feature legitimately requires a new env var, add it
 # explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
@@ -4629,7 +4629,7 @@ def select_recommendation(
             f"  selection: extension pick — direction signal: {tds[:100]!r}, "
             f"adjacent call site: {pcs[:80]!r}"
         )
-    # Code-override audit (Path B from REMYX-130): when the chosen
+    # Code-override audit: when the chosen
     # candidate has no code link (compat <= 0.30) AND the agent
     # populated code_override_justification, validate the override is
     # restricted to the eligible archetypes (addition / simplification)
@@ -5997,7 +5997,7 @@ def _enrich_selection_rejected(
     external tooling parsing the result dict) get self-describing entries.
 
     The license fields are the empirically-load-bearing axis identified by
-    the REMYX-101 cross-portfolio sprint (21 of 25 high-tier rejected
+    cross-portfolio analysis (21 of 25 high-tier rejected
     candidates were ``no-code-link``). Including them in the per-rejected
     record makes that signal queryable at engine scale rather than only
     visible in the per-run step summary.
@@ -6338,7 +6338,7 @@ def process_target(target: Target) -> dict:
                     result["selection_context_efficiency"] = (
                         selection["selection_context_efficiency"]
                     )
-                # Code-override audit field (REMYX-130 Path B) — attached
+                # Code-override audit field — attached
                 # once before the branch logic so every downstream path
                 # (in-pool, extension, external, skip) carries it. Field
                 # is only set when the agent populated and validated it
@@ -8808,7 +8808,7 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         # ``recommendation_runs.selection_rejected`` (JSONB) accumulates
         # these for cross-customer analysis: baseline code-availability
         # rate, per-(paper, customer) rejection patterns, deeper-research
-        # prioritization (REMYX-7 / REMYX-100 / REMYX-105). Title is
+        # prioritization. Title is
         # omitted from the wire payload — engine resolves it from
         # ``arxiv_id``; per-rejection reason is truncated to keep payload
         # bounded on rich runs.

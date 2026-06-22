@@ -215,7 +215,7 @@ def test_run_reexports_scorer_and_threshold():
     assert run.DIFF_RISK_ISSUE_THRESHOLD == diff_risk_score.DIFF_RISK_ISSUE_THRESHOLD
 
 
-# ── branch-vs-base mode (REMYX-107 calibration harness) ────────────────────
+# ── branch-vs-base mode (calibration harness) ──────────────────────────────
 
 
 def test_branch_vs_base_mode_scores_committed_diff():

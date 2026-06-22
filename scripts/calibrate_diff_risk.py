@@ -3,7 +3,7 @@
 
 Scores every `remyx-recommendation/*` branch in the local clone against its
 merge-base with `origin/main`, producing a Markdown table the maintainer can
-qualitatively review (REMYX-107 step 2). No customer impact; runs entirely
+qualitatively review. No customer impact; runs entirely
 against Outrider's own git history.
 
 Usage (from the repo root):

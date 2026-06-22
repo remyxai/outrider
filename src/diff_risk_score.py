@@ -120,7 +120,7 @@ def _is_critical(path: str) -> bool:
 #
 # The default mode (base_ref=None) reads from the working tree vs HEAD —
 # Outrider's runtime case where Claude Code's changes are uncommitted. For
-# scoring historical PR branches (REMYX-107 calibration), we instead want
+# scoring historical PR branches (calibration), we instead want
 # the diff between the branch HEAD and its merge-base with main, so the
 # helpers below switch to that comparison when a base_ref is supplied.
 
@@ -319,7 +319,7 @@ def score_diff_risk(
     Default mode (``base_ref=None``): scores the working-tree diff vs HEAD —
     Outrider's runtime case. Branch-vs-base mode (``base_ref`` is a SHA / ref
     name): scores HEAD vs ``base_ref`` — used to retrospectively score
-    historical PR branches against their merge-base (REMYX-107 calibration).
+    historical PR branches against their merge-base (calibration).
 
     Returns a :class:`DiffRisk` whose ``band`` drives the orchestrator's
     risk-aware routing. Pure function of the static diff — no Claude call,

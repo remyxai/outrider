@@ -1,4 +1,4 @@
-"""Tests for the OutboundSecretError telemetry path (REMYX-129 Follow-up 3).
+"""Tests for the OutboundSecretError telemetry path.
 
 When the v1.6.4 outbound-body scrubber fires, the orchestrator routes
 the abort to the dedicated ``aborted_secret_in_payload`` status:

@@ -1,4 +1,4 @@
-"""Tests for the selection_rejected telemetry plumbing (REMYX-133).
+"""Tests for the selection_rejected telemetry plumbing.
 
 The selection-pass produces a per-rejected-candidate list with rich
 free-form rejection rationale. Before this work the data was only
@@ -13,7 +13,7 @@ This module ships:
   1. ``_enrich_selection_rejected`` carries ``license_class`` and
      ``license_compat`` alongside the existing arxiv_id / title /
      reason. These are the empirically load-bearing axis identified
-     by the REMYX-101 cross-portfolio sprint.
+     by cross-portfolio analysis.
   2. ``_compact_selection_rejected_for_telemetry`` produces a wire
      projection: drops ``title`` (engine resolves from arxiv_id),
      truncates ``reason`` to keep payload bounded, caps the list
@@ -234,7 +234,7 @@ def test_compact_no_payload_bloat_on_typical_run():
 
 def test_telemetry_payload_includes_selection_rejected(monkeypatch, tmp_path):
     """The engine-side telemetry POST must include the compacted
-    rejection list. The whole point of REMYX-133 is making this data
+    rejection list. The whole point of this plumbing is making this data
     queryable on engine; if the payload doesn't carry it, all the
     upstream enrichment is wasted."""
     captured = {}
