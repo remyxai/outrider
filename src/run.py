@@ -3743,6 +3743,36 @@ def _claude_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _format_agent_cli_failure(
+    tool: str, returncode: int, stdout: str, stderr: str
+) -> str:
+    """Build an agent-CLI failure diagnostic that puts the real cause where it
+    survives truncation.
+
+    Provider-agnostic: ``tool`` is the CLI's program name (``claude`` today;
+    Aider / Goose / Codex / Copilot as they land), used only for labeling. On
+    a hard reject (usage limit, credit balance, auth) the agent CLI exits fast
+    with the cause on **stderr** and either nothing or a partial, unparseable
+    JSON fragment on stdout. Callers tail-slice this string
+    (``invoke_claude_code`` keeps the last 4KB, the orchestrator stores the
+    last 1KB into ``claude_log_tail``), so the stderr must land at the *end*
+    to survive truncation — otherwise bulky stdout crowds it out and the log
+    tail shows noise instead of the error.
+    """
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
+    parts = [f"[{tool} exited {returncode}, no JSON envelope parsed]"]
+    if stdout:
+        # stdout is usually noise / a partial fragment here; cap its head so
+        # it can't push the stderr out of the caller's tail-slice window.
+        head = stdout[:500]
+        if len(stdout) > 500:
+            head += " …(truncated)"
+        parts.append(f"--- STDOUT (head) ---\n{head}")
+    parts.append("--- STDERR ---\n" + (stderr or "(empty)"))
+    return "\n".join(parts)
+
+
 def _run_claude_json(
     cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
 ) -> tuple[bool, str]:
@@ -3775,14 +3805,18 @@ def _run_claude_json(
         _record_claude_usage(env)
         text = env.get("result") or ""
         is_error = bool(env.get("is_error")) or proc.returncode != 0
-        if not text and proc.stderr:
-            text = proc.stderr
+        # On error, always append the CLI stderr — the envelope's `result`
+        # often omits the operational cause (e.g. usage limit) that stderr
+        # carries. Skip if stderr is already echoed inside `result`.
+        if is_error and proc.stderr and proc.stderr.strip() not in text:
+            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
         return (not is_error), text
-    # Envelope didn't parse — preserve old behavior, no usage recorded.
-    output = (proc.stdout or "") + (
-        "\n--- STDERR ---\n" + proc.stderr if proc.stderr else ""
+    # Envelope didn't parse — surface the CLI's exit code and stderr so the
+    # real failure cause reaches `claude_log_tail`. No usage recorded (no
+    # envelope to account).
+    return proc.returncode == 0, _format_agent_cli_failure(
+        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
     )
-    return proc.returncode == 0, output
 
 
 def _run_claude_stream(
@@ -3832,14 +3866,17 @@ def _run_claude_stream(
         _record_claude_usage(final)
         text = final.get("result") or ""
         is_error = bool(final.get("is_error")) or proc.returncode != 0
-        if not text and proc.stderr:
-            text = proc.stderr
+        # On error, always append the CLI stderr — the result event's text
+        # often omits the operational cause (e.g. usage limit) that stderr
+        # carries. Skip if stderr is already echoed inside the result text.
+        if is_error and proc.stderr and proc.stderr.strip() not in text:
+            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
         return (not is_error), text, events
-    # No terminal result event — preserve a usable failure signal.
-    output = (proc.stdout or "") + (
-        "\n--- STDERR ---\n" + proc.stderr if proc.stderr else ""
-    )
-    return proc.returncode == 0, output, events
+    # No terminal result event — surface exit code + stderr so the real
+    # failure cause reaches `claude_log_tail`.
+    return proc.returncode == 0, _format_agent_cli_failure(
+        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
+    ), events
 
 
 def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
