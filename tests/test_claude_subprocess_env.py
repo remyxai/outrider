@@ -1,4 +1,4 @@
-"""Tests for the Claude CLI subprocess env whitelist (REMYX-129 Follow-up 2).
+"""Tests for the Claude CLI subprocess env whitelist.
 
 The Claude CLI subprocess inherits whatever env we pass it. If we pass
 the parent runner's ``os.environ`` verbatim, the agent's Bash tool can
@@ -73,8 +73,8 @@ def test_whitelist_excludes_remyx_api_key():
 
 def test_whitelist_includes_workflow_github_token():
     """The workflow's built-in GITHUB_TOKEN is allowed through so the
-    selection-pass agent's `gh` CLI invocations can authenticate
-    (REMYX-131 Path B). Without it, the agent falls back to
+    selection-pass agent's `gh` CLI invocations can authenticate.
+    Without it, the agent falls back to
     unauthenticated GitHub API at 60 req/hr per shared runner IP and
     can't view private-repo content. Trade-off justified by the
     egress defenses (v1.6.4 scrubber + v1.6.8 diagnostic + v1.6.10
@@ -147,9 +147,8 @@ def test_subprocess_env_returns_only_whitelisted(monkeypatch):
     assert env["ANTHROPIC_API_KEY"] == "sk-test-key"
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["HOME"] == "/home/runner"
-    # Workflow GITHUB_TOKEN is whitelisted for the agent's `gh` CLI auth
-    # (REMYX-131 Path B). The bot's installation token (via
-    # INPUT_GITHUB_TOKEN) stays stripped.
+    # Workflow GITHUB_TOKEN is whitelisted for the agent's `gh` CLI auth.
+    # The bot's installation token (via INPUT_GITHUB_TOKEN) stays stripped.
     assert env["GITHUB_TOKEN"] == "ghs_workflow_token"
 
     # Forbidden vars absent.
@@ -256,7 +255,7 @@ def test_env_strip_complements_outbound_scrubber():
     Two TOKEN-shaped entries are intentional:
       - ANTHROPIC_API_KEY: the Claude CLI's auth requirement
       - GITHUB_TOKEN: the workflow built-in for the agent's `gh` CLI
-        verification tooling (REMYX-131 Path B)
+        verification tooling
     Any other TOKEN-shaped entry should be reviewed before landing."""
     assert hasattr(run, "_scrub_outbound_payload")
     assert hasattr(run, "_claude_subprocess_env")

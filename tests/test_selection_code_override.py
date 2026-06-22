@@ -1,4 +1,4 @@
-"""Tests for the code-override carve-out in the selection-pass (REMYX-130 Path B).
+"""Tests for the code-override carve-out in the selection-pass.
 
 The override lets the selection-pass agent pick a `no-code-link` candidate
 (``license_compat <= 0.30``) under three conditions:

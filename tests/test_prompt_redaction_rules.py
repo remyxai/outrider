@@ -1,4 +1,4 @@
-"""Tests for the narrow redaction rules in the self-review + pre-flight prompts (REMYX-129 Follow-up 1).
+"""Tests for the narrow redaction rules in the self-review + pre-flight prompts.
 
 The self-review and pre-flight one-shot passes produce JSON whose
 fields flow verbatim into the PR / Issue body. If those fields

@@ -148,7 +148,7 @@ def test_renders_above_cost_line(tmp_path, monkeypatch):
     assert out.index("Why this selection") < out.index("Cost & tokens")
 
 
-# ── claude_failed rendering (REMYX-106) ────────────────────────────────────
+# ── claude_failed rendering ─────────────────────────────────────────────────
 
 
 def test_step_summary_credit_balance_renders_topup_section(tmp_path, monkeypatch):

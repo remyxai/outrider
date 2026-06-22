@@ -2557,8 +2557,8 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
     a lower-ranked candidate is a clean drop-in. Returning the full pool
     lets ``select_recommendation`` pick the most implementable candidate.
 
-    See ``GET /api/v1.0/papers/recommended`` in remyxai/remyx
-    (engine/app/api/papers.py).
+    Backed by the Remyx engine's ``GET /api/v1.0/papers/recommended``
+    endpoint.
     """
     if not target.interest_id:
         raise RuntimeError(
@@ -3666,7 +3666,7 @@ def _record_claude_usage(env: dict) -> None:
 #   - XDG paths for the CLI's per-user state
 #   - CI sentinels (CI, GITHUB_ACTIONS) — informational, carry no secrets
 #   - GitHub auth for the agent's `gh` CLI verification tools — see
-#     REMYX-131 / Path B below
+#     the note below
 #
 # GITHUB_TOKEN (the workflow's built-in runner token, NOT the bot's
 # installation token) is included so the selection-pass agent's `gh`
@@ -3690,9 +3690,9 @@ def _record_claude_usage(env: dict) -> None:
 # higher-privilege cross-repo token the orchestrator uses for PR /
 # Issue creation.
 #
-# REMYX-131 Path A (engine-side scoped read-only token mint) is the
-# principled long-term fix; this whitelist entry is the Path B fast
-# unblock pending that work.
+# An engine-side scoped read-only token mint is the principled
+# long-term fix; this whitelist entry is the fast unblock pending
+# that work.
 #
 # If a Claude CLI feature legitimately requires a new env var, add it
 # explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
@@ -3743,6 +3743,36 @@ def _claude_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _format_agent_cli_failure(
+    tool: str, returncode: int, stdout: str, stderr: str
+) -> str:
+    """Build an agent-CLI failure diagnostic that puts the real cause where it
+    survives truncation.
+
+    Provider-agnostic: ``tool`` is the CLI's program name (``claude`` today;
+    Aider / Goose / Codex / Copilot as they land), used only for labeling. On
+    a hard reject (usage limit, credit balance, auth) the agent CLI exits fast
+    with the cause on **stderr** and either nothing or a partial, unparseable
+    JSON fragment on stdout. Callers tail-slice this string
+    (``invoke_claude_code`` keeps the last 4KB, the orchestrator stores the
+    last 1KB into ``claude_log_tail``), so the stderr must land at the *end*
+    to survive truncation — otherwise bulky stdout crowds it out and the log
+    tail shows noise instead of the error.
+    """
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
+    parts = [f"[{tool} exited {returncode}, no JSON envelope parsed]"]
+    if stdout:
+        # stdout is usually noise / a partial fragment here; cap its head so
+        # it can't push the stderr out of the caller's tail-slice window.
+        head = stdout[:500]
+        if len(stdout) > 500:
+            head += " …(truncated)"
+        parts.append(f"--- STDOUT (head) ---\n{head}")
+    parts.append("--- STDERR ---\n" + (stderr or "(empty)"))
+    return "\n".join(parts)
+
+
 def _run_claude_json(
     cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
 ) -> tuple[bool, str]:
@@ -3775,14 +3805,18 @@ def _run_claude_json(
         _record_claude_usage(env)
         text = env.get("result") or ""
         is_error = bool(env.get("is_error")) or proc.returncode != 0
-        if not text and proc.stderr:
-            text = proc.stderr
+        # On error, always append the CLI stderr — the envelope's `result`
+        # often omits the operational cause (e.g. usage limit) that stderr
+        # carries. Skip if stderr is already echoed inside `result`.
+        if is_error and proc.stderr and proc.stderr.strip() not in text:
+            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
         return (not is_error), text
-    # Envelope didn't parse — preserve old behavior, no usage recorded.
-    output = (proc.stdout or "") + (
-        "\n--- STDERR ---\n" + proc.stderr if proc.stderr else ""
+    # Envelope didn't parse — surface the CLI's exit code and stderr so the
+    # real failure cause reaches `claude_log_tail`. No usage recorded (no
+    # envelope to account).
+    return proc.returncode == 0, _format_agent_cli_failure(
+        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
     )
-    return proc.returncode == 0, output
 
 
 def _run_claude_stream(
@@ -3832,14 +3866,17 @@ def _run_claude_stream(
         _record_claude_usage(final)
         text = final.get("result") or ""
         is_error = bool(final.get("is_error")) or proc.returncode != 0
-        if not text and proc.stderr:
-            text = proc.stderr
+        # On error, always append the CLI stderr — the result event's text
+        # often omits the operational cause (e.g. usage limit) that stderr
+        # carries. Skip if stderr is already echoed inside the result text.
+        if is_error and proc.stderr and proc.stderr.strip() not in text:
+            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
         return (not is_error), text, events
-    # No terminal result event — preserve a usable failure signal.
-    output = (proc.stdout or "") + (
-        "\n--- STDERR ---\n" + proc.stderr if proc.stderr else ""
-    )
-    return proc.returncode == 0, output, events
+    # No terminal result event — surface exit code + stderr so the real
+    # failure cause reaches `claude_log_tail`.
+    return proc.returncode == 0, _format_agent_cli_failure(
+        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
+    ), events
 
 
 def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
@@ -3858,7 +3895,16 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     if max_turns:
         cmd += ["--max-turns", max_turns]
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
-    return ok, text[-4000:]   # last 4KB for log brevity
+    if not ok:
+        # The returned `text` is tail-truncated downstream (telemetry keeps
+        # only the last ~1KB), which can clip the CLI's real failure cause.
+        # Emit the full output to the action log here — CI captures stdout
+        # untruncated — so the complete error (e.g. usage limit / credit
+        # balance) is always recoverable from the run logs.
+        log.error(
+            "Claude Code implementation call failed — full output:\n%s", text
+        )
+    return ok, text[-4000:]   # last 4KB retained for the telemetry log tail
 
 
 # ─── Pre-flight routing + self-review (§4, §6) ─────────────────────────────
@@ -4592,7 +4638,7 @@ def select_recommendation(
             f"  selection: extension pick — direction signal: {tds[:100]!r}, "
             f"adjacent call site: {pcs[:80]!r}"
         )
-    # Code-override audit (Path B from REMYX-130): when the chosen
+    # Code-override audit: when the chosen
     # candidate has no code link (compat <= 0.30) AND the agent
     # populated code_override_justification, validate the override is
     # restricted to the eligible archetypes (addition / simplification)
@@ -5960,7 +6006,7 @@ def _enrich_selection_rejected(
     external tooling parsing the result dict) get self-describing entries.
 
     The license fields are the empirically-load-bearing axis identified by
-    the REMYX-101 cross-portfolio sprint (21 of 25 high-tier rejected
+    cross-portfolio analysis (21 of 25 high-tier rejected
     candidates were ``no-code-link``). Including them in the per-rejected
     record makes that signal queryable at engine scale rather than only
     visible in the per-run step summary.
@@ -6301,7 +6347,7 @@ def process_target(target: Target) -> dict:
                     result["selection_context_efficiency"] = (
                         selection["selection_context_efficiency"]
                     )
-                # Code-override audit field (REMYX-130 Path B) — attached
+                # Code-override audit field — attached
                 # once before the branch logic so every downstream path
                 # (in-pool, extension, external, skip) carries it. Field
                 # is only set when the agent populated and validated it
@@ -8771,7 +8817,7 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         # ``recommendation_runs.selection_rejected`` (JSONB) accumulates
         # these for cross-customer analysis: baseline code-availability
         # rate, per-(paper, customer) rejection patterns, deeper-research
-        # prioritization (REMYX-7 / REMYX-100 / REMYX-105). Title is
+        # prioritization. Title is
         # omitted from the wire payload — engine resolves it from
         # ``arxiv_id``; per-rejection reason is truncated to keep payload
         # bounded on rich runs.
