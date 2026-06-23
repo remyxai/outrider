@@ -3879,6 +3879,26 @@ def _run_claude_stream(
     ), events
 
 
+def _strip_leading_frontmatter(text: str) -> str:
+    """Strip a leading YAML frontmatter block (``---`` … ``---``) from ``text``.
+
+    INVOCATION.md carries OKF-conformant YAML frontmatter — metadata for the
+    file, not instructions for the agent. The file is passed verbatim as the
+    Claude CLI's ``-p`` value, and the CLI's option parser reads a leading
+    ``---`` as an unknown flag (``error: unknown option '---'``), hard-failing
+    the call in ~0.2s before any work runs. Send only the instruction body so
+    the prompt never opens with a token the parser mistakes for an option.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        return text
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\r\n") == "---":
+            return "".join(lines[i + 1:]).lstrip("\n")
+    # No closing fence — not a frontmatter block; leave untouched.
+    return text
+
+
 def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     """Invoke the Claude Code CLI in headless mode with the workdir as context.
 
@@ -3888,7 +3908,9 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     ``REMYX_CLAUDE_MAX_TURNS`` (optional) caps the agent's tool-use turns to
     bound cost; unset means no cap (avoids truncating legitimate work).
     """
-    invocation = (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
+    invocation = _strip_leading_frontmatter(
+        (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
+    )
     log.info(f"  → invoking Claude Code (timeout={timeout_s}s) in {workdir}")
     cmd = ["claude", "--dangerously-skip-permissions"]
     max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
