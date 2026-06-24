@@ -8467,24 +8467,21 @@ def run_weekly_summary(target: Target) -> dict:
     return result
 
 
-# ─── Refinement-pass: Phase A (fidelity audit) ─────────────────────────────
+# ─── Refinement-pass: fidelity audit ───────────────────────────────────────
 #
-# REMYX-140 Phase A. Triggered by the `outrider:draft` label on a remyx-ai[bot]
-# PR: diffs the PR's added/modified code against the paper's reference impl,
-# produces a structured Coverage matrix (covered / deferred / deviation) and
-# appends it to the PR body as a ``## Coverage`` section. Optionally patches
-# obviously-mechanical paper-faithful fixes (constant values, missing variant
-# flags) via a Claude Code agentic session and force-pushes.
+# Triggered by the `outrider:draft` label on a remyx-ai[bot] PR: diffs the
+# PR's added/modified code against the paper's reference impl, produces a
+# structured Coverage matrix (covered / deferred / deviation) and appends it
+# to the PR body as a ``## Coverage`` section.
 #
 # Inputs (workflow surface):
-#   INPUT_PR_NUMBER  — PR number to audit (set by workflow from
-#                      ``${{ github.event.pull_request.number }}``)
+#   INPUT_PR_NUMBER  — PR number to audit (set by the workflow from the
+#                      pull_request event payload)
 #
-# Output (action surface):
+# Output:
 #   - PR body updated with ``## Coverage`` section
 #   - Label transition: outrider:draft → outrider:fidelity-done
 #                                       or  outrider:needs-judgment
-#                                       (if any item flagged needs-judgment)
 #   - status: fidelity_audited / fidelity_skipped_* / fidelity_failed_*
 
 FIDELITY_COVERAGE_SECTION_HEADER = "## Coverage"
@@ -8493,8 +8490,9 @@ FIDELITY_LABEL_DONE = "outrider:fidelity-done"
 FIDELITY_LABEL_NEEDS_JUDGMENT = "outrider:needs-judgment"
 
 _REF_REPO_URL_RE = re.compile(
-    r"https?://github\.com/([\w.-]+/[\w.-]+?)(?:/tree/[\w.-]+)?"
-    r"(?:/blob/[\w./_-]+)?(?:[/#?][\w./?=&%#-]*)?",
+    # Greedy on owner/repo. Trailing path (/blob/..., /tree/..., #anchor,
+    # ?query) is not captured.
+    r"https?://github\.com/([\w.-]+/[\w.-]+)",
     re.IGNORECASE,
 )
 
@@ -8504,31 +8502,35 @@ _ARXIV_URL_RE = re.compile(
 )
 
 
-def _extract_reference_url_from_pr_body(body: str) -> tuple[str, str]:
-    """Pull out (arxiv_id, reference_repo_url) from an Outrider PR body.
+def _extract_reference_url_from_pr_body(
+    body: str, target_repo: str = ""
+) -> tuple[str, str]:
+    """Pull out (arxiv_id, reference_repo_url) from a PR body.
 
-    Outrider PR bodies of the shape produced by ``build_pr_body`` and the
-    similar axolotl/TRL templates have both a paper link
+    PR bodies in the supported templates carry both a paper link
     (``https://arxiv.org/abs/<id>``) and a reference-impl link
     (``https://github.com/<owner>/<repo>[/blob/...]``) embedded in the
     Description section. Either may be absent. Returns ``("", "")`` for
-    anything that can't be parsed; the caller decides how to proceed.
+    anything that can't be parsed.
 
-    The reference URL is normalised to the ``owner/repo`` clone URL
-    (``https://github.com/<owner>/<repo>``) — the file-specific suffix is
-    preserved separately if the caller needs a file path anchor (e.g., for
-    the Coverage matrix's reference_location field).
+    The reference URL is normalised to the ``owner/repo`` clone URL —
+    the file-specific suffix is preserved separately if the caller
+    needs a file-path anchor.
+
+    Self-references (URLs pointing at the same owner as the target
+    repo, e.g. the bot's footer attribution) are skipped; the caller's
+    intent is to locate the *upstream* paper's reference impl.
     """
     arxiv_id = ""
     m = _ARXIV_URL_RE.search(body or "")
     if m:
         arxiv_id = m.group(1)
-    # Pick the first github.com URL that isn't a remyxai/* internal link
-    # (those are footer attribution, not reference impl).
+    target_owner = target_repo.split("/", 1)[0].lower() if target_repo else ""
     reference_url = ""
     for m in _REF_REPO_URL_RE.finditer(body or ""):
         owner_repo = m.group(1)
-        if owner_repo.startswith("remyxai/") or owner_repo.startswith("smellslikeml/"):
+        owner = owner_repo.split("/", 1)[0].lower()
+        if target_owner and owner == target_owner:
             continue
         reference_url = f"https://github.com/{owner_repo}"
         break
@@ -8545,12 +8547,17 @@ def _clone_reference_repo(url: str, workdir: Path) -> tuple[bool, Path | None, s
     if ref_dir.exists():
         shutil.rmtree(ref_dir)
     log.info(f"  → cloning reference {url} to {ref_dir}")
+    # GIT_TERMINAL_PROMPT=0 fails fast on any auth prompt instead of
+    # hanging the runner; public repos clone without credentials, and a
+    # private ref isn't supported by this mode.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
         subprocess.run(
             ["git", "clone", "--depth", "1", url, str(ref_dir)],
             check=True,
             capture_output=True,
             timeout=180,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return False, None, f"clone timed out for {url}"
@@ -8783,8 +8790,8 @@ def _remove_pr_label(target: Target, pr_number: int, label: str) -> None:
 
 
 def run_fidelity_audit(target: Target) -> dict:
-    """REMYX-140 Phase A — diff a remyx-ai[bot] PR against its reference
-    impl, post a Coverage matrix to the PR body, and transition labels.
+    """Diff a remyx-ai[bot] PR against its paper's reference impl, post
+    a Coverage matrix to the PR body, and transition labels.
 
     The PR number is read from ``INPUT_PR_NUMBER`` (set by the
     workflow's ``pull_request`` event payload). The reference URL is
@@ -8839,7 +8846,7 @@ def run_fidelity_audit(target: Target) -> dict:
 
     body = pr.get("body") or ""
     title = pr.get("title") or ""
-    arxiv_id, reference_url = _extract_reference_url_from_pr_body(body)
+    arxiv_id, reference_url = _extract_reference_url_from_pr_body(body, target.repo)
     if not reference_url:
         result["status"] = "fidelity_skipped_no_reference"
         result["error"] = "no reference URL extracted from PR body"
