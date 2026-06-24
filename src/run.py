@@ -8467,6 +8467,460 @@ def run_weekly_summary(target: Target) -> dict:
     return result
 
 
+# ─── Refinement-pass: Phase A (fidelity audit) ─────────────────────────────
+#
+# REMYX-140 Phase A. Triggered by the `outrider:draft` label on a remyx-ai[bot]
+# PR: diffs the PR's added/modified code against the paper's reference impl,
+# produces a structured Coverage matrix (covered / deferred / deviation) and
+# appends it to the PR body as a ``## Coverage`` section. Optionally patches
+# obviously-mechanical paper-faithful fixes (constant values, missing variant
+# flags) via a Claude Code agentic session and force-pushes.
+#
+# Inputs (workflow surface):
+#   INPUT_PR_NUMBER  — PR number to audit (set by workflow from
+#                      ``${{ github.event.pull_request.number }}``)
+#
+# Output (action surface):
+#   - PR body updated with ``## Coverage`` section
+#   - Label transition: outrider:draft → outrider:fidelity-done
+#                                       or  outrider:needs-judgment
+#                                       (if any item flagged needs-judgment)
+#   - status: fidelity_audited / fidelity_skipped_* / fidelity_failed_*
+
+FIDELITY_COVERAGE_SECTION_HEADER = "## Coverage"
+FIDELITY_LABEL_DRAFT = "outrider:draft"
+FIDELITY_LABEL_DONE = "outrider:fidelity-done"
+FIDELITY_LABEL_NEEDS_JUDGMENT = "outrider:needs-judgment"
+
+_REF_REPO_URL_RE = re.compile(
+    r"https?://github\.com/([\w.-]+/[\w.-]+?)(?:/tree/[\w.-]+)?"
+    r"(?:/blob/[\w./_-]+)?(?:[/#?][\w./?=&%#-]*)?",
+    re.IGNORECASE,
+)
+
+_ARXIV_URL_RE = re.compile(
+    r"https?://arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})(?:v\d+)?",
+    re.IGNORECASE,
+)
+
+
+def _extract_reference_url_from_pr_body(body: str) -> tuple[str, str]:
+    """Pull out (arxiv_id, reference_repo_url) from an Outrider PR body.
+
+    Outrider PR bodies of the shape produced by ``build_pr_body`` and the
+    similar axolotl/TRL templates have both a paper link
+    (``https://arxiv.org/abs/<id>``) and a reference-impl link
+    (``https://github.com/<owner>/<repo>[/blob/...]``) embedded in the
+    Description section. Either may be absent. Returns ``("", "")`` for
+    anything that can't be parsed; the caller decides how to proceed.
+
+    The reference URL is normalised to the ``owner/repo`` clone URL
+    (``https://github.com/<owner>/<repo>``) — the file-specific suffix is
+    preserved separately if the caller needs a file path anchor (e.g., for
+    the Coverage matrix's reference_location field).
+    """
+    arxiv_id = ""
+    m = _ARXIV_URL_RE.search(body or "")
+    if m:
+        arxiv_id = m.group(1)
+    # Pick the first github.com URL that isn't a remyxai/* internal link
+    # (those are footer attribution, not reference impl).
+    reference_url = ""
+    for m in _REF_REPO_URL_RE.finditer(body or ""):
+        owner_repo = m.group(1)
+        if owner_repo.startswith("remyxai/") or owner_repo.startswith("smellslikeml/"):
+            continue
+        reference_url = f"https://github.com/{owner_repo}"
+        break
+    return arxiv_id, reference_url
+
+
+def _clone_reference_repo(url: str, workdir: Path) -> tuple[bool, Path | None, str]:
+    """Shallow-clone ``url`` into ``workdir/reference``. Returns
+    (success, path, error_message). The clone is depth-1 since the audit
+    only needs the current state of the reference, not its history."""
+    if not url:
+        return False, None, "no reference URL provided"
+    ref_dir = workdir / "reference"
+    if ref_dir.exists():
+        shutil.rmtree(ref_dir)
+    log.info(f"  → cloning reference {url} to {ref_dir}")
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", url, str(ref_dir)],
+            check=True,
+            capture_output=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return False, None, f"clone timed out for {url}"
+    except subprocess.CalledProcessError as e:
+        return False, None, f"clone failed: {e.stderr.decode()[:500]}"
+    return True, ref_dir, ""
+
+
+def _fetch_pr_metadata(target: Target, pr_number: int) -> dict:
+    """Fetch the PR's full metadata via gh_api. Returned dict has the
+    standard GitHub PR shape: number, html_url, head/base, title, body,
+    user, labels, etc."""
+    return gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
+
+
+def _fetch_pr_diff(target: Target, pr_number: int) -> str:
+    """Fetch the unified diff of a PR. GitHub serves it as text/plain
+    when Accept: application/vnd.github.v3.diff. gh_api wraps JSON, so
+    we use the raw URL path for the diff."""
+    token = _github_token()
+    url = f"https://api.github.com/repos/{target.repo}/pulls/{pr_number}"
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github.v3.diff",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "remyxai-outrider",
+    })
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def _build_fidelity_audit_prompt(
+    pr_title: str,
+    pr_body: str,
+    pr_diff: str,
+    arxiv_id: str,
+    reference_url: str,
+    reference_root: Path,
+) -> str:
+    """Compose the fidelity-audit prompt for the one-shot Claude call.
+
+    The prompt instructs Claude to read the reference repo (which has
+    been cloned into the workdir alongside the prompt's working
+    directory), diff the PR's added code against it, and produce a
+    structured Coverage matrix as JSON.
+
+    Output shape (must be valid JSON, parseable by ``_extract_json_object``):
+
+        {
+          "summary": "<one-sentence overall verdict>",
+          "needs_judgment": <bool>,
+          "items": [
+            {
+              "name": "<paper §-or-feature name>",
+              "draft_location": "<file::symbol or null>",
+              "reference_location": "<file::symbol or null>",
+              "status": "covered" | "deferred" | "deviation",
+              "deviation_class": null | "defensible" | "needs-judgment",
+              "rationale": "<one to three sentences>"
+            },
+            ...
+          ]
+        }
+    """
+    # Cap each input section so the prompt stays under the context window.
+    # The reference repo is at ``./reference/`` relative to Claude's
+    # workdir; the agent can explore it via Read/Glob/Grep — we don't
+    # try to embed it here.
+    diff_excerpt = pr_diff if len(pr_diff) <= 60_000 else (
+        pr_diff[:60_000] + f"\n... [diff truncated, total {len(pr_diff)} chars] ...\n"
+    )
+    body_excerpt = (pr_body or "")[:4000]
+
+    return f"""You are auditing a draft PR's fidelity to its reference implementation.
+
+# PR under audit
+
+**Title**: {pr_title}
+
+**Paper**: arxiv:{arxiv_id or "(unknown)"}
+
+**Reference impl**: {reference_url or "(unknown)"} (cloned at ./reference/)
+
+## PR body
+
+```
+{body_excerpt}
+```
+
+## PR diff
+
+```
+{diff_excerpt}
+```
+
+# Task
+
+Read the reference impl at ./reference/ — explore the files that correspond to
+the PR's added/modified code. Then produce a structured Coverage matrix that
+classifies each notable piece of the PR as one of:
+
+- **covered**: the PR faithfully implements the reference. Cite both locations.
+- **deferred**: the PR intentionally leaves something out of scope. Cite what
+  the PR body says about it (e.g., "§4.4 adaptive decay deferred as follow-up").
+- **deviation**: the PR diverges from the reference. Classify as either:
+  - **defensible**: the deviation is a reasonable adaptation to the target
+    repo's conventions or API shape (e.g., advantage-multiply vs PG-loss-multiply
+    in PPO-clipped settings; one is mathematically nearly equivalent and matches
+    the target framework's idiom)
+  - **needs-judgment**: the deviation is substantive and should be a human
+    review point (e.g., different default values that change behavior, missing
+    a paper-headline mechanism, computing a different mathematical quantity)
+
+Focus on the math/algorithm-bearing pieces — function bodies, numerical
+constants, control-flow shape, what's multiplied by what. Don't flag stylistic
+differences (variable naming, docstring shape, test framework) as deviations.
+
+# Output
+
+Return ONLY a valid JSON object (no prose before or after):
+
+{{
+  "summary": "<one-sentence overall verdict>",
+  "needs_judgment": <true if any item.deviation_class == "needs-judgment">,
+  "items": [
+    {{
+      "name": "<paper §-or-feature name>",
+      "draft_location": "<file::symbol or null>",
+      "reference_location": "<file::symbol or null>",
+      "status": "covered" | "deferred" | "deviation",
+      "deviation_class": null | "defensible" | "needs-judgment",
+      "rationale": "<one to three sentences>"
+    }}
+  ]
+}}
+"""
+
+
+def _render_coverage_matrix(matrix: dict) -> str:
+    """Render the Claude-emitted Coverage matrix as a markdown section
+    to append to the PR body. Renders as a table with one row per item
+    plus a summary line + needs-judgment callout."""
+    summary = matrix.get("summary", "(no summary)")
+    needs_judgment = bool(matrix.get("needs_judgment", False))
+    items = matrix.get("items", [])
+
+    lines = [FIDELITY_COVERAGE_SECTION_HEADER, ""]
+    lines.append(f"_{summary}_")
+    lines.append("")
+    if needs_judgment:
+        lines.append("> ⚠️ One or more items below need human judgment — see rows marked `deviation (needs-judgment)`.")
+        lines.append("")
+
+    if not items:
+        lines.append("_No items extracted from the reference comparison._")
+        return "\n".join(lines)
+
+    lines.append("| Item | Status | Draft location | Reference location | Rationale |")
+    lines.append("|---|---|---|---|---|")
+    for it in items:
+        name = (it.get("name") or "").replace("|", "\\|")
+        status_raw = (it.get("status") or "unknown")
+        dev_class = it.get("deviation_class") or ""
+        status = f"{status_raw} ({dev_class})" if dev_class else status_raw
+        draft_loc = (it.get("draft_location") or "—").replace("|", "\\|")
+        ref_loc = (it.get("reference_location") or "—").replace("|", "\\|")
+        rationale = (it.get("rationale") or "").replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| {name} | {status} | `{draft_loc}` | `{ref_loc}` | {rationale} |")
+    lines.append("")
+    lines.append(
+        f"_Generated by [Outrider fidelity audit]"
+        f"({CANONICAL_ATTRIBUTION_URL}) at {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}._"
+    )
+    return "\n".join(lines)
+
+
+def _append_or_replace_coverage(body: str, coverage_section: str) -> str:
+    """Idempotently append (or replace) the ``## Coverage`` section in
+    a PR body. If the body already has a ``## Coverage`` section (from
+    a prior fidelity-audit run on the same PR), this replaces it with
+    the new content so re-running the audit doesn't produce duplicate
+    sections."""
+    body = body or ""
+    marker = FIDELITY_COVERAGE_SECTION_HEADER
+    if marker in body:
+        # Replace everything from the existing ## Coverage header up to
+        # (but not including) the next H2-or-higher header or end of body.
+        idx = body.index(marker)
+        # Find the next ## or # header after the existing Coverage section
+        tail = body[idx + len(marker):]
+        next_h = re.search(r"\n(##? )", tail)
+        if next_h:
+            return body[:idx] + coverage_section + tail[next_h.start():]
+        return body[:idx] + coverage_section
+    # Append at the end with a separator
+    sep = "\n\n---\n\n" if body.strip() else ""
+    return body + sep + coverage_section
+
+
+def _update_pr_body(target: Target, pr_number: int, new_body: str) -> None:
+    """PATCH the PR body via gh_api."""
+    gh_api("PATCH", f"/repos/{target.repo}/pulls/{pr_number}", {"body": new_body})
+
+
+def _add_pr_label(target: Target, pr_number: int, label: str) -> None:
+    """Add a label to the PR. Idempotent — a 422 (already-present) is
+    swallowed since the post-condition is what we want."""
+    try:
+        gh_api(
+            "POST",
+            f"/repos/{target.repo}/issues/{pr_number}/labels",
+            {"labels": [label]},
+        )
+    except RuntimeError as e:
+        if "422" in str(e) or "already_exists" in str(e):
+            return
+        raise
+
+
+def _remove_pr_label(target: Target, pr_number: int, label: str) -> None:
+    """Remove a label from the PR. Swallows 404 (already-absent)."""
+    try:
+        gh_api(
+            "DELETE",
+            f"/repos/{target.repo}/issues/{pr_number}/labels/{urllib.parse.quote(label)}",
+        )
+    except RuntimeError as e:
+        if "404" in str(e):
+            return
+        raise
+
+
+def run_fidelity_audit(target: Target) -> dict:
+    """REMYX-140 Phase A — diff a remyx-ai[bot] PR against its reference
+    impl, post a Coverage matrix to the PR body, and transition labels.
+
+    The PR number is read from ``INPUT_PR_NUMBER`` (set by the
+    workflow's ``pull_request`` event payload). The reference URL is
+    extracted from the PR body using the standard arxiv + github
+    embedding shape Outrider produces.
+
+    Returns a status dict suitable for the action's $GITHUB_OUTPUT and
+    the telemetry post. Status values:
+
+        fidelity_audited                — happy path; Coverage matrix posted
+        fidelity_audited_needs_judgment — happy path + at least one item
+                                          flagged for human review
+        fidelity_skipped_no_pr          — INPUT_PR_NUMBER empty
+        fidelity_skipped_not_bot        — PR not authored by remyx-ai[bot]
+        fidelity_skipped_no_reference   — couldn't extract a reference URL
+        fidelity_failed_clone           — reference clone failed
+        fidelity_failed_claude          — Claude call failed or returned
+                                          unparseable JSON
+    """
+    result: dict = {"repo": target.repo, "mode": "fidelity", "status": "unknown"}
+
+    pr_number_raw = os.environ.get("INPUT_PR_NUMBER", "").strip()
+    if not pr_number_raw:
+        result["status"] = "fidelity_skipped_no_pr"
+        log.info("  ✗ fidelity mode invoked without INPUT_PR_NUMBER")
+        return result
+    try:
+        pr_number = int(pr_number_raw)
+    except ValueError:
+        result["status"] = "fidelity_skipped_no_pr"
+        log.error(f"  ✗ INPUT_PR_NUMBER={pr_number_raw!r} is not an integer")
+        return result
+    result["pr_number"] = pr_number
+
+    log.info(f"  → fidelity audit on {target.repo}#{pr_number}")
+
+    try:
+        pr = _fetch_pr_metadata(target, pr_number)
+    except RuntimeError as e:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"could not fetch PR: {e}"
+        return result
+
+    # Bot-author gate — we only audit remyx-ai[bot] PRs to avoid
+    # touching human-opened PRs that happened to get the label.
+    author = (pr.get("user") or {}).get("login", "")
+    if author != "remyx-ai[bot]":
+        result["status"] = "fidelity_skipped_not_bot"
+        result["error"] = f"PR author is {author!r}, not remyx-ai[bot]"
+        log.info(f"  ✗ PR #{pr_number} authored by {author!r}; skipping")
+        return result
+
+    body = pr.get("body") or ""
+    title = pr.get("title") or ""
+    arxiv_id, reference_url = _extract_reference_url_from_pr_body(body)
+    if not reference_url:
+        result["status"] = "fidelity_skipped_no_reference"
+        result["error"] = "no reference URL extracted from PR body"
+        log.info(f"  ✗ no reference URL in PR #{pr_number} body; skipping")
+        return result
+    result["arxiv_id"] = arxiv_id
+    result["reference_url"] = reference_url
+
+    # Workdir layout: ./reference/ holds the cloned ref impl; Claude's
+    # cwd will be the workdir root so it can Read/Glob/Grep into it.
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-fidelity-"))
+    log.info(f"  → workdir: {workdir}")
+
+    ok, ref_dir, err = _clone_reference_repo(reference_url, workdir)
+    if not ok:
+        result["status"] = "fidelity_failed_clone"
+        result["error"] = err
+        log.error(f"  ✗ {err}")
+        return result
+
+    try:
+        pr_diff = _fetch_pr_diff(target, pr_number)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"could not fetch PR diff: {e}"
+        return result
+
+    prompt = _build_fidelity_audit_prompt(
+        pr_title=title,
+        pr_body=body,
+        pr_diff=pr_diff,
+        arxiv_id=arxiv_id,
+        reference_url=reference_url,
+        reference_root=ref_dir,
+    )
+    log.info(f"  → Claude one-shot audit (timeout={target.claude_timeout_s}s)")
+    ok, raw = _run_claude_oneshot(workdir, prompt, target.claude_timeout_s, max_turns=20)
+    if not ok:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"Claude returned non-zero: {raw[-500:]}"
+        return result
+
+    matrix = _extract_json_object(raw)
+    if not matrix or "items" not in matrix:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"Claude returned unparseable JSON: {raw[-500:]}"
+        return result
+
+    coverage_section = _render_coverage_matrix(matrix)
+    new_body = _append_or_replace_coverage(body, coverage_section)
+
+    try:
+        _update_pr_body(target, pr_number, new_body)
+    except RuntimeError as e:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"PR body update failed: {e}"
+        return result
+
+    needs_judgment = bool(matrix.get("needs_judgment", False))
+    if needs_judgment:
+        _add_pr_label(target, pr_number, FIDELITY_LABEL_NEEDS_JUDGMENT)
+        result["status"] = "fidelity_audited_needs_judgment"
+    else:
+        result["status"] = "fidelity_audited"
+
+    # Transition the trigger label → fidelity-done so the convention pass
+    # workflow picks it up.
+    _add_pr_label(target, pr_number, FIDELITY_LABEL_DONE)
+    _remove_pr_label(target, pr_number, FIDELITY_LABEL_DRAFT)
+
+    result["items_count"] = len(matrix.get("items", []))
+    result["needs_judgment"] = needs_judgment
+    result["coverage_summary"] = matrix.get("summary", "")
+    result["pr_url"] = pr.get("html_url", "")
+    log.info(
+        f"  ✓ {result['status']}: {result['items_count']} items, "
+        f"needs_judgment={needs_judgment}"
+    )
+    return result
+
+
 def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[str]:
     """Render a list of step_summary markdown lines for a ``claude_failed``
     status, dispatching on the agent's log tail.
@@ -8870,9 +9324,9 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in ("recommend", "weekly-summary"):
-        log.error(f"Unknown mode {mode!r}; must be 'recommend' or "
-                  f"'weekly-summary'.")
+    if mode not in ("recommend", "weekly-summary", "fidelity"):
+        log.error(f"Unknown mode {mode!r}; must be 'recommend', "
+                  f"'weekly-summary', or 'fidelity'.")
         sys.exit(2)
 
     target = build_target_from_env()
@@ -8882,6 +9336,11 @@ def main():
         log.info("  mode=weekly-summary")
         runner = run_weekly_summary
         failure_status = "weekly_summary_failed"
+    elif mode == "fidelity":
+        pr_number = os.environ.get("INPUT_PR_NUMBER", "").strip()
+        log.info(f"  mode=fidelity  pr_number={pr_number}")
+        runner = run_fidelity_audit
+        failure_status = "fidelity_failed_claude"
     else:
         log.info(f"  min_confidence={target.min_confidence}  "
                  f"draft_mode={target.draft_mode}  "
@@ -8948,8 +9407,10 @@ def main():
     _write_step_summary(result)
 
     # Best-effort: capture this run's telemetry to the engine for analysis.
-    # Only recommend-mode runs map onto the run schema; weekly-summary runs
-    # are skipped. Never blocks the run.
+    # Only recommend-mode runs map onto the run schema; weekly-summary and
+    # fidelity-audit runs are skipped (they have their own outcome surfaces:
+    # Discussion comment and PR Coverage section respectively). Never blocks
+    # the run.
     if mode == "recommend":
         _post_run_telemetry(result, target)
 

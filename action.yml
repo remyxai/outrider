@@ -21,8 +21,26 @@ inputs:
           scheduled job (weekly cron) that calls the action in this
           mode. Requires `discussions: write` in the workflow's
           permissions block.
+        - "fidelity": audit a remyx-ai[bot] draft PR against its paper's
+          reference impl, append a structured ``## Coverage`` matrix to
+          the PR body, and transition the PR's labels
+          (outrider:draft → outrider:fidelity-done, or
+          outrider:needs-judgment when an item flags for human review).
+          REMYX-140 Phase A. Triggered by the workflow on
+          ``pull_request: labeled`` with name=outrider:draft; requires
+          ``pr-number`` to be set (from the event payload). Read-only
+          for the codebase (only mutates the PR body + labels).
     required: false
     default: 'recommend'
+  pr-number:
+    description: |
+      PR number to operate on. Only read in ``mode: fidelity`` (and the
+      forthcoming convention / validation phases). Set from the
+      workflow's pull_request event payload:
+      ``pr-number: ${{ github.event.pull_request.number }}``. Empty in
+      recommend / weekly-summary modes.
+    required: false
+    default: ''
   weekly-discussion-id:
     description: |
       Target Discussion for weekly-summary mode. Accepts the Discussion
@@ -240,6 +258,11 @@ runs:
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
+        # Refinement-pass: PR number to audit (REMYX-140 Phase A and the
+        # forthcoming convention / validation phases). Set from the
+        # workflow's pull_request event payload; empty in
+        # recommend / weekly-summary modes.
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         # Weekly Discussion summary (opt-in second scheduled job).
         REMYX_MODE: ${{ inputs.mode }}
         REMYX_WEEKLY_DISCUSSION_ID: ${{ inputs.weekly-discussion-id }}
