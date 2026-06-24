@@ -9751,10 +9751,52 @@ def run_convention_pass(target: Target) -> dict:
         if in_scope:
             log.info(f"  → {len(in_scope)} files patched in-scope: {in_scope[:5]}")
 
+            # Auto-fix lint-trivial issues the patching agent may have
+            # introduced (unused imports, trailing whitespace, ruff format
+            # gaps, etc.) before the commit lands. Non-trivial issues
+            # (e.g. B002 double-unary-minus) are NOT auto-fixed and remain
+            # for the test gate to surface — that's the right division of
+            # labor: convention pass cleans up the cheap stuff, test gate
+            # gates on what's genuinely actionable.
+            py_in_scope = [p for p in in_scope if p.endswith(".py")]
+            if py_in_scope:
+                # Ensure ruff is available on the runner (not in action.yml's
+                # baseline install set; cheap to install here).
+                subprocess.run(
+                    ["python", "-m", "pip", "install", "--quiet",
+                     "--disable-pip-version-check", "ruff"],
+                    capture_output=True, timeout=60,
+                )
+                log.info(
+                    f"  → ruff --fix + ruff format on {len(py_in_scope)} patched .py files"
+                )
+                try:
+                    subprocess.run(
+                        ["ruff", "check", "--fix", "--exit-zero",
+                         "--no-cache", *py_in_scope],
+                        cwd=str(clone_workdir),
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    subprocess.run(
+                        ["ruff", "format", "--no-cache", *py_in_scope],
+                        cwd=str(clone_workdir),
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    # Re-stage anything ruff modified so the commit picks
+                    # the fixes up. Idempotent if ruff made no changes.
+                    subprocess.run(
+                        ["git", "add", *py_in_scope],
+                        check=True, cwd=str(clone_workdir),
+                        capture_output=True, timeout=30,
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    log.warning(f"  ! ruff auto-fix step failed (continuing): {e}")
+
             commit_msg = (
                 f"chore: align PR with target-repo conventions\n\n"
                 f"Convention-shape patches extracted from {upstream_repo}'s "
-                f"recent merged PRs. Algorithm logic is left untouched."
+                f"recent merged PRs. Algorithm logic is left untouched. "
+                f"Ruff auto-fixed lint-trivial issues on patched files."
             )
 
             # Local commit so HEAD's tree carries the new content. The
