@@ -8958,6 +8958,64 @@ CONVENTION_LABEL_DONE = "outrider:convention-done"
 CONVENTION_MAX_REFERENCE_PRS = 30
 
 
+# Paths the convention pass is allowed to modify. Anything else the agent
+# stages is reverted before commit so the patch is bounded to actually-
+# convention-shaped changes (PR-aligned tests, docs, the README index, etc.).
+# Order matters — the deny list is consulted first.
+_CONVENTION_DENY_PATTERNS = (
+    f"{BUNDLE_DIR_NAME}/",  # our own scaffolding bundle
+    "version.txt",
+    "VERSION",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "setup.py",
+    "pyproject.toml",
+    "MANIFEST.in",
+    ".github/",
+    "Dockerfile",
+)
+_CONVENTION_DENY_RE = re.compile(
+    # Language-variant READMEs (README_ja.md, README_zh-CN.md, etc.). Plain
+    # README.md is allowed — that's where the project index lives.
+    r"(^|/)README_[a-zA-Z][a-zA-Z0-9_\-]*\.md$",
+    re.IGNORECASE,
+)
+_CONVENTION_ALLOW_PATTERNS = (
+    ".py",            # any python file (where most convention patches land)
+    ".md",            # docs / paper-index / README.md
+    "tests/",         # test idioms
+    "docs/",          # documentation conventions
+    ".yml", ".yaml",  # CI / config sometimes carries the convention
+    ".toml",          # config (but pyproject.toml is in the deny list above)
+)
+
+
+def _partition_convention_staged_paths(
+    staged: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split staged file paths into (in_scope, out_of_scope) by the
+    convention-pass allow/deny rules. Deny list is consulted first; any
+    path matching a deny pattern is out-of-scope regardless of whether
+    it would otherwise be allowed."""
+    in_scope: list[str] = []
+    out_of_scope: list[str] = []
+    for path in staged:
+        if any(path.startswith(p) or f"/{p}" in f"/{path}/" for p in _CONVENTION_DENY_PATTERNS):
+            out_of_scope.append(path)
+            continue
+        if _CONVENTION_DENY_RE.search(path):
+            out_of_scope.append(path)
+            continue
+        if any(path.endswith(p) or p in path for p in _CONVENTION_ALLOW_PATTERNS):
+            in_scope.append(path)
+        else:
+            out_of_scope.append(path)
+    return in_scope, out_of_scope
+
+
 def _resolve_upstream_for_conventions(target: Target) -> str:
     """Return the repo whose merged-PR corpus encodes the conventions
     we should align to. For forks this is the parent; otherwise the
@@ -9231,16 +9289,27 @@ tools as needed.
 
 ## Scope guard — read carefully
 
-- **DO** patch: PR body shape (Description headings, before-submitting
-  checklist, AI-disclosure block), file placement (move helper to the
-  conventional file), test naming + parametrize style, docs additions
-  (e.g. paper_index.md entry).
+- **DO** patch: code files (`*.py`) where the convention is about *placement
+  or naming*, the project's main `README.md` (only if the convention is a
+  documented-feature pattern), test files in `tests/`, documentation pages
+  in `docs/`, paper-index entries.
+- **DO NOT** touch any of:
+  - `.remyx-recommendation/` — our own scaffolding, not part of the PR's
+    surface; leave alone even if you see references to it.
+  - `version.txt`, `VERSION`, `package-lock.json`, `yarn.lock`, `*.lock`,
+    `setup.py`, `pyproject.toml`, `MANIFEST.in`, `Dockerfile` — release /
+    packaging surfaces, not contributor conventions.
+  - `README_<lang>.md` (Japanese / Chinese / etc. language variants) —
+    they're maintained by native-language maintainers and shouldn't be
+    updated by a programmatic patcher. The main `README.md` may be edited.
+  - `.github/workflows/` — CI is out of this pass's scope.
 - **DO NOT** patch: algorithm logic, numerical constants, default values,
   control flow of math-bearing functions, what's multiplied by what. Those
   are algorithm-fidelity concerns and are out of this pass's scope.
 
 If a misalignment is ambiguous between "convention" and "algorithm", skip it
-and leave a note in your final summary.
+and leave a note in your final summary. **It is strictly better to skip an
+unclear patch than to make one that touches paper-anchored math.**
 
 ## Extracted conventions
 
@@ -9390,6 +9459,13 @@ def run_convention_pass(target: Target) -> dict:
             result["error"] = f"clone PR head failed: {e.stderr.decode()[:500]}"
             return result
 
+        # Capture the parent SHA before any changes — this is the commit
+        # the new bot-authored commit will descend from.
+        parent_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+        ).stdout.strip()
+
         # Write the INVOCATION for Claude Code
         bundle_dir = clone_workdir / BUNDLE_DIR_NAME
         bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -9409,7 +9485,7 @@ def run_convention_pass(target: Target) -> dict:
 
         # Inspect staged changes
         try:
-            staged = subprocess.run(
+            staged_raw = subprocess.run(
                 ["git", "diff", "--cached", "--name-only"],
                 check=True, capture_output=True, text=True, cwd=str(clone_workdir),
             ).stdout.strip()
@@ -9418,31 +9494,73 @@ def run_convention_pass(target: Target) -> dict:
             result["error"] = f"git diff --cached failed: {e.stderr[:500]}"
             return result
 
-        if staged:
-            files_touched = staged.splitlines()
-            log.info(f"  → {len(files_touched)} files patched: {files_touched[:5]}")
-            result["files_touched"] = files_touched
+        all_staged = staged_raw.splitlines() if staged_raw else []
 
-            # Commit with bot attribution via the GH git data API
+        # Scope filter: only keep changes that match convention-shape paths.
+        # Drop our own scaffolding (BUNDLE_DIR_NAME/), language-variant READMEs,
+        # version files, lock files — anything the agent shouldn't have touched
+        # but might have. Out-of-scope edits are reverted via git restore so
+        # the commit only carries the legitimate convention patches.
+        in_scope, out_of_scope = _partition_convention_staged_paths(all_staged)
+        if out_of_scope:
+            log.info(f"  → reverting {len(out_of_scope)} out-of-scope files: {out_of_scope[:5]}")
+            try:
+                subprocess.run(
+                    ["git", "restore", "--staged", "--worktree", *out_of_scope],
+                    check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+                )
+            except subprocess.CalledProcessError as e:
+                log.warning(f"  ! restore of out-of-scope paths failed (continuing): {e.stderr[:300]}")
+        result["files_touched"] = in_scope
+        result["files_dropped_out_of_scope"] = out_of_scope
+
+        if in_scope:
+            log.info(f"  → {len(in_scope)} files patched in-scope: {in_scope[:5]}")
+
             commit_msg = (
                 f"chore: align PR with target-repo conventions\n\n"
-                f"Refinement-pass Phase B (convention alignment). Applies "
-                f"convention-shape patches extracted from {upstream_repo}'s recent "
-                f"merged PRs. Algorithm logic is left untouched (that's the "
-                f"fidelity audit's domain)."
+                f"Convention-shape patches extracted from {upstream_repo}'s "
+                f"recent merged PRs. Algorithm logic is left untouched."
             )
+
+            # Local commit so HEAD's tree carries the new content. The
+            # subsequent _recommit_via_api wraps that tree in an API-created
+            # commit signed by the bot installation token (Verified badge).
+            try:
+                subprocess.run(
+                    ["git", "commit", "-m", commit_msg],
+                    check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+                )
+            except subprocess.CalledProcessError as e:
+                result["status"] = "convention_failed_push"
+                result["error"] = f"local commit failed: {e.stderr[:500]}"
+                return result
+
+            # Push first so origin has the branch at our new commit, then
+            # re-author via API to get the Verified badge.
+            try:
+                subprocess.run(
+                    ["git", "push", "--force-with-lease", "origin", head_ref],
+                    check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+                    env=env,
+                )
+            except subprocess.CalledProcessError as e:
+                result["status"] = "convention_failed_push"
+                result["error"] = f"git push failed: {e.stderr[:500]}"
+                return result
+
             try:
                 _recommit_via_api(
-                    clone_workdir, head_ref, commit_msg, head_repo,
-                    base_branch=head_ref,
+                    clone_workdir, head_repo, head_ref, commit_msg,
+                    parent_sha=parent_sha,
                 )
             except Exception as e:
-                result["status"] = "convention_failed_push"
-                result["error"] = f"recommit_via_api failed: {e}"
-                return result
+                # _recommit_via_api degrades gracefully (logs warning, keeps
+                # the pushed commit) so we only land here on a programming
+                # error. Don't fail the whole run — the patches are pushed.
+                log.warning(f"  ! API re-author failed (Verified badge missed): {e}")
         else:
-            log.info("  → no staged changes after patch session; skipping push")
-            result["files_touched"] = []
+            log.info("  → no in-scope staged changes after filtering; skipping push")
 
     # Evidence comment
     log.info("  → posting evidence comment to PR")
