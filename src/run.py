@@ -8492,7 +8492,7 @@ def run_weekly_summary(target: Target) -> dict:
 #   - status: fidelity_audited / fidelity_skipped_* / fidelity_failed_*
 
 FIDELITY_COVERAGE_SECTION_HEADER = "## Coverage"
-FIDELITY_LABEL_DRAFT = "outrider:draft"
+FIDELITY_LABEL_TRIGGER = "outrider:draft"
 FIDELITY_LABEL_DONE = "outrider:fidelity-done"
 FIDELITY_LABEL_NEEDS_JUDGMENT = "outrider:needs-judgment"
 
@@ -8740,6 +8740,25 @@ def _render_coverage_matrix(matrix: dict) -> str:
     return "\n".join(lines)
 
 
+def _append_to_step_summary(markdown: str) -> None:
+    """Append markdown to ``$GITHUB_STEP_SUMMARY``.
+
+    Refinement-pass phases write their per-run output here rather than to
+    the PR body — the body should be 100% governed by the upstream-repo
+    convention-extraction (Phase B's job), and our per-phase metadata
+    belongs on the action's run-summary panel where it can be inspected
+    without polluting the maintainer's PR-body conventions.
+    """
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(markdown.rstrip() + "\n\n")
+    except OSError as e:
+        log.warning(f"Could not append to $GITHUB_STEP_SUMMARY: {e}")
+
+
 def _append_or_replace_section(body: str, header: str, section_content: str) -> str:
     """Idempotently append (or replace) a top-level section in a PR body.
 
@@ -8936,14 +8955,10 @@ def run_fidelity_audit(target: Target) -> dict:
         return result
 
     coverage_section = _render_coverage_matrix(matrix)
-    new_body = _append_or_replace_coverage(body, coverage_section)
-
-    try:
-        _update_pr_body(target, pr_number, new_body)
-    except RuntimeError as e:
-        result["status"] = "fidelity_failed_claude"
-        result["error"] = f"PR body update failed: {e}"
-        return result
+    # Per-phase output goes to the action run-summary panel rather than the
+    # PR body; the body is reserved for content the convention pass aligns
+    # to upstream conventions.
+    _append_to_step_summary(coverage_section)
 
     needs_judgment = bool(matrix.get("needs_judgment", False))
     if needs_judgment:
@@ -8955,7 +8970,7 @@ def run_fidelity_audit(target: Target) -> dict:
     # Transition the trigger label → fidelity-done so the convention pass
     # workflow picks it up.
     _add_pr_label(target, pr_number, FIDELITY_LABEL_DONE)
-    _remove_pr_label(target, pr_number, FIDELITY_LABEL_DRAFT)
+    _remove_pr_label(target, pr_number, FIDELITY_LABEL_TRIGGER)
 
     result["items_count"] = len(matrix.get("items", []))
     result["needs_judgment"] = needs_judgment
@@ -9781,25 +9796,19 @@ def run_convention_pass(target: Target) -> dict:
         else:
             log.info("  → no in-scope staged changes after filtering; skipping push")
 
-    # Evidence section — written into the PR body so it survives re-runs
-    # idempotently and doesn't accumulate as a thread of comments.
-    log.info("  → updating ## Convention pass section in PR body")
-    section = _render_convention_evidence_comment(
+    # Evidence — to the action run-summary panel only. The PR body
+    # itself is owned by the convention-driven rewrite performed earlier
+    # in this run; appending an `## Convention pass` H2 here would
+    # contradict the body's upstream-shape, which is the whole point of
+    # this phase.
+    log.info("  → writing convention-pass evidence to step summary")
+    evidence_md = _render_convention_evidence_comment(
         upstream_repo, patterns, misalignments, patches_summary,
         pr_body_updated=bool(result.get("pr_body_updated")),
         pr_body_rationale=result.get("pr_body_rationale", ""),
         pr_body_skip_reason=result.get("pr_body_skip_reason", ""),
     )
-    try:
-        # The pr_body may have been rewritten earlier in this run by the
-        # pr_body_template update; refresh from the API.
-        current_pr = gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
-        new_body = _append_or_replace_section(
-            current_pr.get("body") or "", "## Convention pass", section,
-        )
-        _update_pr_body(target, pr_number, new_body)
-    except RuntimeError as e:
-        log.warning(f"  ! convention section update failed (non-fatal): {e}")
+    _append_to_step_summary(evidence_md)
 
     # Label transition
     _add_pr_label(target, pr_number, CONVENTION_LABEL_DONE)
@@ -9818,11 +9827,11 @@ def run_convention_pass(target: Target) -> dict:
 # ─── Refinement-pass: test gate ────────────────────────────────────────────
 #
 # Triggered after the convention pass completes. Runs lint + targeted tests
-# on the PR's added/modified files, posts a result section to the PR body,
-# and transitions the label to either `outrider:ready-for-review` (lint
-# passed and tests passed-or-unvalidated) or `outrider:test-failed` (lint
-# surfaced issues or tests failed). On a passing run, also drops the PR's
-# draft state so reviewers see the PR as ready.
+# on the PR's added/modified files, writes a result panel to the action's
+# run-summary, drops the PR's draft state on a passing run (the canonical
+# GitHub signal for "ready for review"), and applies the
+# ``outrider:test-failed`` label only on a hard failure. PR body is left
+# untouched — that's the convention pass's surface.
 #
 # Heavier validation workloads (CPU smoke pass, benchmarks, LLM judges) are
 # deferred to a forthcoming "validate" phase that opts in via outrider.yaml
@@ -9830,10 +9839,7 @@ def run_convention_pass(target: Target) -> dict:
 # without needing GPU or special-cased infra.
 
 TEST_LABEL_TRIGGER = "outrider:convention-done"
-TEST_LABEL_READY = "outrider:ready-for-review"
 TEST_LABEL_FAILED = "outrider:test-failed"
-
-TEST_BODY_SECTION_HEADER = "## Refinement checks"
 
 _TEST_LINT_TIMEOUT_S = 120
 _TEST_PYTEST_TIMEOUT_S = 240
@@ -10004,7 +10010,7 @@ def _render_test_section(
         f"**Lint** {icon.get(lint_status, '?')} {lint_status}",
         f"**Tests** {icon.get(test_status, '?')} {test_status}",
     ]
-    lines = [TEST_BODY_SECTION_HEADER, ""]
+    lines = ["## Refinement checks", ""]
     lines.append(" · ".join(summary_parts))
     lines.append("")
     lines.append(f"Touched in this PR: **{len(touched_py)} Python files** "
@@ -10061,10 +10067,10 @@ def _render_test_section(
 
 
 def run_test_gate(target: Target) -> dict:
-    """Test gate — lint + targeted pytest on a remyx-ai[bot] PR. Posts a
-    result section into the PR body, transitions labels to
-    ``outrider:ready-for-review`` or ``outrider:test-failed``, and drops
-    the PR's draft state on a passing run.
+    """Test gate — lint + targeted pytest on a remyx-ai[bot] PR. Writes
+    a result section to the action's run-summary, drops the PR's draft
+    state on a passing run (the canonical GitHub signal for "ready for
+    review"), and applies ``outrider:test-failed`` on hard failure.
 
     Status values:
         test_passed                  — lint passed, tests passed-or-unvalidated
@@ -10158,9 +10164,9 @@ def run_test_gate(target: Target) -> dict:
     result["test_status"] = test_status
     log.info(f"  → tests: {test_status}")
 
-    # Render the result section and inline it into the PR body — same
-    # idempotent pattern as Phase A's ## Coverage and Phase B's
-    # ## Convention pass sections.
+    # Render the result section and write to the action run-summary
+    # panel; the PR body is owned by the convention pass's body rewrite
+    # and isn't an appropriate surface for per-run check output.
     section_body = _render_test_section(
         lint_status=lint_status, lint_output=lint_output, lint_issues=lint_issues,
         test_status=test_status, test_output=test_output,
@@ -10168,28 +10174,18 @@ def run_test_gate(target: Target) -> dict:
         package_manager=pkg_mgr,
         deps_installed=install_ok, deps_install_summary=install_summary,
     )
-    try:
-        current_pr = gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
-        new_body = _append_or_replace_section(
-            current_pr.get("body") or "", TEST_BODY_SECTION_HEADER, section_body,
-        )
-        _update_pr_body(target, pr_number, new_body)
-    except RuntimeError as e:
-        log.warning(f"  ! refinement-checks section update failed (non-fatal): {e}")
+    _append_to_step_summary(section_body)
 
-    # Label transition: ready-for-review iff lint passed AND tests didn't
-    # outright fail. Unvalidated tests (missing deps) don't gate — they're
-    # informational only.
+    # On a passing run, drop the PR's draft state — that's the canonical
+    # GitHub signal for "ready for review", and replaces what was
+    # previously a redundant outrider:ready-for-review label.
+    # Unvalidated tests (missing deps) don't gate — informational only.
     hard_failure = (lint_status == "failed") or (test_status == "failed")
     if hard_failure:
         _add_pr_label(target, pr_number, TEST_LABEL_FAILED)
         result["status"] = "test_failed"
     else:
-        _add_pr_label(target, pr_number, TEST_LABEL_READY)
         result["status"] = "test_passed"
-        # On a passing run, drop the PR's draft state so reviewers see
-        # the PR as ready. The label is the metadata signal; un-drafting
-        # is the behavioral one that triggers reviewer notifications.
         ready_ok = _drop_pr_draft_state(target, pr_number)
         result["draft_dropped"] = ready_ok
     _remove_pr_label(target, pr_number, TEST_LABEL_TRIGGER)

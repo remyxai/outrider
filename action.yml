@@ -38,12 +38,13 @@ inputs:
           the patterns + their source PRs. Triggered by
           ``outrider:fidelity-done``; requires ``pr-number``.
         - "test": run lint + targeted tests on the PR's added/modified
-          files, post a ``## Refinement checks`` section to the PR
-          body, transition the label to ``outrider:ready-for-review``
-          (lint passed and tests passed-or-unvalidated) or
-          ``outrider:test-failed`` (lint surfaced issues or tests
-          failed), and drop the PR's draft state on a passing run.
-          Triggered after the convention pass; requires ``pr-number``.
+          files, write a ``## Refinement checks`` section to the
+          action's run-summary panel, drop the PR's draft state on a
+          passing run (the canonical GitHub "ready for review" signal),
+          and apply the ``outrider:test-failed`` label only on hard
+          failure (lint surfaced issues or tests failed). PR body is
+          untouched — that's the convention pass's surface. Triggered
+          after the convention pass; requires ``pr-number``.
     required: false
     default: 'recommend'
   pr-number:
