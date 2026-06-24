@@ -479,6 +479,32 @@ Required outputs:
    attribution links to the codebase — attribution lives in the PR body
    footer (handled by the orchestrator), not in the maintainer's repo.
 
+# Lint cleanly against the repo's own config
+
+After your edits and before declaring done, run the repo's lint command
+on the files you changed and fix anything it flags. The orchestrator
+will run the same lint as a gate; failures block the PR from being
+marked ready for review.
+
+The repo's lint setup lives in ORIENTATION.md (`## Tooling config`) —
+that's the canonical source. Typical shapes:
+
+  - ``ruff check <changed_files>`` if ``[tool.ruff]`` is configured
+  - ``flake8 <changed_files>`` if a ``.flake8`` or ``setup.cfg`` defines it
+  - ``black --check <changed_files>`` for formatting
+  - ``mypy <changed_files>`` only if the repo opts into it
+  - ``make lint`` if a Makefile target exists
+
+Use the repo's config, not your own preferences — strict ones lint
+stylistic patterns (mutable default args, bare ``except``, unused imports,
+double-unary minus, etc.) that more permissive configs allow. The
+repo's rules are authoritative.
+
+If the linter reports issues you cannot trivially fix without changing
+behavior, prefer rewriting the surface expression to avoid the lint
+warning rather than adding ``# noqa`` — explicit suppression should be
+rare and signaled, not the cleanup path.
+
 # Honesty rules
 
 - If the public surface of your new module is dominated by `TODO`,
@@ -1086,6 +1112,13 @@ FAILURE_EXIT_STATUSES = {
     "error",
     "claude_failed",
     "weekly_summary_failed",
+    "fidelity_failed_clone",
+    "fidelity_failed_claude",
+    "convention_failed_extraction",
+    "convention_failed_misalignment",
+    "convention_failed_patch",
+    "convention_failed_push",
+    "test_failed_setup",
     # Outbound credential-scrubber abort. Not a graceful skip — the
     # operator needs to investigate the body-assembly path (whatever
     # upstream content produced credential-shaped text). Surfaces red
@@ -8467,6 +8500,1928 @@ def run_weekly_summary(target: Target) -> dict:
     return result
 
 
+# ─── Refinement-pass: fidelity audit ───────────────────────────────────────
+#
+# Triggered by the `outrider:draft` label on a remyx-ai[bot] PR: diffs the
+# PR's added/modified code against the paper's reference impl, produces a
+# structured Coverage matrix (covered / deferred / deviation) and appends it
+# to the PR body as a ``## Coverage`` section.
+#
+# Inputs (workflow surface):
+#   INPUT_PR_NUMBER  — PR number to audit (set by the workflow from the
+#                      pull_request event payload)
+#
+# Output:
+#   - PR body updated with ``## Coverage`` section
+#   - Label transition: outrider:draft → outrider:fidelity-done
+#                                       or  outrider:needs-judgment
+#   - status: fidelity_audited / fidelity_skipped_* / fidelity_failed_*
+
+FIDELITY_COVERAGE_SECTION_HEADER = "## Coverage"
+FIDELITY_LABEL_TRIGGER = "outrider:draft"
+FIDELITY_LABEL_DONE = "outrider:fidelity-done"
+FIDELITY_LABEL_NEEDS_JUDGMENT = "outrider:needs-judgment"
+
+_REF_REPO_URL_RE = re.compile(
+    # Greedy on owner/repo. Trailing path (/blob/..., /tree/..., #anchor,
+    # ?query) is not captured.
+    r"https?://github\.com/([\w.-]+/[\w.-]+)",
+    re.IGNORECASE,
+)
+
+_ARXIV_URL_RE = re.compile(
+    r"https?://arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})(?:v\d+)?",
+    re.IGNORECASE,
+)
+
+
+def _extract_reference_url_from_pr_body(
+    body: str, target_repo: str = ""
+) -> tuple[str, str]:
+    """Pull out (arxiv_id, reference_repo_url) from a PR body.
+
+    PR bodies in the supported templates carry both a paper link
+    (``https://arxiv.org/abs/<id>``) and a reference-impl link
+    (``https://github.com/<owner>/<repo>[/blob/...]``) embedded in the
+    Description section. Either may be absent. Returns ``("", "")`` for
+    anything that can't be parsed.
+
+    The reference URL is normalised to the ``owner/repo`` clone URL —
+    the file-specific suffix is preserved separately if the caller
+    needs a file-path anchor.
+
+    Self-references (URLs pointing at the same owner as the target
+    repo, e.g. the bot's footer attribution) are skipped; the caller's
+    intent is to locate the *upstream* paper's reference impl.
+    """
+    arxiv_id = ""
+    m = _ARXIV_URL_RE.search(body or "")
+    if m:
+        arxiv_id = m.group(1)
+    target_owner = target_repo.split("/", 1)[0].lower() if target_repo else ""
+    reference_url = ""
+    for m in _REF_REPO_URL_RE.finditer(body or ""):
+        owner_repo = m.group(1)
+        owner = owner_repo.split("/", 1)[0].lower()
+        if target_owner and owner == target_owner:
+            continue
+        reference_url = f"https://github.com/{owner_repo}"
+        break
+    return arxiv_id, reference_url
+
+
+def _clone_reference_repo(url: str, workdir: Path) -> tuple[bool, Path | None, str]:
+    """Shallow-clone ``url`` into ``workdir/reference``. Returns
+    (success, path, error_message). The clone is depth-1 since the audit
+    only needs the current state of the reference, not its history."""
+    if not url:
+        return False, None, "no reference URL provided"
+    ref_dir = workdir / "reference"
+    if ref_dir.exists():
+        shutil.rmtree(ref_dir)
+    log.info(f"  → cloning reference {url} to {ref_dir}")
+    # GIT_TERMINAL_PROMPT=0 fails fast on any auth prompt instead of
+    # hanging the runner; public repos clone without credentials, and a
+    # private ref isn't supported by this mode.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", url, str(ref_dir)],
+            check=True,
+            capture_output=True,
+            timeout=180,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, None, f"clone timed out for {url}"
+    except subprocess.CalledProcessError as e:
+        return False, None, f"clone failed: {e.stderr.decode()[:500]}"
+    return True, ref_dir, ""
+
+
+def _fetch_pr_metadata(target: Target, pr_number: int) -> dict:
+    """Fetch the PR's full metadata via gh_api. Returned dict has the
+    standard GitHub PR shape: number, html_url, head/base, title, body,
+    user, labels, etc."""
+    return gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
+
+
+def _fetch_pr_diff(target: Target, pr_number: int) -> str:
+    """Fetch the unified diff of a PR. GitHub serves it as text/plain
+    when Accept: application/vnd.github.v3.diff. gh_api wraps JSON, so
+    we use the raw URL path for the diff."""
+    token = _github_token()
+    url = f"https://api.github.com/repos/{target.repo}/pulls/{pr_number}"
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github.v3.diff",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "remyxai-outrider",
+    })
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def _build_fidelity_audit_prompt(
+    pr_title: str,
+    pr_body: str,
+    pr_diff: str,
+    arxiv_id: str,
+    reference_url: str,
+    reference_root: Path,
+) -> str:
+    """Compose the fidelity-audit prompt for the one-shot Claude call.
+
+    The prompt instructs Claude to read the reference repo (which has
+    been cloned into the workdir alongside the prompt's working
+    directory), diff the PR's added code against it, and produce a
+    structured Coverage matrix as JSON.
+
+    Output shape (must be valid JSON, parseable by ``_extract_json_object``):
+
+        {
+          "summary": "<one-sentence overall verdict>",
+          "needs_judgment": <bool>,
+          "items": [
+            {
+              "name": "<paper §-or-feature name>",
+              "draft_location": "<file::symbol or null>",
+              "reference_location": "<file::symbol or null>",
+              "status": "covered" | "deferred" | "deviation",
+              "deviation_class": null | "defensible" | "needs-judgment",
+              "rationale": "<one to three sentences>"
+            },
+            ...
+          ]
+        }
+    """
+    # Cap each input section so the prompt stays under the context window.
+    # The reference repo is at ``./reference/`` relative to Claude's
+    # workdir; the agent can explore it via Read/Glob/Grep — we don't
+    # try to embed it here.
+    diff_excerpt = pr_diff if len(pr_diff) <= 60_000 else (
+        pr_diff[:60_000] + f"\n... [diff truncated, total {len(pr_diff)} chars] ...\n"
+    )
+    body_excerpt = (pr_body or "")[:4000]
+
+    return f"""You are auditing a draft PR's fidelity to its reference implementation.
+
+# PR under audit
+
+**Title**: {pr_title}
+
+**Paper**: arxiv:{arxiv_id or "(unknown)"}
+
+**Reference impl**: {reference_url or "(unknown)"} (cloned at ./reference/)
+
+## PR body
+
+```
+{body_excerpt}
+```
+
+## PR diff
+
+```
+{diff_excerpt}
+```
+
+# Task
+
+Read the reference impl at ./reference/ — explore the files that correspond to
+the PR's added/modified code. Then produce a structured Coverage matrix that
+classifies each notable piece of the PR as one of:
+
+- **covered**: the PR faithfully implements the reference. Cite both locations.
+- **deferred**: the PR intentionally leaves something out of scope. Cite what
+  the PR body says about it (e.g., "§4.4 adaptive decay deferred as follow-up").
+- **deviation**: the PR diverges from the reference. Classify as either:
+  - **defensible**: the deviation is a reasonable adaptation to the target
+    repo's conventions or API shape (e.g., advantage-multiply vs PG-loss-multiply
+    in PPO-clipped settings; one is mathematically nearly equivalent and matches
+    the target framework's idiom)
+  - **needs-judgment**: the deviation is substantive and should be a human
+    review point (e.g., different default values that change behavior, missing
+    a paper-headline mechanism, computing a different mathematical quantity)
+
+Focus on the math/algorithm-bearing pieces — function bodies, numerical
+constants, control-flow shape, what's multiplied by what. Don't flag stylistic
+differences (variable naming, docstring shape, test framework) as deviations.
+
+# Output
+
+Return ONLY a valid JSON object (no prose before or after):
+
+{{
+  "summary": "<one-sentence overall verdict>",
+  "needs_judgment": <true if any item.deviation_class == "needs-judgment">,
+  "items": [
+    {{
+      "name": "<paper §-or-feature name>",
+      "draft_location": "<file::symbol or null>",
+      "reference_location": "<file::symbol or null>",
+      "status": "covered" | "deferred" | "deviation",
+      "deviation_class": null | "defensible" | "needs-judgment",
+      "rationale": "<one to three sentences>"
+    }}
+  ]
+}}
+"""
+
+
+def _render_coverage_matrix(matrix: dict) -> str:
+    """Render the Claude-emitted Coverage matrix as a markdown section
+    to append to the PR body. Renders as a table with one row per item
+    plus a summary line + needs-judgment callout."""
+    summary = matrix.get("summary", "(no summary)")
+    needs_judgment = bool(matrix.get("needs_judgment", False))
+    items = matrix.get("items", [])
+
+    lines = [FIDELITY_COVERAGE_SECTION_HEADER, ""]
+    lines.append(f"_{summary}_")
+    lines.append("")
+    if needs_judgment:
+        lines.append("> ⚠️ One or more items below need human judgment — see rows marked `deviation (needs-judgment)`.")
+        lines.append("")
+
+    if not items:
+        lines.append("_No items extracted from the reference comparison._")
+        return "\n".join(lines)
+
+    lines.append("| Item | Status | Draft location | Reference location | Rationale |")
+    lines.append("|---|---|---|---|---|")
+    for it in items:
+        name = (it.get("name") or "").replace("|", "\\|")
+        status_raw = (it.get("status") or "unknown")
+        dev_class = it.get("deviation_class") or ""
+        status = f"{status_raw} ({dev_class})" if dev_class else status_raw
+        draft_loc = (it.get("draft_location") or "—").replace("|", "\\|")
+        ref_loc = (it.get("reference_location") or "—").replace("|", "\\|")
+        rationale = (it.get("rationale") or "").replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| {name} | {status} | `{draft_loc}` | `{ref_loc}` | {rationale} |")
+    lines.append("")
+    lines.append(
+        f"_Generated by [Outrider fidelity audit]"
+        f"({CANONICAL_ATTRIBUTION_URL}) at {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}._"
+    )
+    return "\n".join(lines)
+
+
+def _append_to_step_summary(markdown: str) -> None:
+    """Append markdown to ``$GITHUB_STEP_SUMMARY``.
+
+    Refinement-pass phases write their per-run output here rather than to
+    the PR body — the body should be 100% governed by the upstream-repo
+    convention-extraction (Phase B's job), and our per-phase metadata
+    belongs on the action's run-summary panel where it can be inspected
+    without polluting the maintainer's PR-body conventions.
+    """
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(markdown.rstrip() + "\n\n")
+    except OSError as e:
+        log.warning(f"Could not append to $GITHUB_STEP_SUMMARY: {e}")
+
+
+def _append_or_replace_section(body: str, header: str, section_content: str) -> str:
+    """Idempotently append (or replace) a top-level section in a PR body.
+
+    A section is delimited by its ``## Header`` line on top, and either
+    the next ``# `` / ``## `` heading or end-of-body on the bottom. If
+    ``header`` is already present, the existing section is replaced
+    in-place; otherwise the new section is appended at the end with a
+    ``---`` separator.
+
+    Used by every refinement phase that writes to the PR body so re-runs
+    are idempotent and the section ordering is stable.
+    """
+    body = body or ""
+    if header in body:
+        idx = body.index(header)
+        tail = body[idx + len(header):]
+        next_h = re.search(r"\n(##? )", tail)
+        if next_h:
+            return body[:idx] + section_content + tail[next_h.start():]
+        return body[:idx] + section_content
+    sep = "\n\n---\n\n" if body.strip() else ""
+    return body + sep + section_content
+
+
+def _append_or_replace_coverage(body: str, coverage_section: str) -> str:
+    """Backward-compat wrapper for Phase A's Coverage-section update."""
+    return _append_or_replace_section(body, FIDELITY_COVERAGE_SECTION_HEADER, coverage_section)
+
+
+def _drop_pr_draft_state(target: Target, pr_number: int) -> bool:
+    """Mark a draft PR as ready-for-review via the GraphQL mutation
+    ``markPullRequestReadyForReview``. The REST endpoint
+    (``PATCH /repos/{repo}/pulls/{n}``) silently ignores the ``draft``
+    field — only the GraphQL mutation actually transitions the state.
+
+    Returns True on success, False on any error (non-fatal — the
+    label transition is the primary signal either way).
+    """
+    pr = gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
+    if not pr.get("draft"):
+        return True   # already non-draft, idempotent
+    node_id = pr.get("node_id", "")
+    if not node_id:
+        return False
+    mutation = (
+        "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){"
+        "pullRequest{isDraft}}}"
+    )
+    try:
+        gh_graphql(mutation, {"id": node_id})
+        return True
+    except RuntimeError as e:
+        log.warning(f"  ! could not drop draft state on PR #{pr_number}: {e}")
+        return False
+
+
+def _update_pr_body(target: Target, pr_number: int, new_body: str) -> None:
+    """PATCH the PR body via gh_api."""
+    gh_api("PATCH", f"/repos/{target.repo}/pulls/{pr_number}", {"body": new_body})
+
+
+def _add_pr_label(target: Target, pr_number: int, label: str) -> None:
+    """Add a label to the PR. Idempotent — a 422 (already-present) is
+    swallowed since the post-condition is what we want."""
+    try:
+        gh_api(
+            "POST",
+            f"/repos/{target.repo}/issues/{pr_number}/labels",
+            {"labels": [label]},
+        )
+    except RuntimeError as e:
+        if "422" in str(e) or "already_exists" in str(e):
+            return
+        raise
+
+
+def _remove_pr_label(target: Target, pr_number: int, label: str) -> None:
+    """Remove a label from the PR. Swallows 404 (already-absent)."""
+    try:
+        gh_api(
+            "DELETE",
+            f"/repos/{target.repo}/issues/{pr_number}/labels/{urllib.parse.quote(label)}",
+        )
+    except RuntimeError as e:
+        if "404" in str(e):
+            return
+        raise
+
+
+def run_fidelity_audit(target: Target) -> dict:
+    """Diff a remyx-ai[bot] PR against its paper's reference impl, post
+    a Coverage matrix to the PR body, and transition labels.
+
+    The PR number is read from ``INPUT_PR_NUMBER`` (set by the
+    workflow's ``pull_request`` event payload). The reference URL is
+    extracted from the PR body using the standard arxiv + github
+    embedding shape Outrider produces.
+
+    Returns a status dict suitable for the action's $GITHUB_OUTPUT and
+    the telemetry post. Status values:
+
+        fidelity_audited                — happy path; Coverage matrix posted
+        fidelity_audited_needs_judgment — happy path + at least one item
+                                          flagged for human review
+        fidelity_skipped_no_pr          — INPUT_PR_NUMBER empty
+        fidelity_skipped_not_bot        — PR not authored by remyx-ai[bot]
+        fidelity_skipped_no_reference   — couldn't extract a reference URL
+        fidelity_failed_clone           — reference clone failed
+        fidelity_failed_claude          — Claude call failed or returned
+                                          unparseable JSON
+    """
+    result: dict = {"repo": target.repo, "mode": "fidelity", "status": "unknown"}
+
+    pr_number_raw = os.environ.get("INPUT_PR_NUMBER", "").strip()
+    if not pr_number_raw:
+        result["status"] = "fidelity_skipped_no_pr"
+        log.info("  ✗ fidelity mode invoked without INPUT_PR_NUMBER")
+        return result
+    try:
+        pr_number = int(pr_number_raw)
+    except ValueError:
+        result["status"] = "fidelity_skipped_no_pr"
+        log.error(f"  ✗ INPUT_PR_NUMBER={pr_number_raw!r} is not an integer")
+        return result
+    result["pr_number"] = pr_number
+
+    log.info(f"  → fidelity audit on {target.repo}#{pr_number}")
+
+    try:
+        pr = _fetch_pr_metadata(target, pr_number)
+    except RuntimeError as e:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"could not fetch PR: {e}"
+        return result
+
+    # Bot-author gate — we only audit remyx-ai[bot] PRs to avoid
+    # touching human-opened PRs that happened to get the label.
+    author = (pr.get("user") or {}).get("login", "")
+    if author != "remyx-ai[bot]":
+        result["status"] = "fidelity_skipped_not_bot"
+        result["error"] = f"PR author is {author!r}, not remyx-ai[bot]"
+        log.info(f"  ✗ PR #{pr_number} authored by {author!r}; skipping")
+        return result
+
+    body = pr.get("body") or ""
+    title = pr.get("title") or ""
+    arxiv_id, reference_url = _extract_reference_url_from_pr_body(body, target.repo)
+    if not reference_url:
+        result["status"] = "fidelity_skipped_no_reference"
+        result["error"] = "no reference URL extracted from PR body"
+        log.info(f"  ✗ no reference URL in PR #{pr_number} body; skipping")
+        return result
+    result["arxiv_id"] = arxiv_id
+    result["reference_url"] = reference_url
+
+    # Workdir layout: ./reference/ holds the cloned ref impl; Claude's
+    # cwd will be the workdir root so it can Read/Glob/Grep into it.
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-fidelity-"))
+    log.info(f"  → workdir: {workdir}")
+
+    ok, ref_dir, err = _clone_reference_repo(reference_url, workdir)
+    if not ok:
+        result["status"] = "fidelity_failed_clone"
+        result["error"] = err
+        log.error(f"  ✗ {err}")
+        return result
+
+    try:
+        pr_diff = _fetch_pr_diff(target, pr_number)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"could not fetch PR diff: {e}"
+        return result
+
+    prompt = _build_fidelity_audit_prompt(
+        pr_title=title,
+        pr_body=body,
+        pr_diff=pr_diff,
+        arxiv_id=arxiv_id,
+        reference_url=reference_url,
+        reference_root=ref_dir,
+    )
+    log.info(f"  → Claude one-shot audit (timeout={target.claude_timeout_s}s)")
+    ok, raw = _run_claude_oneshot(workdir, prompt, target.claude_timeout_s, max_turns=20)
+    if not ok:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"Claude returned non-zero: {raw[-500:]}"
+        return result
+
+    matrix = _extract_json_object(raw)
+    if not matrix or "items" not in matrix:
+        result["status"] = "fidelity_failed_claude"
+        result["error"] = f"Claude returned unparseable JSON: {raw[-500:]}"
+        return result
+
+    coverage_section = _render_coverage_matrix(matrix)
+    # Per-phase output goes to the action run-summary panel rather than the
+    # PR body; the body is reserved for content the convention pass aligns
+    # to upstream conventions.
+    _append_to_step_summary(coverage_section)
+
+    needs_judgment = bool(matrix.get("needs_judgment", False))
+    if needs_judgment:
+        _add_pr_label(target, pr_number, FIDELITY_LABEL_NEEDS_JUDGMENT)
+        result["status"] = "fidelity_audited_needs_judgment"
+    else:
+        result["status"] = "fidelity_audited"
+
+    # Transition the trigger label → fidelity-done so the convention pass
+    # workflow picks it up.
+    _add_pr_label(target, pr_number, FIDELITY_LABEL_DONE)
+    _remove_pr_label(target, pr_number, FIDELITY_LABEL_TRIGGER)
+
+    result["items_count"] = len(matrix.get("items", []))
+    result["needs_judgment"] = needs_judgment
+    result["coverage_summary"] = matrix.get("summary", "")
+    result["pr_url"] = pr.get("html_url", "")
+    log.info(
+        f"  ✓ {result['status']}: {result['items_count']} items, "
+        f"needs_judgment={needs_judgment}"
+    )
+    return result
+
+
+# ─── Refinement-pass: convention alignment ─────────────────────────────────
+#
+# Triggered by the `outrider:fidelity-done` label. Extracts target-repo
+# conventions from recent merged PRs, identifies misalignments in the draft,
+# runs an agentic Claude Code patching session bounded to convention-shaped
+# changes (PR body shape, file placement, test idioms, docs entries —
+# explicitly NOT algorithm changes), force-pushes the result with the bot's
+# verified attribution, and posts an evidence comment listing the patterns
+# extracted + the PRs they were derived from.
+#
+# Input (workflow surface):
+#   INPUT_PR_NUMBER — PR number to refine
+#
+# Output:
+#   - PR head branch force-pushed with convention-aligned commit(s)
+#   - PR comment posted listing extracted patterns + evidence PRs
+#   - Label transition: outrider:fidelity-done → outrider:convention-done
+#   - status: convention_aligned / convention_skipped_* / convention_failed_*
+
+CONVENTION_LABEL_TRIGGER = "outrider:fidelity-done"
+CONVENTION_LABEL_DONE = "outrider:convention-done"
+CONVENTION_MAX_REFERENCE_PRS = 30
+
+
+# Paths the convention pass is allowed to modify. Anything else the agent
+# stages is reverted before commit so the patch is bounded to actually-
+# convention-shaped changes (PR-aligned tests, docs, the README index, etc.).
+# Order matters — the deny list is consulted first.
+_CONVENTION_DENY_PATTERNS = (
+    f"{BUNDLE_DIR_NAME}/",  # our own scaffolding bundle
+    "version.txt",
+    "VERSION",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "setup.py",
+    "pyproject.toml",
+    "MANIFEST.in",
+    ".github/",
+    "Dockerfile",
+)
+_CONVENTION_DENY_RE = re.compile(
+    # Language-variant READMEs (README_ja.md, README_zh-CN.md, etc.). Plain
+    # README.md is allowed — that's where the project index lives.
+    r"(^|/)README_[a-zA-Z][a-zA-Z0-9_\-]*\.md$",
+    re.IGNORECASE,
+)
+_CONVENTION_ALLOW_PATTERNS = (
+    ".py",            # any python file (where most convention patches land)
+    ".md",            # docs / paper-index / README.md
+    "tests/",         # test idioms
+    "docs/",          # documentation conventions
+    ".yml", ".yaml",  # CI / config sometimes carries the convention
+    ".toml",          # config (but pyproject.toml is in the deny list above)
+)
+
+# Path-prefix → allowed-extension table for repos that ship example scripts
+# as a documented part of their feature-rollout convention (e.g. OpenRLHF's
+# examples/scripts/train_*.sh shell wrappers). Each entry says "files under
+# this prefix may carry this extension even if the extension wouldn't be
+# allow-listed globally." Generic shell files outside these prefixes stay
+# out of scope.
+_CONVENTION_PREFIX_ALLOW = (
+    ("examples/scripts/", (".sh", ".py")),
+    ("examples/python/", (".py", ".md")),
+)
+
+
+def _partition_convention_staged_paths(
+    staged: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split staged file paths into (in_scope, out_of_scope) by the
+    convention-pass allow/deny rules. Deny list is consulted first; any
+    path matching a deny pattern is out-of-scope regardless of whether
+    it would otherwise be allowed."""
+    in_scope: list[str] = []
+    out_of_scope: list[str] = []
+    for path in staged:
+        if any(path.startswith(p) or f"/{p}" in f"/{path}/" for p in _CONVENTION_DENY_PATTERNS):
+            out_of_scope.append(path)
+            continue
+        if _CONVENTION_DENY_RE.search(path):
+            out_of_scope.append(path)
+            continue
+        # Prefix-scoped allow rules (e.g. examples/scripts/*.sh).
+        prefix_match = False
+        for prefix, exts in _CONVENTION_PREFIX_ALLOW:
+            if path.startswith(prefix) and any(path.endswith(ext) for ext in exts):
+                in_scope.append(path)
+                prefix_match = True
+                break
+        if prefix_match:
+            continue
+        if any(path.endswith(p) or p in path for p in _CONVENTION_ALLOW_PATTERNS):
+            in_scope.append(path)
+        else:
+            out_of_scope.append(path)
+    return in_scope, out_of_scope
+
+
+def _resolve_upstream_for_conventions(target: Target) -> str:
+    """Return the repo whose merged-PR corpus encodes the conventions
+    we should align to. For forks this is the parent; otherwise the
+    target itself."""
+    try:
+        meta = gh_api("GET", f"/repos/{target.repo}")
+    except RuntimeError:
+        return target.repo
+    parent = (meta.get("parent") or {}).get("full_name", "")
+    if parent and meta.get("fork"):
+        return parent
+    return target.repo
+
+
+def _fetch_recent_merged_prs(repo: str, limit: int) -> list[dict]:
+    """Return the most-recently-merged PRs on ``repo``, newest first.
+
+    Returns a list of dicts with ``number``, ``title``, ``body``,
+    ``merged_at``, ``additions``, ``deletions``, ``files`` (list of
+    ``{filename, status, additions, deletions}``). ``files`` is capped
+    at 40 entries per PR to bound the convention-extraction prompt size.
+    """
+    # GitHub's list API doesn't sort by merged_at; we use the search
+    # API which does, scoped to merged state on the repo.
+    q = f"repo:{repo} is:pr is:merged"
+    search = gh_api("GET", f"/search/issues?q={urllib.parse.quote(q)}&sort=updated&order=desc&per_page={limit}")
+    prs: list[dict] = []
+    for item in search.get("items", [])[:limit]:
+        num = item["number"]
+        try:
+            pr = gh_api("GET", f"/repos/{repo}/pulls/{num}")
+        except RuntimeError:
+            continue
+        try:
+            files = gh_api("GET", f"/repos/{repo}/pulls/{num}/files?per_page=40")
+        except RuntimeError:
+            files = []
+        prs.append({
+            "number": num,
+            "title": pr.get("title", ""),
+            "body": (pr.get("body") or "")[:6000],
+            "merged_at": pr.get("merged_at", ""),
+            "additions": pr.get("additions", 0),
+            "deletions": pr.get("deletions", 0),
+            "files": [
+                {"filename": f.get("filename", ""),
+                 "status": f.get("status", ""),
+                 "additions": f.get("additions", 0),
+                 "deletions": f.get("deletions", 0)}
+                for f in files[:40]
+            ],
+        })
+    return prs
+
+
+def _build_convention_extraction_prompt(
+    upstream_repo: str, recent_prs: list[dict]
+) -> str:
+    """Compose the prompt for the convention-extraction Claude one-shot."""
+    pr_blocks = []
+    for pr in recent_prs:
+        files_summary = "\n".join(
+            f"  - {f['filename']}  ({f['status']}, +{f['additions']}/-{f['deletions']})"
+            for f in pr["files"]
+        )
+        pr_blocks.append(
+            f"### #{pr['number']} — {pr['title']}\n"
+            f"merged: {pr['merged_at'][:10]}  +{pr['additions']}/-{pr['deletions']}\n\n"
+            f"**Body:**\n```\n{pr['body']}\n```\n\n"
+            f"**Files changed:**\n{files_summary}\n"
+        )
+    pr_corpus = "\n\n".join(pr_blocks)
+
+    return f"""You are extracting contributor conventions from a repo's recently-merged PRs.
+
+Target repo: {upstream_repo}
+Corpus: {len(recent_prs)} most-recently-merged PRs.
+
+# Recent merged PRs
+
+{pr_corpus}
+
+# Task
+
+Identify the conventions that a new contributor's PR should match for it to
+read as natively-shaped to this repo. Focus on patterns the PR-corpus
+demonstrates repeatedly (not one-off choices). For each pattern, cite the PR
+numbers it's derived from.
+
+Categories to inspect (skip any that don't have clear patterns in this
+corpus):
+
+- **pr_body_template**: required sections in the PR body (e.g. "What does
+  this PR do?", "Before submitting", "Who can review?", "AI writing
+  disclosure", etc.) and their typical content.
+- **code_placement**: when a new feature/method/option is added, where does
+  it land? Specific directories, files, classes, dispatch patterns
+  (e.g. `loss_type` dispatch in GRPOTrainer, `register_X` decorators,
+  config dataclass field placement).
+- **test_idiom**: how are new options tested? Parametrize patterns, test
+  file naming, test class structure, fixture conventions.
+- **docs_idiom**: where do new features get documented? Top-level docs
+  index files, README mentions, paper-index entries, docstring shape.
+- **ai_disclosure**: does the corpus show explicit AI-usage disclosure
+  blocks? If yes, what's the canonical shape?
+
+# Output
+
+Return ONLY valid JSON (no prose before or after):
+
+{{
+  "patterns": [
+    {{
+      "category": "<one of: pr_body_template | code_placement | test_idiom | docs_idiom | ai_disclosure>",
+      "description": "<one-to-three sentences describing the pattern>",
+      "evidence_pr_numbers": [<int>, ...],
+      "canonical_example": "<a short code/markdown snippet illustrating the pattern, or null>"
+    }},
+    ...
+  ]
+}}
+
+Limit yourself to the 5 most-load-bearing patterns. Skip patterns that only
+appear in 1-2 PRs.
+"""
+
+
+def _build_misalignment_prompt(
+    pr_title: str, pr_body: str, pr_diff: str, patterns: dict
+) -> str:
+    """Compose the prompt that takes (draft PR, extracted conventions)
+    and returns a list of actionable misalignment fixes."""
+    pattern_lines = []
+    for p in patterns.get("patterns", []):
+        pattern_lines.append(
+            f"- **{p.get('category')}**: {p.get('description')}\n"
+            f"  Evidence: PRs {p.get('evidence_pr_numbers', [])}\n"
+            f"  Example:\n```\n{(p.get('canonical_example') or '')[:1500]}\n```"
+        )
+    patterns_block = "\n\n".join(pattern_lines)
+
+    diff_excerpt = pr_diff if len(pr_diff) <= 40_000 else (
+        pr_diff[:40_000] + f"\n... [truncated; total {len(pr_diff)} chars] ...\n"
+    )
+
+    return f"""You are reviewing a draft PR for alignment with extracted target-repo conventions.
+
+# Target-repo conventions
+
+{patterns_block}
+
+# Draft PR
+
+**Title**: {pr_title}
+
+## PR body
+
+```
+{(pr_body or "")[:4000]}
+```
+
+## PR diff
+
+```
+{diff_excerpt}
+```
+
+# Task
+
+For each convention above, decide whether the draft is *aligned*, *misaligned*,
+or *not applicable*. For misaligned items, propose a concrete patch action
+(file to edit, what to add/change, expected outcome). Limit yourself to
+convention-shape patches — **DO NOT propose algorithmic or numerical-value
+changes**. Algorithm fidelity is a separate concern.
+
+# Output
+
+Return ONLY valid JSON (no prose):
+
+{{
+  "summary": "<one-sentence overall verdict>",
+  "actions": [
+    {{
+      "category": "<which convention category>",
+      "verdict": "aligned | misaligned | n/a",
+      "patch_action": "<concrete instruction for the patching agent, or null if aligned>",
+      "files_likely_touched": ["<path>", ...]
+    }},
+    ...
+  ]
+}}
+"""
+
+
+def _render_convention_evidence_comment(
+    upstream_repo: str,
+    patterns: dict,
+    misalignments: dict,
+    applied_patches_summary: str,
+    pr_body_updated: bool = False,
+    pr_body_rationale: str = "",
+    pr_body_skip_reason: str = "",
+) -> str:
+    """Produce the PR comment that surfaces what conventions were extracted
+    + which were applied, with evidence PR links so a reviewer can verify."""
+    lines = ["## Convention pass", ""]
+    lines.append(f"_{misalignments.get('summary', '(no summary)')}_")
+    lines.append("")
+    lines.append(f"Conventions extracted from `{upstream_repo}`'s recent merged PRs:")
+    lines.append("")
+    for p in patterns.get("patterns", []):
+        cat = p.get("category", "?")
+        desc = p.get("description", "")
+        evidence = p.get("evidence_pr_numbers", [])
+        evidence_md = ", ".join(
+            f"[#{n}](https://github.com/{upstream_repo}/pull/{n})" for n in evidence[:5]
+        )
+        lines.append(f"- **{cat}** — {desc}")
+        if evidence_md:
+            lines.append(f"  _Evidence:_ {evidence_md}")
+    lines.append("")
+    lines.append("### Patches applied")
+    lines.append("")
+    body_line = ""
+    if pr_body_updated:
+        body_line = f"- **PR body**: rewritten to match `pr_body_template` convention ({pr_body_rationale})."
+    elif pr_body_skip_reason:
+        body_line = f"- **PR body**: rewrite skipped — {pr_body_skip_reason}."
+    if body_line:
+        lines.append(body_line)
+    if applied_patches_summary.strip():
+        lines.append(applied_patches_summary)
+    elif not body_line:
+        lines.append("_No code patches applied (draft already aligned with extracted conventions, or no actionable convention-shape diffs identified)._")
+    lines.append("")
+    lines.append(
+        f"_Generated by [Outrider convention pass]"
+        f"({CANONICAL_ATTRIBUTION_URL}) at {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}._"
+    )
+    return "\n".join(lines)
+
+
+def _build_pr_body_rewrite_prompt(
+    pr_title: str, current_body: str, pr_body_pattern: dict, all_patterns: dict
+) -> str:
+    """Compose the prompt for a focused Claude one-shot that rewrites
+    the PR body to match the extracted pr_body_template convention.
+
+    The rewrite must preserve the existing ``## Coverage`` section
+    verbatim (Phase A's audit output stays intact), keep the same factual
+    content, and only restructure the body to use the headings + sections
+    the convention demands.
+    """
+    other_patterns = "\n".join(
+        f"- **{p.get('category')}**: {p.get('description', '')[:240]}"
+        for p in all_patterns.get("patterns", [])
+        if p.get("category") != "pr_body_template"
+    )
+    canonical = pr_body_pattern.get("canonical_example") or ""
+    description = pr_body_pattern.get("description", "")
+
+    return f"""You are rewriting a draft PR's body to match the target repo's PR body conventions.
+
+# PR being refined
+
+**Title**: {pr_title}
+
+# Current PR body
+
+```
+{current_body[:8000]}
+```
+
+# Convention to apply
+
+{description}
+
+**Canonical example:**
+
+```
+{canonical[:3000]}
+```
+
+# Other conventions (for context, do not address here)
+
+{other_patterns}
+
+# Task
+
+Produce an updated PR body that:
+
+1. **Matches the structural convention** above — the same heading hierarchy
+   (## H2 sections), the same recurring sections (e.g. ``## Problem`` / ``## Fix``
+   for fixes; ``## Summary`` / ``## Changes`` / ``## Motivation`` /
+   ``## Test plan`` for features), and any required checklists or task lists.
+2. **Preserves the existing ``## Coverage`` section verbatim** if present —
+   that section is the fidelity-audit output and must not be modified or
+   moved. If a Coverage section is present, keep it at the end of the body.
+3. **Reuses the same factual content** from the current body (code locations,
+   numbers, behavior callouts, test results) — do not invent new claims and
+   do not remove substantive details. Restructure, don't rewrite.
+4. **Does not add boilerplate** that isn't in the canonical example (no
+   "Generated by..." footers, no horizontal rules unless the canonical
+   example shows them).
+
+# Output
+
+Return ONLY valid JSON (no prose before or after):
+
+{{
+  "updated_body": "<the full new PR body in markdown>",
+  "rationale": "<one-sentence note on what structurally changed>"
+}}
+"""
+
+
+def _apply_pr_body_convention_update(
+    target: Target,
+    pr_number: int,
+    current_body: str,
+    pr_body_pattern: dict,
+    all_patterns: dict,
+    pr_title: str,
+    timeout_s: int,
+    workdir: Path,
+) -> tuple[bool, str, str]:
+    """Run the PR-body rewrite one-shot and PATCH the PR body.
+
+    Returns ``(ok, rationale, error)``. On non-fatal failure (Claude
+    failed, JSON unparseable, PATCH rejected) returns ``ok=False`` with
+    an error message — the caller decides whether to continue with the
+    file-patch step.
+    """
+    prompt = _build_pr_body_rewrite_prompt(
+        pr_title, current_body, pr_body_pattern, all_patterns
+    )
+    ok, raw = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=4)
+    if not ok:
+        return False, "", f"body-rewrite Claude call failed: {raw[-300:]}"
+    rewrite = _extract_json_object(raw)
+    if not rewrite or "updated_body" not in rewrite:
+        return False, "", f"body-rewrite returned unparseable JSON: {raw[-300:]}"
+    new_body = rewrite["updated_body"]
+    # Sanity check: if a Coverage section existed in the input, it must
+    # still exist verbatim in the output. Drop the rewrite if Phase A's
+    # audit was clobbered.
+    if FIDELITY_COVERAGE_SECTION_HEADER in current_body:
+        if FIDELITY_COVERAGE_SECTION_HEADER not in new_body:
+            return False, "", "body-rewrite dropped the ## Coverage section"
+    try:
+        _update_pr_body(target, pr_number, new_body)
+    except RuntimeError as e:
+        return False, "", f"PR body PATCH failed: {e}"
+    return True, rewrite.get("rationale", "structurally aligned to convention"), ""
+
+
+def _build_convention_patch_invocation(
+    patterns: dict, misalignments: dict, pr_title: str
+) -> str:
+    """Compose the INVOCATION.md content that drives the Claude Code
+    patching session.
+
+    The patching session edits files in the cloned PR head branch (cwd =
+    workdir). The agent reads the misalignment list, makes the smallest
+    edits needed to align with the extracted conventions, and STAGES the
+    changes for commit. The runner handles commit + push.
+    """
+    actions = [a for a in misalignments.get("actions", []) if a.get("verdict") == "misaligned"]
+    if not actions:
+        return ""
+
+    action_lines = []
+    for a in actions:
+        files = ", ".join(a.get("files_likely_touched", []) or [])
+        action_lines.append(
+            f"- **{a.get('category')}**: {a.get('patch_action', '')}\n"
+            f"  Files to consider: {files or '(any relevant)'}\n"
+        )
+    actions_block = "\n".join(action_lines)
+
+    pattern_lines = []
+    for p in patterns.get("patterns", []):
+        if p.get("canonical_example"):
+            pattern_lines.append(
+                f"### {p.get('category')}\n\n{p.get('description', '')}\n\n"
+                f"Canonical example:\n```\n{p['canonical_example'][:2000]}\n```"
+            )
+    patterns_block = "\n\n".join(pattern_lines)
+
+    return f"""# Convention-alignment patches
+
+PR under refinement: "{pr_title}"
+
+You are running in the cloned PR head branch (cwd = the workdir). Your task
+is to apply small, convention-shape patches to align this draft with the
+target repo's contributor conventions. Use the Read, Edit, Glob, and Grep
+tools as needed.
+
+## Scope guard — read carefully
+
+- **DO** patch: code files (`*.py`) where the convention is about *placement
+  or naming*, the project's main `README.md` (only if the convention is a
+  documented-feature pattern), test files in `tests/`, documentation pages
+  in `docs/`, paper-index entries.
+- **DO NOT** touch any of:
+  - `.remyx-recommendation/` — our own scaffolding, not part of the PR's
+    surface; leave alone even if you see references to it.
+  - `version.txt`, `VERSION`, `package-lock.json`, `yarn.lock`, `*.lock`,
+    `setup.py`, `pyproject.toml`, `MANIFEST.in`, `Dockerfile` — release /
+    packaging surfaces, not contributor conventions.
+  - `README_<lang>.md` (Japanese / Chinese / etc. language variants) —
+    they're maintained by native-language maintainers and shouldn't be
+    updated by a programmatic patcher. The main `README.md` may be edited.
+  - `.github/workflows/` — CI is out of this pass's scope.
+- **DO NOT** patch: algorithm logic, numerical constants, default values,
+  control flow of math-bearing functions, what's multiplied by what. Those
+  are algorithm-fidelity concerns and are out of this pass's scope.
+
+If a misalignment is ambiguous between "convention" and "algorithm", skip it
+and leave a note in your final summary. **It is strictly better to skip an
+unclear patch than to make one that touches paper-anchored math.**
+
+## Extracted conventions
+
+{patterns_block}
+
+## Misalignments to address
+
+{actions_block}
+
+## After patching
+
+Stage all changes with ``git add -A``. Do not commit — the orchestrator
+handles the commit and force-push with the bot's verified attribution.
+
+Print a brief markdown summary of what you actually changed (file paths +
+one-line per file), bullet-listed, in your final response. The runner uses
+this summary verbatim in the PR comment that explains the patches.
+"""
+
+
+def run_convention_pass(target: Target) -> dict:
+    """Phase B — diff a remyx-ai[bot] PR against the target repo's recent
+    merged-PR conventions, patch convention-shape misalignments via an
+    agentic session, force-push, and transition labels.
+
+    Status values:
+        convention_aligned                  — patches applied (or no
+                                              misalignments found)
+        convention_skipped_no_pr            — INPUT_PR_NUMBER empty
+        convention_skipped_not_bot          — PR not authored by remyx-ai[bot]
+        convention_skipped_no_corpus        — upstream has too few merged PRs
+                                              to extract patterns from
+        convention_failed_extraction        — pattern extraction Claude call
+                                              failed
+        convention_failed_misalignment      — misalignment Claude call failed
+        convention_failed_patch             — Claude Code patch session failed
+        convention_failed_push              — git push step failed
+    """
+    result: dict = {"repo": target.repo, "mode": "convention", "status": "unknown"}
+
+    pr_number_raw = os.environ.get("INPUT_PR_NUMBER", "").strip()
+    if not pr_number_raw:
+        result["status"] = "convention_skipped_no_pr"
+        log.info("  ✗ convention mode invoked without INPUT_PR_NUMBER")
+        return result
+    try:
+        pr_number = int(pr_number_raw)
+    except ValueError:
+        result["status"] = "convention_skipped_no_pr"
+        return result
+    result["pr_number"] = pr_number
+    log.info(f"  → convention pass on {target.repo}#{pr_number}")
+
+    try:
+        pr = _fetch_pr_metadata(target, pr_number)
+    except RuntimeError as e:
+        result["status"] = "convention_failed_extraction"
+        result["error"] = f"could not fetch PR: {e}"
+        return result
+
+    author = (pr.get("user") or {}).get("login", "")
+    if author != "remyx-ai[bot]":
+        result["status"] = "convention_skipped_not_bot"
+        result["error"] = f"PR author is {author!r}, not remyx-ai[bot]"
+        return result
+
+    upstream_repo = _resolve_upstream_for_conventions(target)
+    log.info(f"  → resolving conventions from {upstream_repo}")
+    result["upstream_repo"] = upstream_repo
+
+    recent_prs = _fetch_recent_merged_prs(upstream_repo, CONVENTION_MAX_REFERENCE_PRS)
+    if len(recent_prs) < 5:
+        result["status"] = "convention_skipped_no_corpus"
+        result["error"] = f"only {len(recent_prs)} merged PRs found on {upstream_repo}"
+        return result
+    log.info(f"  → corpus: {len(recent_prs)} recent merged PRs")
+
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-convention-"))
+    log.info(f"  → workdir: {workdir}")
+
+    # Pattern extraction (one-shot)
+    log.info("  → extracting conventions (one-shot)")
+    extraction_prompt = _build_convention_extraction_prompt(upstream_repo, recent_prs)
+    ok, raw = _run_claude_oneshot(workdir, extraction_prompt, target.claude_timeout_s, max_turns=8)
+    if not ok:
+        result["status"] = "convention_failed_extraction"
+        result["error"] = f"extraction call failed: {raw[-500:]}"
+        return result
+    patterns = _extract_json_object(raw)
+    if not patterns or "patterns" not in patterns:
+        result["status"] = "convention_failed_extraction"
+        result["error"] = f"extraction returned unparseable JSON: {raw[-500:]}"
+        return result
+    result["patterns_count"] = len(patterns.get("patterns", []))
+    log.info(f"  → extracted {result['patterns_count']} patterns")
+
+    # Fetch draft PR diff for misalignment analysis
+    try:
+        pr_diff = _fetch_pr_diff(target, pr_number)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        result["status"] = "convention_failed_misalignment"
+        result["error"] = f"could not fetch PR diff: {e}"
+        return result
+
+    # Misalignment analysis (one-shot)
+    log.info("  → identifying misalignments (one-shot)")
+    misalignment_prompt = _build_misalignment_prompt(
+        pr.get("title", ""), pr.get("body", "") or "", pr_diff, patterns,
+    )
+    ok, raw = _run_claude_oneshot(workdir, misalignment_prompt, target.claude_timeout_s, max_turns=8)
+    if not ok:
+        result["status"] = "convention_failed_misalignment"
+        result["error"] = f"misalignment call failed: {raw[-500:]}"
+        return result
+    misalignments = _extract_json_object(raw)
+    if not misalignments or "actions" not in misalignments:
+        result["status"] = "convention_failed_misalignment"
+        result["error"] = f"misalignment returned unparseable JSON: {raw[-500:]}"
+        return result
+    actionable = [a for a in misalignments.get("actions", []) if a.get("verdict") == "misaligned"]
+    result["actionable_count"] = len(actionable)
+    log.info(f"  → {len(actionable)} actionable misalignments")
+
+    patches_summary = ""
+
+    # PR-body rewrites are handled separately from file patches: the PR
+    # body lives in GitHub metadata, not in the cloned repo, so the
+    # agentic patch session can't touch it. We do a focused one-shot +
+    # gh PATCH here and remove the pr_body_template action from the
+    # list passed to the agent.
+    pr_body_action = next(
+        (a for a in actionable if a.get("category") == "pr_body_template"), None,
+    )
+    pr_body_pattern = next(
+        (p for p in patterns.get("patterns", []) if p.get("category") == "pr_body_template"),
+        None,
+    )
+    if pr_body_action and pr_body_pattern:
+        log.info("  → rewriting PR body to match pr_body_template convention")
+        ok, rationale, err = _apply_pr_body_convention_update(
+            target=target,
+            pr_number=pr_number,
+            current_body=pr.get("body") or "",
+            pr_body_pattern=pr_body_pattern,
+            all_patterns=patterns,
+            pr_title=pr.get("title", ""),
+            timeout_s=target.claude_timeout_s,
+            workdir=workdir,
+        )
+        if ok:
+            log.info(f"  ✓ PR body updated: {rationale}")
+            result["pr_body_updated"] = True
+            result["pr_body_rationale"] = rationale
+            # Drop the PR-body action from the agent's queue so it doesn't
+            # try to also restructure code in pursuit of the same fix.
+            actionable = [a for a in actionable if a is not pr_body_action]
+        else:
+            log.warning(f"  ! PR body rewrite skipped (non-fatal): {err}")
+            result["pr_body_updated"] = False
+            result["pr_body_skip_reason"] = err
+    else:
+        result["pr_body_updated"] = False
+
+    if actionable:
+        # Clone the PR head branch (we need to patch + push to it).
+        head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or target.repo
+        head_ref = (pr.get("head") or {}).get("ref", "")
+        if not head_ref:
+            result["status"] = "convention_failed_patch"
+            result["error"] = "could not resolve PR head branch"
+            return result
+
+        log.info(f"  → cloning PR head {head_repo}:{head_ref}")
+        clone_workdir = workdir / "draft"
+        token = _github_token()
+        clone_url = f"https://x-access-token:{token}@github.com/{head_repo}.git"
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", head_ref, clone_url, str(clone_workdir)],
+                check=True, capture_output=True, timeout=300, env=env,
+            )
+        except subprocess.CalledProcessError as e:
+            result["status"] = "convention_failed_patch"
+            result["error"] = f"clone PR head failed: {e.stderr.decode()[:500]}"
+            return result
+
+        # Capture the parent SHA before any changes — this is the commit
+        # the new bot-authored commit will descend from.
+        parent_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+        ).stdout.strip()
+
+        # Write the INVOCATION for Claude Code
+        bundle_dir = clone_workdir / BUNDLE_DIR_NAME
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        invocation = _build_convention_patch_invocation(
+            patterns, misalignments, pr.get("title", ""),
+        )
+        (bundle_dir / "INVOCATION.md").write_text(invocation)
+
+        # Run the agentic patch loop
+        log.info(f"  → invoking Claude Code patch session (timeout={target.claude_timeout_s}s)")
+        ok, patch_output = invoke_claude_code(clone_workdir, timeout_s=target.claude_timeout_s)
+        if not ok:
+            result["status"] = "convention_failed_patch"
+            result["error"] = f"patch session failed: {patch_output[-500:]}"
+            return result
+        patches_summary = patch_output
+
+        # Inspect staged changes
+        try:
+            staged_raw = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+            ).stdout.strip()
+        except subprocess.CalledProcessError as e:
+            result["status"] = "convention_failed_patch"
+            result["error"] = f"git diff --cached failed: {e.stderr[:500]}"
+            return result
+
+        all_staged = staged_raw.splitlines() if staged_raw else []
+
+        # Scope filter: only keep changes that match convention-shape paths.
+        # Drop our own scaffolding (BUNDLE_DIR_NAME/), language-variant READMEs,
+        # version files, lock files — anything the agent shouldn't have touched
+        # but might have. Out-of-scope edits are reverted via git restore so
+        # the commit only carries the legitimate convention patches.
+        in_scope, out_of_scope = _partition_convention_staged_paths(all_staged)
+        if out_of_scope:
+            log.info(f"  → reverting {len(out_of_scope)} out-of-scope files: {out_of_scope[:5]}")
+            try:
+                subprocess.run(
+                    ["git", "restore", "--staged", "--worktree", *out_of_scope],
+                    check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+                )
+            except subprocess.CalledProcessError as e:
+                log.warning(f"  ! restore of out-of-scope paths failed (continuing): {e.stderr[:300]}")
+        result["files_touched"] = in_scope
+        result["files_dropped_out_of_scope"] = out_of_scope
+
+        if in_scope:
+            log.info(f"  → {len(in_scope)} files patched in-scope: {in_scope[:5]}")
+
+            # Auto-fix lint-trivial issues the patching agent may have
+            # introduced (unused imports, trailing whitespace, ruff format
+            # gaps, etc.) before the commit lands. Non-trivial issues
+            # (e.g. B002 double-unary-minus) are NOT auto-fixed and remain
+            # for the test gate to surface — that's the right division of
+            # labor: convention pass cleans up the cheap stuff, test gate
+            # gates on what's genuinely actionable.
+            py_in_scope = [p for p in in_scope if p.endswith(".py")]
+            if py_in_scope:
+                # Ensure ruff is available on the runner (not in action.yml's
+                # baseline install set; cheap to install here).
+                subprocess.run(
+                    ["python", "-m", "pip", "install", "--quiet",
+                     "--disable-pip-version-check", "ruff"],
+                    capture_output=True, timeout=60,
+                )
+                log.info(
+                    f"  → ruff --fix + ruff format on {len(py_in_scope)} patched .py files"
+                )
+                try:
+                    subprocess.run(
+                        ["ruff", "check", "--fix", "--exit-zero",
+                         "--no-cache", *py_in_scope],
+                        cwd=str(clone_workdir),
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    subprocess.run(
+                        ["ruff", "format", "--no-cache", *py_in_scope],
+                        cwd=str(clone_workdir),
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    # Re-stage anything ruff modified so the commit picks
+                    # the fixes up. Idempotent if ruff made no changes.
+                    subprocess.run(
+                        ["git", "add", *py_in_scope],
+                        check=True, cwd=str(clone_workdir),
+                        capture_output=True, timeout=30,
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    log.warning(f"  ! ruff auto-fix step failed (continuing): {e}")
+
+            commit_msg = (
+                f"chore: align PR with target-repo conventions\n\n"
+                f"Convention-shape patches extracted from {upstream_repo}'s "
+                f"recent merged PRs. Algorithm logic is left untouched. "
+                f"Ruff auto-fixed lint-trivial issues on patched files."
+            )
+
+            # Local commit so HEAD's tree carries the new content. The
+            # subsequent _recommit_via_api wraps that tree in an API-created
+            # commit signed by the bot installation token (Verified badge).
+            try:
+                subprocess.run(
+                    ["git", "commit", "-m", commit_msg],
+                    check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+                )
+            except subprocess.CalledProcessError as e:
+                result["status"] = "convention_failed_push"
+                result["error"] = f"local commit failed: {e.stderr[:500]}"
+                return result
+
+            # Push first so origin has the branch at our new commit, then
+            # re-author via API to get the Verified badge.
+            try:
+                subprocess.run(
+                    ["git", "push", "--force-with-lease", "origin", head_ref],
+                    check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+                    env=env,
+                )
+            except subprocess.CalledProcessError as e:
+                result["status"] = "convention_failed_push"
+                result["error"] = f"git push failed: {e.stderr[:500]}"
+                return result
+
+            try:
+                _recommit_via_api(
+                    clone_workdir, head_repo, head_ref, commit_msg,
+                    parent_sha=parent_sha,
+                )
+            except Exception as e:
+                # _recommit_via_api degrades gracefully (logs warning, keeps
+                # the pushed commit) so we only land here on a programming
+                # error. Don't fail the whole run — the patches are pushed.
+                log.warning(f"  ! API re-author failed (Verified badge missed): {e}")
+        else:
+            log.info("  → no in-scope staged changes after filtering; skipping push")
+
+    # Evidence — to the action run-summary panel only. The PR body
+    # itself is owned by the convention-driven rewrite performed earlier
+    # in this run; appending an `## Convention pass` H2 here would
+    # contradict the body's upstream-shape, which is the whole point of
+    # this phase.
+    log.info("  → writing convention-pass evidence to step summary")
+    evidence_md = _render_convention_evidence_comment(
+        upstream_repo, patterns, misalignments, patches_summary,
+        pr_body_updated=bool(result.get("pr_body_updated")),
+        pr_body_rationale=result.get("pr_body_rationale", ""),
+        pr_body_skip_reason=result.get("pr_body_skip_reason", ""),
+    )
+    _append_to_step_summary(evidence_md)
+
+    # Label transition
+    _add_pr_label(target, pr_number, CONVENTION_LABEL_DONE)
+    _remove_pr_label(target, pr_number, CONVENTION_LABEL_TRIGGER)
+
+    result["status"] = "convention_aligned"
+    result["summary"] = misalignments.get("summary", "")
+    result["pr_url"] = pr.get("html_url", "")
+    log.info(
+        f"  ✓ {result['status']}: {result.get('actionable_count', 0)} actionable, "
+        f"{len(result.get('files_touched', []))} files patched"
+    )
+    return result
+
+
+# ─── Refinement-pass: test gate ────────────────────────────────────────────
+#
+# Triggered after the convention pass completes. Runs lint + targeted tests
+# on the PR's added/modified files, writes a result panel to the action's
+# run-summary, drops the PR's draft state on a passing run (the canonical
+# GitHub signal for "ready for review"), and applies the
+# ``outrider:test-failed`` label only on a hard failure. PR body is left
+# untouched — that's the convention pass's surface.
+#
+# Heavier validation workloads (CPU smoke pass, benchmarks, LLM judges) are
+# deferred to a forthcoming "validate" phase that opts in via outrider.yaml
+# in the target repo; this phase sticks to checks that fit in a stock runner
+# without needing GPU or special-cased infra.
+
+TEST_LABEL_TRIGGER = "outrider:convention-done"
+TEST_LABEL_FAILED = "outrider:test-failed"
+
+_TEST_LINT_TIMEOUT_S = 120
+_TEST_PYTEST_TIMEOUT_S = 240
+_TEST_DEP_INSTALL_TIMEOUT_S = 480  # 8 min upper bound; most pure-Python repos finish in <2 min
+
+
+# PyPI distribution names commonly imported under a different top-level
+# package name. The AST scan returns import-name; pip needs dist-name.
+_IMPORT_TO_DIST = {
+    "yaml": "PyYAML",
+    "PIL": "pillow",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "Crypto": "pycryptodome",
+    "OpenSSL": "pyOpenSSL",
+    "bs4": "beautifulsoup4",
+    "google": "google-cloud-core",  # ambiguous; better than nothing
+}
+
+# Top-level imports that are part of the Python stdlib or always-installed
+# on a stock GH Actions runner — never need pip install.
+_STDLIB_OR_PREINSTALLED = frozenset({
+    # stdlib (representative subset; more added below dynamically)
+    "abc", "argparse", "ast", "asyncio", "base64", "bisect", "builtins",
+    "bz2", "collections", "configparser", "contextlib", "copy", "csv",
+    "ctypes", "dataclasses", "datetime", "decimal", "difflib", "dis",
+    "doctest", "email", "enum", "errno", "fileinput", "fnmatch",
+    "fractions", "functools", "gc", "getopt", "getpass", "gettext", "glob",
+    "gzip", "hashlib", "heapq", "hmac", "html", "http", "imp", "importlib",
+    "inspect", "io", "ipaddress", "itertools", "json", "keyword", "linecache",
+    "locale", "logging", "lzma", "math", "mimetypes", "multiprocessing",
+    "numbers", "operator", "os", "pathlib", "pdb", "pickle", "platform",
+    "plistlib", "pprint", "queue", "random", "re", "secrets", "select",
+    "shlex", "shutil", "signal", "site", "smtplib", "socket", "sqlite3",
+    "ssl", "stat", "statistics", "string", "stringprep", "struct",
+    "subprocess", "sys", "tarfile", "tempfile", "textwrap", "threading",
+    "time", "timeit", "tkinter", "token", "tokenize", "trace", "traceback",
+    "types", "typing", "unicodedata", "unittest", "urllib", "uuid",
+    "warnings", "weakref", "webbrowser", "xml", "xmlrpc", "zipfile",
+    "zipimport", "zlib",
+    # Pre-installed on the GH Actions runner via action.yml
+    "pytest", "ruff", "remyxai",
+})
+
+# Packages whose build step requires torch to be importable (PEP 517 build
+# isolation defeats this when ``pip install -e .`` builds them in a fresh
+# env). Pre-installing CPU torch BEFORE attempting full install handles the
+# common ML-repo pattern.
+_TORCH_BUILD_DEPENDENTS = frozenset({
+    "flash_attn", "flash-attn", "flash_attn_2",
+    "mamba_ssm", "mamba-ssm",
+    "causal_conv1d", "causal-conv1d",
+    "xformers",
+    "deepspeed",
+    "apex",
+    "triton",
+})
+
+
+def _extract_external_imports(
+    workdir: Path, test_files: list[str]
+) -> tuple[list[str], list[str]]:
+    """AST-walk the touched test files and return
+    ``(external_imports, local_imports)``.
+
+    A top-level import name is classified as ``local`` if a same-named
+    directory or ``.py`` file exists at the repo root (i.e., the import
+    resolves from ``PYTHONPATH=<workdir>`` without pip install). Otherwise
+    it's ``external`` and goes on the pip install list. Stdlib and
+    runner-preinstalled names are filtered out of both lists.
+    """
+    external: set[str] = set()
+    local: set[str] = set()
+    repo_top_level = {p.stem for p in workdir.iterdir() if p.is_dir() or p.suffix == ".py"}
+    for rel in test_files:
+        path = workdir / rel
+        if not path.is_file():
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top in _STDLIB_OR_PREINSTALLED:
+                        continue
+                    if top in repo_top_level:
+                        local.add(top)
+                    else:
+                        external.add(top)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and node.level == 0:
+                    top = node.module.split(".")[0]
+                    if top in _STDLIB_OR_PREINSTALLED:
+                        continue
+                    if top in repo_top_level:
+                        local.add(top)
+                    else:
+                        external.add(top)
+    return sorted(external), sorted(local)
+
+
+def _install_focused_test_deps(
+    workdir: Path, external_imports: list[str]
+) -> tuple[bool, str]:
+    """Install just the external Python packages the touched test files
+    actually import, plus any torch-build-required deps. Skips the full
+    target-repo install entirely; tests resolve local imports via the
+    ``PYTHONPATH=<workdir>`` set in :func:`_run_test_pytest`.
+
+    Multi-strategy: if any torch-build-dependent package is in the
+    extracted imports, pre-install CPU torch first via PyTorch's CPU
+    wheel index so the dependent package can build.
+
+    Returns ``(installed, summary)``.
+    """
+    if not external_imports:
+        return True, "no external imports detected in touched test files"
+
+    # Map import names to PyPI dist names where they differ.
+    dist_names = [_IMPORT_TO_DIST.get(name, name) for name in external_imports]
+
+    # Decide whether to pre-install torch from the CPU wheel index.
+    needs_torch_first = (
+        "torch" in external_imports
+        or any(name.replace("-", "_") in _TORCH_BUILD_DEPENDENTS for name in external_imports)
+    )
+
+    install_log: list[str] = []
+    env = {**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+
+    if needs_torch_first and "torch" in dist_names:
+        # Move torch to its own install step so we can pin the CPU index.
+        dist_names = [n for n in dist_names if n != "torch"]
+        log.info("  → installing torch (CPU wheel) before other deps")
+        try:
+            proc = subprocess.run(
+                ["python", "-m", "pip", "install", "--quiet",
+                 "--index-url", "https://download.pytorch.org/whl/cpu",
+                 "torch"],
+                capture_output=True, text=True,
+                timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"torch CPU-wheel install timed out after {_TEST_DEP_INSTALL_TIMEOUT_S}s"
+        if proc.returncode != 0:
+            return False, f"torch CPU-wheel install failed: {(proc.stderr or proc.stdout)[-800:].strip()}"
+        install_log.append("torch (CPU wheel)")
+
+    if dist_names:
+        log.info(f"  → installing focused deps: {dist_names}")
+        try:
+            proc = subprocess.run(
+                ["python", "-m", "pip", "install", "--quiet", *dist_names],
+                capture_output=True, text=True,
+                timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"focused-deps install timed out after {_TEST_DEP_INSTALL_TIMEOUT_S}s"
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "")[-1200:].strip()
+            return False, f"focused-deps install failed (exit {proc.returncode}):\n{tail}"
+        install_log.append(", ".join(dist_names))
+
+    return True, "installed: " + "; then ".join(install_log) if install_log else "no install needed"
+
+
+def _extract_touched_files(pr_diff: str) -> tuple[list[str], list[str]]:
+    """Parse a unified diff to extract added/modified file paths.
+
+    Returns ``(python_files, test_files)``. ``test_files`` is the subset
+    of python_files whose path matches the conventional test patterns
+    (``tests/...``, ``**/test_*.py``, ``**/*_test.py``) so the test
+    gate can run a focused pytest invocation.
+    """
+    py_files: list[str] = []
+    for line in (pr_diff or "").splitlines():
+        # New file: "+++ b/path/to/file.py"
+        if line.startswith("+++ b/") and line.endswith(".py"):
+            path = line[6:]
+            if path not in py_files:
+                py_files.append(path)
+    test_files = [
+        p for p in py_files
+        if p.startswith("tests/") or p.startswith("test/")
+        or "/tests/" in p or "/test/" in p
+        or Path(p).name.startswith("test_")
+        or Path(p).name.endswith("_test.py")
+    ]
+    return py_files, test_files
+
+
+def _run_test_lint(
+    workdir: Path, touched_py_files: list[str]
+) -> tuple[str, str, int]:
+    """Run ruff check on PR-touched Python files.
+
+    Returns ``(status, output, issue_count)`` where status is
+    ``"passed"`` / ``"failed"`` / ``"unvalidated"`` (no files to check
+    or ruff not installable). ``issue_count`` is parsed from ruff's
+    summary line when status is failed.
+    """
+    if not touched_py_files:
+        return "unvalidated", "no python files touched by this PR", 0
+
+    # Ensure ruff is available — the existing action.yml installs pytest
+    # and remyxai but not ruff; install ad-hoc rather than threading
+    # another dep through action.yml.
+    install = subprocess.run(
+        ["python", "-m", "pip", "install", "--quiet", "ruff"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if install.returncode != 0:
+        return "unvalidated", f"could not install ruff: {install.stderr[-300:]}", 0
+
+    existing = [f for f in touched_py_files if (workdir / f).is_file()]
+    if not existing:
+        return "unvalidated", "no touched .py files found in workdir", 0
+
+    log.info(f"  → running ruff check on {len(existing)} touched .py files")
+    try:
+        proc = subprocess.run(
+            ["ruff", "check", "--no-fix", "--output-format=concise", *existing],
+            cwd=workdir, capture_output=True, text=True,
+            timeout=_TEST_LINT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", f"ruff timed out after {_TEST_LINT_TIMEOUT_S}s", 0
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode == 0:
+        return "passed", output[-2000:].strip() or "All ruff checks passed.", 0
+    # Ruff exit 1 = lint issues; exit 2 = ruff itself errored. Count
+    # issue lines for the comment summary.
+    issue_lines = [l for l in (proc.stdout or "").splitlines() if ":" in l and l.strip()]
+    return "failed", output[-2500:], len(issue_lines)
+
+
+def _run_test_pytest(
+    workdir: Path, touched_test_files: list[str]
+) -> tuple[str, str]:
+    """Run pytest on the PR's added/modified test files.
+
+    ``PYTHONPATH=<workdir>`` is prepended so local imports
+    (``from openrlhf.utils import ...``) resolve from the cloned repo
+    without requiring a ``pip install -e .`` step — that step is the
+    main reason most ML-repo test runs blow up on build-time deps
+    (flash-attn / deepspeed wheels that need torch present to build).
+
+    Returns ``(status, output)`` matching ``run_tests``' contract:
+    ``"passed"`` / ``"failed"`` / ``"unvalidated"``. ``unvalidated``
+    fires when the runner lacks the target repo's full dep set
+    (collection ImportError) — informational, doesn't gate the chain.
+    """
+    if not touched_test_files:
+        return "unvalidated", "no test files touched by this PR"
+
+    existing = [f for f in touched_test_files if (workdir / f).is_file()]
+    if not existing:
+        return "unvalidated", "no touched test files found in workdir"
+
+    log.info(f"  → running pytest on {len(existing)} touched test files")
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath = str(workdir) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    env = {**os.environ, "PYTHONPATH": pythonpath}
+    try:
+        proc = subprocess.run(
+            ["python", "-m", "pytest", "-q", "--maxfail=5", *existing],
+            cwd=workdir, capture_output=True, text=True,
+            timeout=_TEST_PYTEST_TIMEOUT_S, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", f"pytest timed out after {_TEST_PYTEST_TIMEOUT_S}s"
+    output = (proc.stdout or "") + ("\n--- STDERR ---\n" + proc.stderr if proc.stderr else "")
+    return _classify_pytest(proc.returncode, output), output[-3000:]
+
+
+def _render_test_section(
+    lint_status: str, lint_output: str, lint_issues: int,
+    test_status: str, test_output: str,
+    touched_py: list[str], touched_tests: list[str],
+    package_manager: str,
+    deps_installed: bool = False,
+    deps_install_summary: str = "",
+) -> str:
+    """Compose the markdown body section summarising the test gate's findings."""
+    icon = {"passed": "✓", "failed": "✗", "unvalidated": "—"}
+    summary_parts = [
+        f"**Lint** {icon.get(lint_status, '?')} {lint_status}",
+        f"**Tests** {icon.get(test_status, '?')} {test_status}",
+    ]
+    lines = ["## Refinement checks", ""]
+    lines.append(" · ".join(summary_parts))
+    lines.append("")
+    lines.append(f"Touched in this PR: **{len(touched_py)} Python files** "
+                 f"({len(touched_tests)} test). Package manager detected: `{package_manager}`. "
+                 f"Deps install: {'succeeded' if deps_installed else 'skipped/failed'}.")
+    if deps_install_summary:
+        lines.append("")
+        lines.append(f"_{deps_install_summary[:600]}_")
+    lines.append("")
+
+    lines.append(f"### Lint — `{lint_status}`")
+    if lint_status == "passed":
+        lines.append("All ruff checks passed on PR-touched files.")
+    elif lint_status == "unvalidated":
+        lines.append(f"_{lint_output}_")
+    else:
+        lines.append(f"Ruff surfaced **{lint_issues} issues** on PR-touched files:")
+        lines.append("")
+        lines.append("```")
+        lines.append(lint_output)
+        lines.append("```")
+    lines.append("")
+
+    lines.append(f"### Tests — `{test_status}`")
+    if test_status == "passed":
+        lines.append(f"`pytest` on touched test files succeeded.")
+    elif test_status == "unvalidated":
+        if "no test files" in test_output or "no touched test files" in test_output:
+            lines.append(f"_{test_output}_")
+        else:
+            lines.append(
+                "Tests could not be exercised — collection failed on a missing "
+                "dependency or import error. This is an environment limitation, "
+                "not a code failure (a stock runner lacks the target repo's "
+                "full ML dependency set). The PR's own changes were not run."
+            )
+            lines.append("")
+            lines.append("<details><summary>collection output (tail)</summary>")
+            lines.append("")
+            lines.append("```")
+            lines.append(test_output[-1500:])
+            lines.append("```")
+            lines.append("")
+            lines.append("</details>")
+    else:
+        lines.append(f"Pytest run failed:")
+        lines.append("")
+        lines.append("```")
+        lines.append(test_output)
+        lines.append("```")
+    lines.append("")
+    lines.append(
+        f"_Generated by [Outrider test gate]"
+        f"({CANONICAL_ATTRIBUTION_URL}) at {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}._"
+    )
+    return "\n".join(lines)
+
+
+def run_test_gate(target: Target) -> dict:
+    """Test gate — lint + targeted pytest on a remyx-ai[bot] PR. Writes
+    a result section to the action's run-summary, drops the PR's draft
+    state on a passing run (the canonical GitHub signal for "ready for
+    review"), and applies ``outrider:test-failed`` on hard failure.
+
+    Status values:
+        test_passed                  — lint passed, tests passed-or-unvalidated
+        test_failed                  — lint surfaced issues OR tests failed
+        test_skipped_no_pr           — INPUT_PR_NUMBER empty
+        test_skipped_not_bot         — PR not authored by remyx-ai[bot]
+        test_failed_setup            — could not clone PR head
+    """
+    result: dict = {"repo": target.repo, "mode": "test", "status": "unknown"}
+
+    pr_number_raw = os.environ.get("INPUT_PR_NUMBER", "").strip()
+    if not pr_number_raw:
+        result["status"] = "test_skipped_no_pr"
+        return result
+    try:
+        pr_number = int(pr_number_raw)
+    except ValueError:
+        result["status"] = "test_skipped_no_pr"
+        return result
+    result["pr_number"] = pr_number
+    log.info(f"  → test gate on {target.repo}#{pr_number}")
+
+    try:
+        pr = _fetch_pr_metadata(target, pr_number)
+    except RuntimeError as e:
+        result["status"] = "test_failed_setup"
+        result["error"] = f"could not fetch PR: {e}"
+        return result
+
+    author = (pr.get("user") or {}).get("login", "")
+    if author != "remyx-ai[bot]":
+        result["status"] = "test_skipped_not_bot"
+        return result
+
+    try:
+        pr_diff = _fetch_pr_diff(target, pr_number)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        result["status"] = "test_failed_setup"
+        result["error"] = f"could not fetch PR diff: {e}"
+        return result
+
+    touched_py, touched_tests = _extract_touched_files(pr_diff)
+    log.info(f"  → PR touches {len(touched_py)} .py files ({len(touched_tests)} tests)")
+    result["touched_py_files"] = touched_py
+    result["touched_test_files"] = touched_tests
+
+    # Clone PR head — lint + pytest both need actual files on disk.
+    head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or target.repo
+    head_ref = (pr.get("head") or {}).get("ref", "")
+    if not head_ref:
+        result["status"] = "test_failed_setup"
+        result["error"] = "could not resolve PR head branch"
+        return result
+
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-test-"))
+    clone_workdir = workdir / "draft"
+    token = _github_token()
+    clone_url = f"https://x-access-token:{token}@github.com/{head_repo}.git"
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    log.info(f"  → cloning PR head {head_repo}:{head_ref}")
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", head_ref, clone_url, str(clone_workdir)],
+            check=True, capture_output=True, timeout=300, env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        result["status"] = "test_failed_setup"
+        result["error"] = f"clone PR head failed: {e.stderr.decode()[:500]}"
+        return result
+
+    pkg_mgr, _ = _detect_verification_stack(clone_workdir)
+    result["package_manager"] = pkg_mgr
+
+    # Lint
+    lint_status, lint_output, lint_issues = _run_test_lint(clone_workdir, touched_py)
+    result["lint_status"] = lint_status
+    result["lint_issues"] = lint_issues
+    log.info(f"  → lint: {lint_status} ({lint_issues} issues)")
+
+    # Install only what the touched test files actually import — much
+    # more likely to succeed on ML repos than a full ``pip install -e .``
+    # (which can blow up on heavy build-time deps like flash-attn /
+    # deepspeed that need torch present during their PEP 517 build).
+    # Local imports resolve via PYTHONPATH=<workdir> in _run_test_pytest.
+    external_imports, local_imports = _extract_external_imports(clone_workdir, touched_tests)
+    log.info(f"  → touched-test imports: external={external_imports}, local={local_imports}")
+    install_ok, install_summary = _install_focused_test_deps(clone_workdir, external_imports)
+    result["deps_installed"] = install_ok
+    result["deps_install_summary"] = install_summary
+    result["test_imports_external"] = external_imports
+    result["test_imports_local"] = local_imports
+    log.info(f"  → deps install: {'ok' if install_ok else 'failed'} ({install_summary[:120]})")
+
+    # Optional escalation: if focused install failed AND the repo has a
+    # pyproject.toml, try a single retry with --no-build-isolation. This
+    # picks up repos where torch is already in the runner env (from the
+    # focused step above) and the repo's own deps build against it.
+    if not install_ok and (clone_workdir / "pyproject.toml").is_file():
+        log.info("  → escalating to pip install -e . --no-build-isolation")
+        try:
+            proc = subprocess.run(
+                ["python", "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "--no-build-isolation",
+                 "-e", "."],
+                cwd=clone_workdir, capture_output=True, text=True,
+                timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
+            )
+            if proc.returncode == 0:
+                install_ok = True
+                install_summary = "installed via pip install -e . --no-build-isolation (fallback)"
+                result["deps_installed"] = True
+                result["deps_install_summary"] = install_summary
+                log.info(f"  → fallback install succeeded")
+        except subprocess.TimeoutExpired:
+            log.info("  → fallback install timed out; continuing with unvalidated tests")
+
+    # Tests
+    test_status, test_output = _run_test_pytest(clone_workdir, touched_tests)
+    result["test_status"] = test_status
+    log.info(f"  → tests: {test_status}")
+
+    # Render the result section and write to the action run-summary
+    # panel; the PR body is owned by the convention pass's body rewrite
+    # and isn't an appropriate surface for per-run check output.
+    section_body = _render_test_section(
+        lint_status=lint_status, lint_output=lint_output, lint_issues=lint_issues,
+        test_status=test_status, test_output=test_output,
+        touched_py=touched_py, touched_tests=touched_tests,
+        package_manager=pkg_mgr,
+        deps_installed=install_ok, deps_install_summary=install_summary,
+    )
+    _append_to_step_summary(section_body)
+
+    # On a passing run, drop the PR's draft state — that's the canonical
+    # GitHub signal for "ready for review", and replaces what was
+    # previously a redundant outrider:ready-for-review label.
+    # Unvalidated tests (missing deps) don't gate — informational only.
+    hard_failure = (lint_status == "failed") or (test_status == "failed")
+    if hard_failure:
+        _add_pr_label(target, pr_number, TEST_LABEL_FAILED)
+        result["status"] = "test_failed"
+    else:
+        result["status"] = "test_passed"
+        ready_ok = _drop_pr_draft_state(target, pr_number)
+        result["draft_dropped"] = ready_ok
+    _remove_pr_label(target, pr_number, TEST_LABEL_TRIGGER)
+
+    result["pr_url"] = pr.get("html_url", "")
+    log.info(
+        f"  ✓ {result['status']}: lint={lint_status}, tests={test_status}, "
+        f"hard_failure={hard_failure}"
+    )
+    return result
+
+
 def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[str]:
     """Render a list of step_summary markdown lines for a ``claude_failed``
     status, dispatching on the agent's log tail.
@@ -8870,9 +10825,9 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in ("recommend", "weekly-summary"):
-        log.error(f"Unknown mode {mode!r}; must be 'recommend' or "
-                  f"'weekly-summary'.")
+    if mode not in ("recommend", "weekly-summary", "fidelity", "convention", "test"):
+        log.error(f"Unknown mode {mode!r}; must be 'recommend', "
+                  f"'weekly-summary', 'fidelity', 'convention', or 'test'.")
         sys.exit(2)
 
     target = build_target_from_env()
@@ -8882,6 +10837,21 @@ def main():
         log.info("  mode=weekly-summary")
         runner = run_weekly_summary
         failure_status = "weekly_summary_failed"
+    elif mode == "fidelity":
+        pr_number = os.environ.get("INPUT_PR_NUMBER", "").strip()
+        log.info(f"  mode=fidelity  pr_number={pr_number}")
+        runner = run_fidelity_audit
+        failure_status = "fidelity_failed_claude"
+    elif mode == "convention":
+        pr_number = os.environ.get("INPUT_PR_NUMBER", "").strip()
+        log.info(f"  mode=convention  pr_number={pr_number}")
+        runner = run_convention_pass
+        failure_status = "convention_failed_extraction"
+    elif mode == "test":
+        pr_number = os.environ.get("INPUT_PR_NUMBER", "").strip()
+        log.info(f"  mode=test  pr_number={pr_number}")
+        runner = run_test_gate
+        failure_status = "test_failed_setup"
     else:
         log.info(f"  min_confidence={target.min_confidence}  "
                  f"draft_mode={target.draft_mode}  "
@@ -8948,8 +10918,10 @@ def main():
     _write_step_summary(result)
 
     # Best-effort: capture this run's telemetry to the engine for analysis.
-    # Only recommend-mode runs map onto the run schema; weekly-summary runs
-    # are skipped. Never blocks the run.
+    # Only recommend-mode runs map onto the run schema; weekly-summary and
+    # fidelity-audit runs are skipped (they have their own outcome surfaces:
+    # Discussion comment and PR Coverage section respectively). Never blocks
+    # the run.
     if mode == "recommend":
         _post_run_telemetry(result, target)
 

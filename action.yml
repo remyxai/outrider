@@ -21,8 +21,40 @@ inputs:
           scheduled job (weekly cron) that calls the action in this
           mode. Requires `discussions: write` in the workflow's
           permissions block.
+        - "fidelity": audit a remyx-ai[bot] draft PR against its paper's
+          reference impl, append a structured ``## Coverage`` matrix to
+          the PR body, and transition the PR's labels
+          (outrider:draft → outrider:fidelity-done, or
+          outrider:needs-judgment when an item flags for human review).
+          Triggered by the workflow on ``pull_request: labeled`` with
+          name=outrider:draft; requires ``pr-number`` to be set (from
+          the event payload). Read-only for the codebase (only mutates
+          the PR body + labels).
+        - "convention": extract contributor conventions from the target
+          repo's (or upstream's, for forks) recent merged PRs, identify
+          convention-shape misalignments in the draft, run an agentic
+          patch session bounded to non-algorithmic changes, force-push
+          with bot attribution, and post an evidence comment listing
+          the patterns + their source PRs. Triggered by
+          ``outrider:fidelity-done``; requires ``pr-number``.
+        - "test": run lint + targeted tests on the PR's added/modified
+          files, write a ``## Refinement checks`` section to the
+          action's run-summary panel, drop the PR's draft state on a
+          passing run (the canonical GitHub "ready for review" signal),
+          and apply the ``outrider:test-failed`` label only on hard
+          failure (lint surfaced issues or tests failed). PR body is
+          untouched — that's the convention pass's surface. Triggered
+          after the convention pass; requires ``pr-number``.
     required: false
     default: 'recommend'
+  pr-number:
+    description: |
+      PR number to operate on. Only read in ``mode: fidelity``. Set
+      from the workflow's pull_request event payload — see
+      `docs/refinement_pass.md` for the recommended workflow snippet.
+      Empty in recommend / weekly-summary modes.
+    required: false
+    default: ''
   weekly-discussion-id:
     description: |
       Target Discussion for weekly-summary mode. Accepts the Discussion
@@ -240,6 +272,9 @@ runs:
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
+        # PR number to audit in fidelity mode (set from the workflow's
+        # pull_request event payload; empty in recommend / weekly-summary).
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         # Weekly Discussion summary (opt-in second scheduled job).
         REMYX_MODE: ${{ inputs.mode }}
         REMYX_WEEKLY_DISCUSSION_ID: ${{ inputs.weekly-discussion-id }}
