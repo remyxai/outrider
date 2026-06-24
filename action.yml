@@ -30,6 +30,13 @@ inputs:
           name=outrider:draft; requires ``pr-number`` to be set (from
           the event payload). Read-only for the codebase (only mutates
           the PR body + labels).
+        - "convention": extract contributor conventions from the target
+          repo's (or upstream's, for forks) recent merged PRs, identify
+          convention-shape misalignments in the draft, run an agentic
+          patch session bounded to non-algorithmic changes, force-push
+          with bot attribution, and post an evidence comment listing
+          the patterns + their source PRs. Triggered by
+          ``outrider:fidelity-done``; requires ``pr-number``.
     required: false
     default: 'recommend'
   pr-number:

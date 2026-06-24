@@ -1086,6 +1086,12 @@ FAILURE_EXIT_STATUSES = {
     "error",
     "claude_failed",
     "weekly_summary_failed",
+    "fidelity_failed_clone",
+    "fidelity_failed_claude",
+    "convention_failed_extraction",
+    "convention_failed_misalignment",
+    "convention_failed_patch",
+    "convention_failed_push",
     # Outbound credential-scrubber abort. Not a graceful skip — the
     # operator needs to investigate the body-assembly path (whatever
     # upstream content produced credential-shaped text). Surfaces red
@@ -8928,6 +8934,544 @@ def run_fidelity_audit(target: Target) -> dict:
     return result
 
 
+# ─── Refinement-pass: convention alignment ─────────────────────────────────
+#
+# Triggered by the `outrider:fidelity-done` label. Extracts target-repo
+# conventions from recent merged PRs, identifies misalignments in the draft,
+# runs an agentic Claude Code patching session bounded to convention-shaped
+# changes (PR body shape, file placement, test idioms, docs entries —
+# explicitly NOT algorithm changes), force-pushes the result with the bot's
+# verified attribution, and posts an evidence comment listing the patterns
+# extracted + the PRs they were derived from.
+#
+# Input (workflow surface):
+#   INPUT_PR_NUMBER — PR number to refine
+#
+# Output:
+#   - PR head branch force-pushed with convention-aligned commit(s)
+#   - PR comment posted listing extracted patterns + evidence PRs
+#   - Label transition: outrider:fidelity-done → outrider:convention-done
+#   - status: convention_aligned / convention_skipped_* / convention_failed_*
+
+CONVENTION_LABEL_TRIGGER = "outrider:fidelity-done"
+CONVENTION_LABEL_DONE = "outrider:convention-done"
+CONVENTION_MAX_REFERENCE_PRS = 30
+
+
+def _resolve_upstream_for_conventions(target: Target) -> str:
+    """Return the repo whose merged-PR corpus encodes the conventions
+    we should align to. For forks this is the parent; otherwise the
+    target itself."""
+    try:
+        meta = gh_api("GET", f"/repos/{target.repo}")
+    except RuntimeError:
+        return target.repo
+    parent = (meta.get("parent") or {}).get("full_name", "")
+    if parent and meta.get("fork"):
+        return parent
+    return target.repo
+
+
+def _fetch_recent_merged_prs(repo: str, limit: int) -> list[dict]:
+    """Return the most-recently-merged PRs on ``repo``, newest first.
+
+    Returns a list of dicts with ``number``, ``title``, ``body``,
+    ``merged_at``, ``additions``, ``deletions``, ``files`` (list of
+    ``{filename, status, additions, deletions}``). ``files`` is capped
+    at 40 entries per PR to bound the convention-extraction prompt size.
+    """
+    # GitHub's list API doesn't sort by merged_at; we use the search
+    # API which does, scoped to merged state on the repo.
+    q = f"repo:{repo} is:pr is:merged"
+    search = gh_api("GET", f"/search/issues?q={urllib.parse.quote(q)}&sort=updated&order=desc&per_page={limit}")
+    prs: list[dict] = []
+    for item in search.get("items", [])[:limit]:
+        num = item["number"]
+        try:
+            pr = gh_api("GET", f"/repos/{repo}/pulls/{num}")
+        except RuntimeError:
+            continue
+        try:
+            files = gh_api("GET", f"/repos/{repo}/pulls/{num}/files?per_page=40")
+        except RuntimeError:
+            files = []
+        prs.append({
+            "number": num,
+            "title": pr.get("title", ""),
+            "body": (pr.get("body") or "")[:6000],
+            "merged_at": pr.get("merged_at", ""),
+            "additions": pr.get("additions", 0),
+            "deletions": pr.get("deletions", 0),
+            "files": [
+                {"filename": f.get("filename", ""),
+                 "status": f.get("status", ""),
+                 "additions": f.get("additions", 0),
+                 "deletions": f.get("deletions", 0)}
+                for f in files[:40]
+            ],
+        })
+    return prs
+
+
+def _build_convention_extraction_prompt(
+    upstream_repo: str, recent_prs: list[dict]
+) -> str:
+    """Compose the prompt for the convention-extraction Claude one-shot."""
+    pr_blocks = []
+    for pr in recent_prs:
+        files_summary = "\n".join(
+            f"  - {f['filename']}  ({f['status']}, +{f['additions']}/-{f['deletions']})"
+            for f in pr["files"]
+        )
+        pr_blocks.append(
+            f"### #{pr['number']} — {pr['title']}\n"
+            f"merged: {pr['merged_at'][:10]}  +{pr['additions']}/-{pr['deletions']}\n\n"
+            f"**Body:**\n```\n{pr['body']}\n```\n\n"
+            f"**Files changed:**\n{files_summary}\n"
+        )
+    pr_corpus = "\n\n".join(pr_blocks)
+
+    return f"""You are extracting contributor conventions from a repo's recently-merged PRs.
+
+Target repo: {upstream_repo}
+Corpus: {len(recent_prs)} most-recently-merged PRs.
+
+# Recent merged PRs
+
+{pr_corpus}
+
+# Task
+
+Identify the conventions that a new contributor's PR should match for it to
+read as natively-shaped to this repo. Focus on patterns the PR-corpus
+demonstrates repeatedly (not one-off choices). For each pattern, cite the PR
+numbers it's derived from.
+
+Categories to inspect (skip any that don't have clear patterns in this
+corpus):
+
+- **pr_body_template**: required sections in the PR body (e.g. "What does
+  this PR do?", "Before submitting", "Who can review?", "AI writing
+  disclosure", etc.) and their typical content.
+- **code_placement**: when a new feature/method/option is added, where does
+  it land? Specific directories, files, classes, dispatch patterns
+  (e.g. `loss_type` dispatch in GRPOTrainer, `register_X` decorators,
+  config dataclass field placement).
+- **test_idiom**: how are new options tested? Parametrize patterns, test
+  file naming, test class structure, fixture conventions.
+- **docs_idiom**: where do new features get documented? Top-level docs
+  index files, README mentions, paper-index entries, docstring shape.
+- **ai_disclosure**: does the corpus show explicit AI-usage disclosure
+  blocks? If yes, what's the canonical shape?
+
+# Output
+
+Return ONLY valid JSON (no prose before or after):
+
+{{
+  "patterns": [
+    {{
+      "category": "<one of: pr_body_template | code_placement | test_idiom | docs_idiom | ai_disclosure>",
+      "description": "<one-to-three sentences describing the pattern>",
+      "evidence_pr_numbers": [<int>, ...],
+      "canonical_example": "<a short code/markdown snippet illustrating the pattern, or null>"
+    }},
+    ...
+  ]
+}}
+
+Limit yourself to the 5 most-load-bearing patterns. Skip patterns that only
+appear in 1-2 PRs.
+"""
+
+
+def _build_misalignment_prompt(
+    pr_title: str, pr_body: str, pr_diff: str, patterns: dict
+) -> str:
+    """Compose the prompt that takes (draft PR, extracted conventions)
+    and returns a list of actionable misalignment fixes."""
+    pattern_lines = []
+    for p in patterns.get("patterns", []):
+        pattern_lines.append(
+            f"- **{p.get('category')}**: {p.get('description')}\n"
+            f"  Evidence: PRs {p.get('evidence_pr_numbers', [])}\n"
+            f"  Example:\n```\n{(p.get('canonical_example') or '')[:1500]}\n```"
+        )
+    patterns_block = "\n\n".join(pattern_lines)
+
+    diff_excerpt = pr_diff if len(pr_diff) <= 40_000 else (
+        pr_diff[:40_000] + f"\n... [truncated; total {len(pr_diff)} chars] ...\n"
+    )
+
+    return f"""You are reviewing a draft PR for alignment with extracted target-repo conventions.
+
+# Target-repo conventions
+
+{patterns_block}
+
+# Draft PR
+
+**Title**: {pr_title}
+
+## PR body
+
+```
+{(pr_body or "")[:4000]}
+```
+
+## PR diff
+
+```
+{diff_excerpt}
+```
+
+# Task
+
+For each convention above, decide whether the draft is *aligned*, *misaligned*,
+or *not applicable*. For misaligned items, propose a concrete patch action
+(file to edit, what to add/change, expected outcome). Limit yourself to
+convention-shape patches — **DO NOT propose algorithmic or numerical-value
+changes**. Algorithm fidelity is a separate concern.
+
+# Output
+
+Return ONLY valid JSON (no prose):
+
+{{
+  "summary": "<one-sentence overall verdict>",
+  "actions": [
+    {{
+      "category": "<which convention category>",
+      "verdict": "aligned | misaligned | n/a",
+      "patch_action": "<concrete instruction for the patching agent, or null if aligned>",
+      "files_likely_touched": ["<path>", ...]
+    }},
+    ...
+  ]
+}}
+"""
+
+
+def _render_convention_evidence_comment(
+    upstream_repo: str, patterns: dict, misalignments: dict, applied_patches_summary: str
+) -> str:
+    """Produce the PR comment that surfaces what conventions were extracted
+    + which were applied, with evidence PR links so a reviewer can verify."""
+    lines = ["## Convention pass", ""]
+    lines.append(f"_{misalignments.get('summary', '(no summary)')}_")
+    lines.append("")
+    lines.append(f"Conventions extracted from `{upstream_repo}`'s recent merged PRs:")
+    lines.append("")
+    for p in patterns.get("patterns", []):
+        cat = p.get("category", "?")
+        desc = p.get("description", "")
+        evidence = p.get("evidence_pr_numbers", [])
+        evidence_md = ", ".join(
+            f"[#{n}](https://github.com/{upstream_repo}/pull/{n})" for n in evidence[:5]
+        )
+        lines.append(f"- **{cat}** — {desc}")
+        if evidence_md:
+            lines.append(f"  _Evidence:_ {evidence_md}")
+    lines.append("")
+    lines.append("### Patches applied")
+    lines.append("")
+    if applied_patches_summary.strip():
+        lines.append(applied_patches_summary)
+    else:
+        lines.append("_No code patches applied (draft already aligned with extracted conventions, or no actionable convention-shape diffs identified)._")
+    lines.append("")
+    lines.append(
+        f"_Generated by [Outrider convention pass]"
+        f"({CANONICAL_ATTRIBUTION_URL}) at {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}._"
+    )
+    return "\n".join(lines)
+
+
+def _build_convention_patch_invocation(
+    patterns: dict, misalignments: dict, pr_title: str
+) -> str:
+    """Compose the INVOCATION.md content that drives the Claude Code
+    patching session.
+
+    The patching session edits files in the cloned PR head branch (cwd =
+    workdir). The agent reads the misalignment list, makes the smallest
+    edits needed to align with the extracted conventions, and STAGES the
+    changes for commit. The runner handles commit + push.
+    """
+    actions = [a for a in misalignments.get("actions", []) if a.get("verdict") == "misaligned"]
+    if not actions:
+        return ""
+
+    action_lines = []
+    for a in actions:
+        files = ", ".join(a.get("files_likely_touched", []) or [])
+        action_lines.append(
+            f"- **{a.get('category')}**: {a.get('patch_action', '')}\n"
+            f"  Files to consider: {files or '(any relevant)'}\n"
+        )
+    actions_block = "\n".join(action_lines)
+
+    pattern_lines = []
+    for p in patterns.get("patterns", []):
+        if p.get("canonical_example"):
+            pattern_lines.append(
+                f"### {p.get('category')}\n\n{p.get('description', '')}\n\n"
+                f"Canonical example:\n```\n{p['canonical_example'][:2000]}\n```"
+            )
+    patterns_block = "\n\n".join(pattern_lines)
+
+    return f"""# Convention-alignment patches
+
+PR under refinement: "{pr_title}"
+
+You are running in the cloned PR head branch (cwd = the workdir). Your task
+is to apply small, convention-shape patches to align this draft with the
+target repo's contributor conventions. Use the Read, Edit, Glob, and Grep
+tools as needed.
+
+## Scope guard — read carefully
+
+- **DO** patch: PR body shape (Description headings, before-submitting
+  checklist, AI-disclosure block), file placement (move helper to the
+  conventional file), test naming + parametrize style, docs additions
+  (e.g. paper_index.md entry).
+- **DO NOT** patch: algorithm logic, numerical constants, default values,
+  control flow of math-bearing functions, what's multiplied by what. Those
+  are algorithm-fidelity concerns and are out of this pass's scope.
+
+If a misalignment is ambiguous between "convention" and "algorithm", skip it
+and leave a note in your final summary.
+
+## Extracted conventions
+
+{patterns_block}
+
+## Misalignments to address
+
+{actions_block}
+
+## After patching
+
+Stage all changes with ``git add -A``. Do not commit — the orchestrator
+handles the commit and force-push with the bot's verified attribution.
+
+Print a brief markdown summary of what you actually changed (file paths +
+one-line per file), bullet-listed, in your final response. The runner uses
+this summary verbatim in the PR comment that explains the patches.
+"""
+
+
+def run_convention_pass(target: Target) -> dict:
+    """Phase B — diff a remyx-ai[bot] PR against the target repo's recent
+    merged-PR conventions, patch convention-shape misalignments via an
+    agentic session, force-push, and transition labels.
+
+    Status values:
+        convention_aligned                  — patches applied (or no
+                                              misalignments found)
+        convention_skipped_no_pr            — INPUT_PR_NUMBER empty
+        convention_skipped_not_bot          — PR not authored by remyx-ai[bot]
+        convention_skipped_no_corpus        — upstream has too few merged PRs
+                                              to extract patterns from
+        convention_failed_extraction        — pattern extraction Claude call
+                                              failed
+        convention_failed_misalignment      — misalignment Claude call failed
+        convention_failed_patch             — Claude Code patch session failed
+        convention_failed_push              — git push step failed
+    """
+    result: dict = {"repo": target.repo, "mode": "convention", "status": "unknown"}
+
+    pr_number_raw = os.environ.get("INPUT_PR_NUMBER", "").strip()
+    if not pr_number_raw:
+        result["status"] = "convention_skipped_no_pr"
+        log.info("  ✗ convention mode invoked without INPUT_PR_NUMBER")
+        return result
+    try:
+        pr_number = int(pr_number_raw)
+    except ValueError:
+        result["status"] = "convention_skipped_no_pr"
+        return result
+    result["pr_number"] = pr_number
+    log.info(f"  → convention pass on {target.repo}#{pr_number}")
+
+    try:
+        pr = _fetch_pr_metadata(target, pr_number)
+    except RuntimeError as e:
+        result["status"] = "convention_failed_extraction"
+        result["error"] = f"could not fetch PR: {e}"
+        return result
+
+    author = (pr.get("user") or {}).get("login", "")
+    if author != "remyx-ai[bot]":
+        result["status"] = "convention_skipped_not_bot"
+        result["error"] = f"PR author is {author!r}, not remyx-ai[bot]"
+        return result
+
+    upstream_repo = _resolve_upstream_for_conventions(target)
+    log.info(f"  → resolving conventions from {upstream_repo}")
+    result["upstream_repo"] = upstream_repo
+
+    recent_prs = _fetch_recent_merged_prs(upstream_repo, CONVENTION_MAX_REFERENCE_PRS)
+    if len(recent_prs) < 5:
+        result["status"] = "convention_skipped_no_corpus"
+        result["error"] = f"only {len(recent_prs)} merged PRs found on {upstream_repo}"
+        return result
+    log.info(f"  → corpus: {len(recent_prs)} recent merged PRs")
+
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-convention-"))
+    log.info(f"  → workdir: {workdir}")
+
+    # Pattern extraction (one-shot)
+    log.info("  → extracting conventions (one-shot)")
+    extraction_prompt = _build_convention_extraction_prompt(upstream_repo, recent_prs)
+    ok, raw = _run_claude_oneshot(workdir, extraction_prompt, target.claude_timeout_s, max_turns=8)
+    if not ok:
+        result["status"] = "convention_failed_extraction"
+        result["error"] = f"extraction call failed: {raw[-500:]}"
+        return result
+    patterns = _extract_json_object(raw)
+    if not patterns or "patterns" not in patterns:
+        result["status"] = "convention_failed_extraction"
+        result["error"] = f"extraction returned unparseable JSON: {raw[-500:]}"
+        return result
+    result["patterns_count"] = len(patterns.get("patterns", []))
+    log.info(f"  → extracted {result['patterns_count']} patterns")
+
+    # Fetch draft PR diff for misalignment analysis
+    try:
+        pr_diff = _fetch_pr_diff(target, pr_number)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        result["status"] = "convention_failed_misalignment"
+        result["error"] = f"could not fetch PR diff: {e}"
+        return result
+
+    # Misalignment analysis (one-shot)
+    log.info("  → identifying misalignments (one-shot)")
+    misalignment_prompt = _build_misalignment_prompt(
+        pr.get("title", ""), pr.get("body", "") or "", pr_diff, patterns,
+    )
+    ok, raw = _run_claude_oneshot(workdir, misalignment_prompt, target.claude_timeout_s, max_turns=8)
+    if not ok:
+        result["status"] = "convention_failed_misalignment"
+        result["error"] = f"misalignment call failed: {raw[-500:]}"
+        return result
+    misalignments = _extract_json_object(raw)
+    if not misalignments or "actions" not in misalignments:
+        result["status"] = "convention_failed_misalignment"
+        result["error"] = f"misalignment returned unparseable JSON: {raw[-500:]}"
+        return result
+    actionable = [a for a in misalignments.get("actions", []) if a.get("verdict") == "misaligned"]
+    result["actionable_count"] = len(actionable)
+    log.info(f"  → {len(actionable)} actionable misalignments")
+
+    patches_summary = ""
+
+    if actionable:
+        # Clone the PR head branch (we need to patch + push to it).
+        head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or target.repo
+        head_ref = (pr.get("head") or {}).get("ref", "")
+        if not head_ref:
+            result["status"] = "convention_failed_patch"
+            result["error"] = "could not resolve PR head branch"
+            return result
+
+        log.info(f"  → cloning PR head {head_repo}:{head_ref}")
+        clone_workdir = workdir / "draft"
+        token = _github_token()
+        clone_url = f"https://x-access-token:{token}@github.com/{head_repo}.git"
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", head_ref, clone_url, str(clone_workdir)],
+                check=True, capture_output=True, timeout=300, env=env,
+            )
+        except subprocess.CalledProcessError as e:
+            result["status"] = "convention_failed_patch"
+            result["error"] = f"clone PR head failed: {e.stderr.decode()[:500]}"
+            return result
+
+        # Write the INVOCATION for Claude Code
+        bundle_dir = clone_workdir / BUNDLE_DIR_NAME
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        invocation = _build_convention_patch_invocation(
+            patterns, misalignments, pr.get("title", ""),
+        )
+        (bundle_dir / "INVOCATION.md").write_text(invocation)
+
+        # Run the agentic patch loop
+        log.info(f"  → invoking Claude Code patch session (timeout={target.claude_timeout_s}s)")
+        ok, patch_output = invoke_claude_code(clone_workdir, timeout_s=target.claude_timeout_s)
+        if not ok:
+            result["status"] = "convention_failed_patch"
+            result["error"] = f"patch session failed: {patch_output[-500:]}"
+            return result
+        patches_summary = patch_output
+
+        # Inspect staged changes
+        try:
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                check=True, capture_output=True, text=True, cwd=str(clone_workdir),
+            ).stdout.strip()
+        except subprocess.CalledProcessError as e:
+            result["status"] = "convention_failed_patch"
+            result["error"] = f"git diff --cached failed: {e.stderr[:500]}"
+            return result
+
+        if staged:
+            files_touched = staged.splitlines()
+            log.info(f"  → {len(files_touched)} files patched: {files_touched[:5]}")
+            result["files_touched"] = files_touched
+
+            # Commit with bot attribution via the GH git data API
+            commit_msg = (
+                f"chore: align PR with target-repo conventions\n\n"
+                f"Refinement-pass Phase B (convention alignment). Applies "
+                f"convention-shape patches extracted from {upstream_repo}'s recent "
+                f"merged PRs. Algorithm logic is left untouched (that's the "
+                f"fidelity audit's domain)."
+            )
+            try:
+                _recommit_via_api(
+                    clone_workdir, head_ref, commit_msg, head_repo,
+                    base_branch=head_ref,
+                )
+            except Exception as e:
+                result["status"] = "convention_failed_push"
+                result["error"] = f"recommit_via_api failed: {e}"
+                return result
+        else:
+            log.info("  → no staged changes after patch session; skipping push")
+            result["files_touched"] = []
+
+    # Evidence comment
+    log.info("  → posting evidence comment to PR")
+    comment_body = _render_convention_evidence_comment(
+        upstream_repo, patterns, misalignments, patches_summary,
+    )
+    try:
+        gh_api(
+            "POST",
+            f"/repos/{target.repo}/issues/{pr_number}/comments",
+            {"body": comment_body},
+        )
+    except RuntimeError as e:
+        log.warning(f"  ! evidence comment failed (non-fatal): {e}")
+
+    # Label transition
+    _add_pr_label(target, pr_number, CONVENTION_LABEL_DONE)
+    _remove_pr_label(target, pr_number, CONVENTION_LABEL_TRIGGER)
+
+    result["status"] = "convention_aligned"
+    result["summary"] = misalignments.get("summary", "")
+    result["pr_url"] = pr.get("html_url", "")
+    log.info(
+        f"  ✓ {result['status']}: {result.get('actionable_count', 0)} actionable, "
+        f"{len(result.get('files_touched', []))} files patched"
+    )
+    return result
+
+
 def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[str]:
     """Render a list of step_summary markdown lines for a ``claude_failed``
     status, dispatching on the agent's log tail.
@@ -9331,9 +9875,9 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in ("recommend", "weekly-summary", "fidelity"):
+    if mode not in ("recommend", "weekly-summary", "fidelity", "convention"):
         log.error(f"Unknown mode {mode!r}; must be 'recommend', "
-                  f"'weekly-summary', or 'fidelity'.")
+                  f"'weekly-summary', 'fidelity', or 'convention'.")
         sys.exit(2)
 
     target = build_target_from_env()
@@ -9348,6 +9892,11 @@ def main():
         log.info(f"  mode=fidelity  pr_number={pr_number}")
         runner = run_fidelity_audit
         failure_status = "fidelity_failed_claude"
+    elif mode == "convention":
+        pr_number = os.environ.get("INPUT_PR_NUMBER", "").strip()
+        log.info(f"  mode=convention  pr_number={pr_number}")
+        runner = run_convention_pass
+        failure_status = "convention_failed_extraction"
     else:
         log.info(f"  min_confidence={target.min_confidence}  "
                  f"draft_mode={target.draft_mode}  "
