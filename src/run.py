@@ -9846,54 +9846,170 @@ _TEST_PYTEST_TIMEOUT_S = 240
 _TEST_DEP_INSTALL_TIMEOUT_S = 480  # 8 min upper bound; most pure-Python repos finish in <2 min
 
 
-def _install_target_repo_deps(workdir: Path) -> tuple[bool, str]:
-    """Best-effort install of the target repo + its declared deps so the
-    subsequent pytest run can actually exercise the PR's code rather than
-    falling through on a missing-dep collection error.
+# PyPI distribution names commonly imported under a different top-level
+# package name. The AST scan returns import-name; pip needs dist-name.
+_IMPORT_TO_DIST = {
+    "yaml": "PyYAML",
+    "PIL": "pillow",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "Crypto": "pycryptodome",
+    "OpenSSL": "pyOpenSSL",
+    "bs4": "beautifulsoup4",
+    "google": "google-cloud-core",  # ambiguous; better than nothing
+}
 
-    Strategy in order of preference:
-      1. ``pip install -e .`` when the repo is pip-installable
-         (pyproject.toml / setup.py / setup.cfg present)
-      2. ``pip install -r requirements.txt`` as a fallback
-      3. No-op when nothing actionable is detected
+# Top-level imports that are part of the Python stdlib or always-installed
+# on a stock GH Actions runner — never need pip install.
+_STDLIB_OR_PREINSTALLED = frozenset({
+    # stdlib (representative subset; more added below dynamically)
+    "abc", "argparse", "ast", "asyncio", "base64", "bisect", "builtins",
+    "bz2", "collections", "configparser", "contextlib", "copy", "csv",
+    "ctypes", "dataclasses", "datetime", "decimal", "difflib", "dis",
+    "doctest", "email", "enum", "errno", "fileinput", "fnmatch",
+    "fractions", "functools", "gc", "getopt", "getpass", "gettext", "glob",
+    "gzip", "hashlib", "heapq", "hmac", "html", "http", "imp", "importlib",
+    "inspect", "io", "ipaddress", "itertools", "json", "keyword", "linecache",
+    "locale", "logging", "lzma", "math", "mimetypes", "multiprocessing",
+    "numbers", "operator", "os", "pathlib", "pdb", "pickle", "platform",
+    "plistlib", "pprint", "queue", "random", "re", "secrets", "select",
+    "shlex", "shutil", "signal", "site", "smtplib", "socket", "sqlite3",
+    "ssl", "stat", "statistics", "string", "stringprep", "struct",
+    "subprocess", "sys", "tarfile", "tempfile", "textwrap", "threading",
+    "time", "timeit", "tkinter", "token", "tokenize", "trace", "traceback",
+    "types", "typing", "unicodedata", "unittest", "urllib", "uuid",
+    "warnings", "weakref", "webbrowser", "xml", "xmlrpc", "zipfile",
+    "zipimport", "zlib",
+    # Pre-installed on the GH Actions runner via action.yml
+    "pytest", "ruff", "remyxai",
+})
 
-    Returns ``(installed, summary)`` where ``installed`` is True only when
-    a real install command ran to completion successfully. Heavy ML deps
-    (vllm, deepspeed) tend to time out or fail on binary wheels — that's
-    a graceful "we tried, fall back to unvalidated" outcome, not an error.
+# Packages whose build step requires torch to be importable (PEP 517 build
+# isolation defeats this when ``pip install -e .`` builds them in a fresh
+# env). Pre-installing CPU torch BEFORE attempting full install handles the
+# common ML-repo pattern.
+_TORCH_BUILD_DEPENDENTS = frozenset({
+    "flash_attn", "flash-attn", "flash_attn_2",
+    "mamba_ssm", "mamba-ssm",
+    "causal_conv1d", "causal-conv1d",
+    "xformers",
+    "deepspeed",
+    "apex",
+    "triton",
+})
+
+
+def _extract_external_imports(
+    workdir: Path, test_files: list[str]
+) -> tuple[list[str], list[str]]:
+    """AST-walk the touched test files and return
+    ``(external_imports, local_imports)``.
+
+    A top-level import name is classified as ``local`` if a same-named
+    directory or ``.py`` file exists at the repo root (i.e., the import
+    resolves from ``PYTHONPATH=<workdir>`` without pip install). Otherwise
+    it's ``external`` and goes on the pip install list. Stdlib and
+    runner-preinstalled names are filtered out of both lists.
     """
-    has_pyproject = (workdir / "pyproject.toml").is_file()
-    has_setup_py = (workdir / "setup.py").is_file()
-    has_setup_cfg = (workdir / "setup.cfg").is_file()
-    has_requirements = (workdir / "requirements.txt").is_file()
+    external: set[str] = set()
+    local: set[str] = set()
+    repo_top_level = {p.stem for p in workdir.iterdir() if p.is_dir() or p.suffix == ".py"}
+    for rel in test_files:
+        path = workdir / rel
+        if not path.is_file():
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top in _STDLIB_OR_PREINSTALLED:
+                        continue
+                    if top in repo_top_level:
+                        local.add(top)
+                    else:
+                        external.add(top)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and node.level == 0:
+                    top = node.module.split(".")[0]
+                    if top in _STDLIB_OR_PREINSTALLED:
+                        continue
+                    if top in repo_top_level:
+                        local.add(top)
+                    else:
+                        external.add(top)
+    return sorted(external), sorted(local)
 
-    if not (has_pyproject or has_setup_py or has_setup_cfg or has_requirements):
-        return False, "no pyproject.toml / setup.py / requirements.txt detected"
 
-    if has_pyproject or has_setup_py or has_setup_cfg:
-        cmd = ["python", "-m", "pip", "install", "--quiet",
-               "--disable-pip-version-check", "-e", "."]
-        label = "pip install -e ."
-    else:
-        cmd = ["python", "-m", "pip", "install", "--quiet",
-               "--disable-pip-version-check", "-r", "requirements.txt"]
-        label = "pip install -r requirements.txt"
+def _install_focused_test_deps(
+    workdir: Path, external_imports: list[str]
+) -> tuple[bool, str]:
+    """Install just the external Python packages the touched test files
+    actually import, plus any torch-build-required deps. Skips the full
+    target-repo install entirely; tests resolve local imports via the
+    ``PYTHONPATH=<workdir>`` set in :func:`_run_test_pytest`.
 
-    log.info(f"  → {label} (timeout={_TEST_DEP_INSTALL_TIMEOUT_S}s)")
-    try:
-        proc = subprocess.run(
-            cmd, cwd=workdir, capture_output=True, text=True,
-            timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"{label} timed out after {_TEST_DEP_INSTALL_TIMEOUT_S}s"
-    if proc.returncode != 0:
-        # Capture the tail of stderr — heavy ML repos commonly fail on
-        # binary-wheel resolution (torch/vllm/deepspeed) which is an
-        # environmental constraint rather than a code defect.
-        tail = (proc.stderr or proc.stdout or "")[-1500:].strip()
-        return False, f"{label} failed (exit {proc.returncode}):\n{tail}"
-    return True, f"{label} succeeded"
+    Multi-strategy: if any torch-build-dependent package is in the
+    extracted imports, pre-install CPU torch first via PyTorch's CPU
+    wheel index so the dependent package can build.
+
+    Returns ``(installed, summary)``.
+    """
+    if not external_imports:
+        return True, "no external imports detected in touched test files"
+
+    # Map import names to PyPI dist names where they differ.
+    dist_names = [_IMPORT_TO_DIST.get(name, name) for name in external_imports]
+
+    # Decide whether to pre-install torch from the CPU wheel index.
+    needs_torch_first = (
+        "torch" in external_imports
+        or any(name.replace("-", "_") in _TORCH_BUILD_DEPENDENTS for name in external_imports)
+    )
+
+    install_log: list[str] = []
+    env = {**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+
+    if needs_torch_first and "torch" in dist_names:
+        # Move torch to its own install step so we can pin the CPU index.
+        dist_names = [n for n in dist_names if n != "torch"]
+        log.info("  → installing torch (CPU wheel) before other deps")
+        try:
+            proc = subprocess.run(
+                ["python", "-m", "pip", "install", "--quiet",
+                 "--index-url", "https://download.pytorch.org/whl/cpu",
+                 "torch"],
+                capture_output=True, text=True,
+                timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"torch CPU-wheel install timed out after {_TEST_DEP_INSTALL_TIMEOUT_S}s"
+        if proc.returncode != 0:
+            return False, f"torch CPU-wheel install failed: {(proc.stderr or proc.stdout)[-800:].strip()}"
+        install_log.append("torch (CPU wheel)")
+
+    if dist_names:
+        log.info(f"  → installing focused deps: {dist_names}")
+        try:
+            proc = subprocess.run(
+                ["python", "-m", "pip", "install", "--quiet", *dist_names],
+                capture_output=True, text=True,
+                timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"focused-deps install timed out after {_TEST_DEP_INSTALL_TIMEOUT_S}s"
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "")[-1200:].strip()
+            return False, f"focused-deps install failed (exit {proc.returncode}):\n{tail}"
+        install_log.append(", ".join(dist_names))
+
+    return True, "installed: " + "; then ".join(install_log) if install_log else "no install needed"
 
 
 def _extract_touched_files(pr_diff: str) -> tuple[list[str], list[str]]:
@@ -9971,6 +10087,12 @@ def _run_test_pytest(
 ) -> tuple[str, str]:
     """Run pytest on the PR's added/modified test files.
 
+    ``PYTHONPATH=<workdir>`` is prepended so local imports
+    (``from openrlhf.utils import ...``) resolve from the cloned repo
+    without requiring a ``pip install -e .`` step — that step is the
+    main reason most ML-repo test runs blow up on build-time deps
+    (flash-attn / deepspeed wheels that need torch present to build).
+
     Returns ``(status, output)`` matching ``run_tests``' contract:
     ``"passed"`` / ``"failed"`` / ``"unvalidated"``. ``unvalidated``
     fires when the runner lacks the target repo's full dep set
@@ -9984,11 +10106,14 @@ def _run_test_pytest(
         return "unvalidated", "no touched test files found in workdir"
 
     log.info(f"  → running pytest on {len(existing)} touched test files")
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath = str(workdir) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    env = {**os.environ, "PYTHONPATH": pythonpath}
     try:
         proc = subprocess.run(
             ["python", "-m", "pytest", "-q", "--maxfail=5", *existing],
             cwd=workdir, capture_output=True, text=True,
-            timeout=_TEST_PYTEST_TIMEOUT_S,
+            timeout=_TEST_PYTEST_TIMEOUT_S, env=env,
         )
     except subprocess.TimeoutExpired:
         return "failed", f"pytest timed out after {_TEST_PYTEST_TIMEOUT_S}s"
@@ -10016,6 +10141,9 @@ def _render_test_section(
     lines.append(f"Touched in this PR: **{len(touched_py)} Python files** "
                  f"({len(touched_tests)} test). Package manager detected: `{package_manager}`. "
                  f"Deps install: {'succeeded' if deps_installed else 'skipped/failed'}.")
+    if deps_install_summary:
+        lines.append("")
+        lines.append(f"_{deps_install_summary[:600]}_")
     lines.append("")
 
     lines.append(f"### Lint — `{lint_status}`")
@@ -10150,14 +10278,42 @@ def run_test_gate(target: Target) -> dict:
     result["lint_issues"] = lint_issues
     log.info(f"  → lint: {lint_status} ({lint_issues} issues)")
 
-    # Try to install the target repo's deps so pytest can actually run.
-    # Heavy ML repos (torch/vllm/deepspeed) often fail this step on
-    # binary-wheel resolution — that's a graceful fall-through to
-    # "unvalidated" in the pytest classifier rather than a failure.
-    install_ok, install_summary = _install_target_repo_deps(clone_workdir)
+    # Install only what the touched test files actually import — much
+    # more likely to succeed on ML repos than a full ``pip install -e .``
+    # (which can blow up on heavy build-time deps like flash-attn /
+    # deepspeed that need torch present during their PEP 517 build).
+    # Local imports resolve via PYTHONPATH=<workdir> in _run_test_pytest.
+    external_imports, local_imports = _extract_external_imports(clone_workdir, touched_tests)
+    log.info(f"  → touched-test imports: external={external_imports}, local={local_imports}")
+    install_ok, install_summary = _install_focused_test_deps(clone_workdir, external_imports)
     result["deps_installed"] = install_ok
     result["deps_install_summary"] = install_summary
-    log.info(f"  → deps install: {'ok' if install_ok else 'skipped/failed'} ({install_summary[:80]})")
+    result["test_imports_external"] = external_imports
+    result["test_imports_local"] = local_imports
+    log.info(f"  → deps install: {'ok' if install_ok else 'failed'} ({install_summary[:120]})")
+
+    # Optional escalation: if focused install failed AND the repo has a
+    # pyproject.toml, try a single retry with --no-build-isolation. This
+    # picks up repos where torch is already in the runner env (from the
+    # focused step above) and the repo's own deps build against it.
+    if not install_ok and (clone_workdir / "pyproject.toml").is_file():
+        log.info("  → escalating to pip install -e . --no-build-isolation")
+        try:
+            proc = subprocess.run(
+                ["python", "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "--no-build-isolation",
+                 "-e", "."],
+                cwd=clone_workdir, capture_output=True, text=True,
+                timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
+            )
+            if proc.returncode == 0:
+                install_ok = True
+                install_summary = "installed via pip install -e . --no-build-isolation (fallback)"
+                result["deps_installed"] = True
+                result["deps_install_summary"] = install_summary
+                log.info(f"  → fallback install succeeded")
+        except subprocess.TimeoutExpired:
+            log.info("  → fallback install timed out; continuing with unvalidated tests")
 
     # Tests
     test_status, test_output = _run_test_pytest(clone_workdir, touched_tests)
