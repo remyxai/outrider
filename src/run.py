@@ -479,6 +479,37 @@ Required outputs:
    attribution links to the codebase — attribution lives in the PR body
    footer (handled by the orchestrator), not in the maintainer's repo.
 
+# Code style — keep the diff lint-clean
+
+The PR will be lint-checked by the orchestrator before being marked
+ready for review. A few patterns that consistently surface as lint
+failures across target repos — avoid them up front:
+
+* **Double-unary minus** (`--x`, `-(-x)`, `not not x`): ruff B002 flags
+  these as likely `--` / `++` decrement-operator typos (Python has no
+  such operator, so the double-negation is just `x`). When writing a
+  test expression like "the PG term for a negative advantage," write
+  `pg_neg = 1.0 * 1.3` directly rather than `pg_neg = -(-1.0) * 1.3`.
+  Group with parens (`-(-1.0 * 1.3)`) if you genuinely need the double
+  negation to mirror a sign-flip — the grouped form lints clean.
+* **Unused imports** (F401): if you tried an approach and removed the
+  code that needed an import, remove the import too. The lint pass
+  cannot tell intent from leftover scaffolding.
+* **Trailing whitespace + missing newline at EOF** (W291/W292): set
+  your editor or pre-write step to strip these.
+* **Bare `except:`** (E722): use `except Exception:` or a specific
+  exception class. Bare except catches `KeyboardInterrupt` and
+  `SystemExit`, which silently breaks Ctrl-C and the orchestrator's
+  timeout handling.
+* **Mutable default arguments** (B006): `def f(items=[]):` is almost
+  always wrong. Use `items=None` + `items = items if items is not None
+  else []`.
+
+ORIENTATION.md surfaces the repo's lint configuration (the
+``## Tooling config`` section). If the target has ``[tool.ruff]`` rules
+declared, follow them — your local code style should match the
+existing repo, not your own preferences.
+
 # Honesty rules
 
 - If the public surface of your new module is dominated by `TODO`,
