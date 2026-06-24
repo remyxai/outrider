@@ -37,6 +37,13 @@ inputs:
           with bot attribution, and post an evidence comment listing
           the patterns + their source PRs. Triggered by
           ``outrider:fidelity-done``; requires ``pr-number``.
+        - "validation": run lint + targeted tests on the PR's
+          added/modified files, post a result comment, and transition
+          the label to ``outrider:ready-for-review`` (lint passed and
+          tests passed-or-unvalidated) or ``outrider:validation-failed``
+          (lint surfaced issues or tests failed). Read-only for the
+          codebase. Triggered by ``outrider:convention-done``; requires
+          ``pr-number``.
     required: false
     default: 'recommend'
   pr-number:

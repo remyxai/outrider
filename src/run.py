@@ -1092,6 +1092,7 @@ FAILURE_EXIT_STATUSES = {
     "convention_failed_misalignment",
     "convention_failed_patch",
     "convention_failed_push",
+    "validation_failed_setup",
     # Outbound credential-scrubber abort. Not a graceful skip — the
     # operator needs to investigate the body-assembly path (whatever
     # upstream content produced credential-shaped text). Surfaces red
@@ -9758,6 +9759,317 @@ def run_convention_pass(target: Target) -> dict:
     return result
 
 
+# ─── Refinement-pass: validation gate ──────────────────────────────────────
+#
+# Triggered by the `outrider:convention-done` label. Runs lint + targeted
+# tests on the PR's added/modified files, posts a result comment, and
+# transitions the label to either `outrider:ready-for-review` (all
+# validation checks passed or were cleanly unvalidated by missing deps) or
+# `outrider:validation-failed` (lint surfaced issues or tests failed).
+#
+# Optional CPU smoke pass is deferred to a v2 opt-in via outrider.yaml in
+# the target repo; this v1 sticks to checks that fit in a stock runner
+# without needing the full target-repo dependency set.
+
+VALIDATION_LABEL_TRIGGER = "outrider:convention-done"
+VALIDATION_LABEL_READY = "outrider:ready-for-review"
+VALIDATION_LABEL_FAILED = "outrider:validation-failed"
+
+_VALIDATION_LINT_TIMEOUT_S = 120
+_VALIDATION_TEST_TIMEOUT_S = 240
+
+
+def _extract_touched_files(pr_diff: str) -> tuple[list[str], list[str]]:
+    """Parse a unified diff to extract added/modified file paths.
+
+    Returns ``(python_files, test_files)``. ``test_files`` is the subset
+    of python_files whose path matches the conventional test patterns
+    (``tests/...``, ``**/test_*.py``, ``**/*_test.py``) so the validation
+    gate can run a focused pytest invocation.
+    """
+    py_files: list[str] = []
+    for line in (pr_diff or "").splitlines():
+        # New file: "+++ b/path/to/file.py"
+        if line.startswith("+++ b/") and line.endswith(".py"):
+            path = line[6:]
+            if path not in py_files:
+                py_files.append(path)
+    test_files = [
+        p for p in py_files
+        if p.startswith("tests/") or p.startswith("test/")
+        or "/tests/" in p or "/test/" in p
+        or Path(p).name.startswith("test_")
+        or Path(p).name.endswith("_test.py")
+    ]
+    return py_files, test_files
+
+
+def _run_validation_lint(
+    workdir: Path, touched_py_files: list[str]
+) -> tuple[str, str, int]:
+    """Run ruff check on PR-touched Python files.
+
+    Returns ``(status, output, issue_count)`` where status is
+    ``"passed"`` / ``"failed"`` / ``"unvalidated"`` (no files to check
+    or ruff not installable). ``issue_count`` is parsed from ruff's
+    summary line when status is failed.
+    """
+    if not touched_py_files:
+        return "unvalidated", "no python files touched by this PR", 0
+
+    # Ensure ruff is available — the existing action.yml installs pytest
+    # and remyxai but not ruff; install ad-hoc rather than threading
+    # another dep through action.yml.
+    install = subprocess.run(
+        ["python", "-m", "pip", "install", "--quiet", "ruff"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if install.returncode != 0:
+        return "unvalidated", f"could not install ruff: {install.stderr[-300:]}", 0
+
+    existing = [f for f in touched_py_files if (workdir / f).is_file()]
+    if not existing:
+        return "unvalidated", "no touched .py files found in workdir", 0
+
+    log.info(f"  → running ruff check on {len(existing)} touched .py files")
+    try:
+        proc = subprocess.run(
+            ["ruff", "check", "--no-fix", "--output-format=concise", *existing],
+            cwd=workdir, capture_output=True, text=True,
+            timeout=_VALIDATION_LINT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", f"ruff timed out after {_VALIDATION_LINT_TIMEOUT_S}s", 0
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode == 0:
+        return "passed", output[-2000:].strip() or "All ruff checks passed.", 0
+    # Ruff exit 1 = lint issues; exit 2 = ruff itself errored. Count
+    # issue lines for the comment summary.
+    issue_lines = [l for l in (proc.stdout or "").splitlines() if ":" in l and l.strip()]
+    return "failed", output[-2500:], len(issue_lines)
+
+
+def _run_validation_tests(
+    workdir: Path, touched_test_files: list[str]
+) -> tuple[str, str]:
+    """Run pytest on the PR's added/modified test files.
+
+    Returns ``(status, output)`` matching ``run_tests``' contract:
+    ``"passed"`` / ``"failed"`` / ``"unvalidated"``. ``unvalidated``
+    fires when the runner lacks the target repo's full dep set
+    (collection ImportError) — informational, doesn't gate the chain.
+    """
+    if not touched_test_files:
+        return "unvalidated", "no test files touched by this PR"
+
+    existing = [f for f in touched_test_files if (workdir / f).is_file()]
+    if not existing:
+        return "unvalidated", "no touched test files found in workdir"
+
+    log.info(f"  → running pytest on {len(existing)} touched test files")
+    try:
+        proc = subprocess.run(
+            ["python", "-m", "pytest", "-q", "--maxfail=5", *existing],
+            cwd=workdir, capture_output=True, text=True,
+            timeout=_VALIDATION_TEST_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", f"pytest timed out after {_VALIDATION_TEST_TIMEOUT_S}s"
+    output = (proc.stdout or "") + ("\n--- STDERR ---\n" + proc.stderr if proc.stderr else "")
+    return _classify_pytest(proc.returncode, output), output[-3000:]
+
+
+def _render_validation_comment(
+    lint_status: str, lint_output: str, lint_issues: int,
+    test_status: str, test_output: str,
+    touched_py: list[str], touched_tests: list[str],
+    package_manager: str,
+) -> str:
+    """Compose the PR comment summarising the validation gate's findings."""
+    icon = {"passed": "✓", "failed": "✗", "unvalidated": "—"}
+    summary_parts = [
+        f"**Lint** {icon.get(lint_status, '?')} {lint_status}",
+        f"**Tests** {icon.get(test_status, '?')} {test_status}",
+    ]
+    lines = ["## Validation gate", ""]
+    lines.append(" · ".join(summary_parts))
+    lines.append("")
+    lines.append(f"Touched in this PR: **{len(touched_py)} Python files** "
+                 f"({len(touched_tests)} test). Package manager detected: `{package_manager}`.")
+    lines.append("")
+
+    lines.append(f"### Lint — `{lint_status}`")
+    if lint_status == "passed":
+        lines.append("All ruff checks passed on PR-touched files.")
+    elif lint_status == "unvalidated":
+        lines.append(f"_{lint_output}_")
+    else:
+        lines.append(f"Ruff surfaced **{lint_issues} issues** on PR-touched files:")
+        lines.append("")
+        lines.append("```")
+        lines.append(lint_output)
+        lines.append("```")
+    lines.append("")
+
+    lines.append(f"### Tests — `{test_status}`")
+    if test_status == "passed":
+        lines.append(f"`pytest` on touched test files succeeded.")
+    elif test_status == "unvalidated":
+        if "no test files" in test_output or "no touched test files" in test_output:
+            lines.append(f"_{test_output}_")
+        else:
+            lines.append(
+                "Tests could not be exercised — collection failed on a missing "
+                "dependency or import error. This is an environment limitation, "
+                "not a code failure (a stock runner lacks the target repo's "
+                "full ML dependency set). The PR's own changes were not run."
+            )
+            lines.append("")
+            lines.append("<details><summary>collection output (tail)</summary>")
+            lines.append("")
+            lines.append("```")
+            lines.append(test_output[-1500:])
+            lines.append("```")
+            lines.append("")
+            lines.append("</details>")
+    else:
+        lines.append(f"Pytest run failed:")
+        lines.append("")
+        lines.append("```")
+        lines.append(test_output)
+        lines.append("```")
+    lines.append("")
+    lines.append(
+        f"_Generated by [Outrider validation gate]"
+        f"({CANONICAL_ATTRIBUTION_URL}) at {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}._"
+    )
+    return "\n".join(lines)
+
+
+def run_validation_gate(target: Target) -> dict:
+    """Phase C — run lint + targeted tests on a remyx-ai[bot] PR, post a
+    result comment, transition labels to ready-for-review or
+    validation-failed.
+
+    Status values:
+        validation_passed                — lint passed, tests passed-or-unvalidated
+        validation_failed                — lint surfaced issues OR tests failed
+        validation_skipped_no_pr         — INPUT_PR_NUMBER empty
+        validation_skipped_not_bot       — PR not authored by remyx-ai[bot]
+        validation_failed_setup          — could not clone PR head
+    """
+    result: dict = {"repo": target.repo, "mode": "validation", "status": "unknown"}
+
+    pr_number_raw = os.environ.get("INPUT_PR_NUMBER", "").strip()
+    if not pr_number_raw:
+        result["status"] = "validation_skipped_no_pr"
+        return result
+    try:
+        pr_number = int(pr_number_raw)
+    except ValueError:
+        result["status"] = "validation_skipped_no_pr"
+        return result
+    result["pr_number"] = pr_number
+    log.info(f"  → validation gate on {target.repo}#{pr_number}")
+
+    try:
+        pr = _fetch_pr_metadata(target, pr_number)
+    except RuntimeError as e:
+        result["status"] = "validation_failed_setup"
+        result["error"] = f"could not fetch PR: {e}"
+        return result
+
+    author = (pr.get("user") or {}).get("login", "")
+    if author != "remyx-ai[bot]":
+        result["status"] = "validation_skipped_not_bot"
+        return result
+
+    try:
+        pr_diff = _fetch_pr_diff(target, pr_number)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        result["status"] = "validation_failed_setup"
+        result["error"] = f"could not fetch PR diff: {e}"
+        return result
+
+    touched_py, touched_tests = _extract_touched_files(pr_diff)
+    log.info(f"  → PR touches {len(touched_py)} .py files ({len(touched_tests)} tests)")
+    result["touched_py_files"] = touched_py
+    result["touched_test_files"] = touched_tests
+
+    # Clone PR head — lint + pytest both need actual files on disk.
+    head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or target.repo
+    head_ref = (pr.get("head") or {}).get("ref", "")
+    if not head_ref:
+        result["status"] = "validation_failed_setup"
+        result["error"] = "could not resolve PR head branch"
+        return result
+
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-validation-"))
+    clone_workdir = workdir / "draft"
+    token = _github_token()
+    clone_url = f"https://x-access-token:{token}@github.com/{head_repo}.git"
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    log.info(f"  → cloning PR head {head_repo}:{head_ref}")
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", head_ref, clone_url, str(clone_workdir)],
+            check=True, capture_output=True, timeout=300, env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        result["status"] = "validation_failed_setup"
+        result["error"] = f"clone PR head failed: {e.stderr.decode()[:500]}"
+        return result
+
+    pkg_mgr, _ = _detect_verification_stack(clone_workdir)
+    result["package_manager"] = pkg_mgr
+
+    # Lint
+    lint_status, lint_output, lint_issues = _run_validation_lint(clone_workdir, touched_py)
+    result["lint_status"] = lint_status
+    result["lint_issues"] = lint_issues
+    log.info(f"  → lint: {lint_status} ({lint_issues} issues)")
+
+    # Tests
+    test_status, test_output = _run_validation_tests(clone_workdir, touched_tests)
+    result["test_status"] = test_status
+    log.info(f"  → tests: {test_status}")
+
+    # Post result comment
+    comment_body = _render_validation_comment(
+        lint_status=lint_status, lint_output=lint_output, lint_issues=lint_issues,
+        test_status=test_status, test_output=test_output,
+        touched_py=touched_py, touched_tests=touched_tests,
+        package_manager=pkg_mgr,
+    )
+    try:
+        gh_api(
+            "POST",
+            f"/repos/{target.repo}/issues/{pr_number}/comments",
+            {"body": comment_body},
+        )
+    except RuntimeError as e:
+        log.warning(f"  ! result comment failed (non-fatal): {e}")
+
+    # Label transition: ready-for-review iff lint passed AND tests didn't
+    # outright fail. Unvalidated tests (missing deps) don't gate — they're
+    # informational only.
+    hard_failure = (lint_status == "failed") or (test_status == "failed")
+    if hard_failure:
+        _add_pr_label(target, pr_number, VALIDATION_LABEL_FAILED)
+        result["status"] = "validation_failed"
+    else:
+        _add_pr_label(target, pr_number, VALIDATION_LABEL_READY)
+        result["status"] = "validation_passed"
+    _remove_pr_label(target, pr_number, VALIDATION_LABEL_TRIGGER)
+
+    result["pr_url"] = pr.get("html_url", "")
+    log.info(
+        f"  ✓ {result['status']}: lint={lint_status}, tests={test_status}, "
+        f"hard_failure={hard_failure}"
+    )
+    return result
+
+
 def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[str]:
     """Render a list of step_summary markdown lines for a ``claude_failed``
     status, dispatching on the agent's log tail.
@@ -10161,9 +10473,9 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in ("recommend", "weekly-summary", "fidelity", "convention"):
+    if mode not in ("recommend", "weekly-summary", "fidelity", "convention", "validation"):
         log.error(f"Unknown mode {mode!r}; must be 'recommend', "
-                  f"'weekly-summary', 'fidelity', or 'convention'.")
+                  f"'weekly-summary', 'fidelity', 'convention', or 'validation'.")
         sys.exit(2)
 
     target = build_target_from_env()
@@ -10183,6 +10495,11 @@ def main():
         log.info(f"  mode=convention  pr_number={pr_number}")
         runner = run_convention_pass
         failure_status = "convention_failed_extraction"
+    elif mode == "validation":
+        pr_number = os.environ.get("INPUT_PR_NUMBER", "").strip()
+        log.info(f"  mode=validation  pr_number={pr_number}")
+        runner = run_validation_gate
+        failure_status = "validation_failed_setup"
     else:
         log.info(f"  min_confidence={target.min_confidence}  "
                  f"draft_mode={target.draft_mode}  "
