@@ -36,9 +36,9 @@ inputs:
     description: |
       PR number to operate on. Only read in ``mode: fidelity`` (and the
       forthcoming convention / validation phases). Set from the
-      workflow's pull_request event payload:
-      ``pr-number: ${{ github.event.pull_request.number }}``. Empty in
-      recommend / weekly-summary modes.
+      workflow's pull_request event payload — see
+      `docs/refinement_pass.md` for the recommended workflow snippet.
+      Empty in recommend / weekly-summary modes.
     required: false
     default: ''
   weekly-discussion-id:
