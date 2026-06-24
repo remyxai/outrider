@@ -1092,7 +1092,7 @@ FAILURE_EXIT_STATUSES = {
     "convention_failed_misalignment",
     "convention_failed_patch",
     "convention_failed_push",
-    "validation_failed_setup",
+    "test_failed_setup",
     # Outbound credential-scrubber abort. Not a graceful skip — the
     # operator needs to investigate the body-assembly path (whatever
     # upstream content produced credential-shaped text). Surfaces red
@@ -8740,27 +8740,60 @@ def _render_coverage_matrix(matrix: dict) -> str:
     return "\n".join(lines)
 
 
-def _append_or_replace_coverage(body: str, coverage_section: str) -> str:
-    """Idempotently append (or replace) the ``## Coverage`` section in
-    a PR body. If the body already has a ``## Coverage`` section (from
-    a prior fidelity-audit run on the same PR), this replaces it with
-    the new content so re-running the audit doesn't produce duplicate
-    sections."""
+def _append_or_replace_section(body: str, header: str, section_content: str) -> str:
+    """Idempotently append (or replace) a top-level section in a PR body.
+
+    A section is delimited by its ``## Header`` line on top, and either
+    the next ``# `` / ``## `` heading or end-of-body on the bottom. If
+    ``header`` is already present, the existing section is replaced
+    in-place; otherwise the new section is appended at the end with a
+    ``---`` separator.
+
+    Used by every refinement phase that writes to the PR body so re-runs
+    are idempotent and the section ordering is stable.
+    """
     body = body or ""
-    marker = FIDELITY_COVERAGE_SECTION_HEADER
-    if marker in body:
-        # Replace everything from the existing ## Coverage header up to
-        # (but not including) the next H2-or-higher header or end of body.
-        idx = body.index(marker)
-        # Find the next ## or # header after the existing Coverage section
-        tail = body[idx + len(marker):]
+    if header in body:
+        idx = body.index(header)
+        tail = body[idx + len(header):]
         next_h = re.search(r"\n(##? )", tail)
         if next_h:
-            return body[:idx] + coverage_section + tail[next_h.start():]
-        return body[:idx] + coverage_section
-    # Append at the end with a separator
+            return body[:idx] + section_content + tail[next_h.start():]
+        return body[:idx] + section_content
     sep = "\n\n---\n\n" if body.strip() else ""
-    return body + sep + coverage_section
+    return body + sep + section_content
+
+
+def _append_or_replace_coverage(body: str, coverage_section: str) -> str:
+    """Backward-compat wrapper for Phase A's Coverage-section update."""
+    return _append_or_replace_section(body, FIDELITY_COVERAGE_SECTION_HEADER, coverage_section)
+
+
+def _drop_pr_draft_state(target: Target, pr_number: int) -> bool:
+    """Mark a draft PR as ready-for-review via the GraphQL mutation
+    ``markPullRequestReadyForReview``. The REST endpoint
+    (``PATCH /repos/{repo}/pulls/{n}``) silently ignores the ``draft``
+    field — only the GraphQL mutation actually transitions the state.
+
+    Returns True on success, False on any error (non-fatal — the
+    label transition is the primary signal either way).
+    """
+    pr = gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
+    if not pr.get("draft"):
+        return True   # already non-draft, idempotent
+    node_id = pr.get("node_id", "")
+    if not node_id:
+        return False
+    mutation = (
+        "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){"
+        "pullRequest{isDraft}}}"
+    )
+    try:
+        gh_graphql(mutation, {"id": node_id})
+        return True
+    except RuntimeError as e:
+        log.warning(f"  ! could not drop draft state on PR #{pr_number}: {e}")
+        return False
 
 
 def _update_pr_body(target: Target, pr_number: int, new_body: str) -> None:
@@ -8993,6 +9026,17 @@ _CONVENTION_ALLOW_PATTERNS = (
     ".toml",          # config (but pyproject.toml is in the deny list above)
 )
 
+# Path-prefix → allowed-extension table for repos that ship example scripts
+# as a documented part of their feature-rollout convention (e.g. OpenRLHF's
+# examples/scripts/train_*.sh shell wrappers). Each entry says "files under
+# this prefix may carry this extension even if the extension wouldn't be
+# allow-listed globally." Generic shell files outside these prefixes stay
+# out of scope.
+_CONVENTION_PREFIX_ALLOW = (
+    ("examples/scripts/", (".sh", ".py")),
+    ("examples/python/", (".py", ".md")),
+)
+
 
 def _partition_convention_staged_paths(
     staged: list[str],
@@ -9009,6 +9053,15 @@ def _partition_convention_staged_paths(
             continue
         if _CONVENTION_DENY_RE.search(path):
             out_of_scope.append(path)
+            continue
+        # Prefix-scoped allow rules (e.g. examples/scripts/*.sh).
+        prefix_match = False
+        for prefix, exts in _CONVENTION_PREFIX_ALLOW:
+            if path.startswith(prefix) and any(path.endswith(ext) for ext in exts):
+                in_scope.append(path)
+                prefix_match = True
+                break
+        if prefix_match:
             continue
         if any(path.endswith(p) or p in path for p in _CONVENTION_ALLOW_PATTERNS):
             in_scope.append(path)
@@ -9728,22 +9781,25 @@ def run_convention_pass(target: Target) -> dict:
         else:
             log.info("  → no in-scope staged changes after filtering; skipping push")
 
-    # Evidence comment
-    log.info("  → posting evidence comment to PR")
-    comment_body = _render_convention_evidence_comment(
+    # Evidence section — written into the PR body so it survives re-runs
+    # idempotently and doesn't accumulate as a thread of comments.
+    log.info("  → updating ## Convention pass section in PR body")
+    section = _render_convention_evidence_comment(
         upstream_repo, patterns, misalignments, patches_summary,
         pr_body_updated=bool(result.get("pr_body_updated")),
         pr_body_rationale=result.get("pr_body_rationale", ""),
         pr_body_skip_reason=result.get("pr_body_skip_reason", ""),
     )
     try:
-        gh_api(
-            "POST",
-            f"/repos/{target.repo}/issues/{pr_number}/comments",
-            {"body": comment_body},
+        # The pr_body may have been rewritten earlier in this run by the
+        # pr_body_template update; refresh from the API.
+        current_pr = gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
+        new_body = _append_or_replace_section(
+            current_pr.get("body") or "", "## Convention pass", section,
         )
+        _update_pr_body(target, pr_number, new_body)
     except RuntimeError as e:
-        log.warning(f"  ! evidence comment failed (non-fatal): {e}")
+        log.warning(f"  ! convention section update failed (non-fatal): {e}")
 
     # Label transition
     _add_pr_label(target, pr_number, CONVENTION_LABEL_DONE)
@@ -9759,24 +9815,79 @@ def run_convention_pass(target: Target) -> dict:
     return result
 
 
-# ─── Refinement-pass: validation gate ──────────────────────────────────────
+# ─── Refinement-pass: test gate ────────────────────────────────────────────
 #
-# Triggered by the `outrider:convention-done` label. Runs lint + targeted
-# tests on the PR's added/modified files, posts a result comment, and
-# transitions the label to either `outrider:ready-for-review` (all
-# validation checks passed or were cleanly unvalidated by missing deps) or
-# `outrider:validation-failed` (lint surfaced issues or tests failed).
+# Triggered after the convention pass completes. Runs lint + targeted tests
+# on the PR's added/modified files, posts a result section to the PR body,
+# and transitions the label to either `outrider:ready-for-review` (lint
+# passed and tests passed-or-unvalidated) or `outrider:test-failed` (lint
+# surfaced issues or tests failed). On a passing run, also drops the PR's
+# draft state so reviewers see the PR as ready.
 #
-# Optional CPU smoke pass is deferred to a v2 opt-in via outrider.yaml in
-# the target repo; this v1 sticks to checks that fit in a stock runner
-# without needing the full target-repo dependency set.
+# Heavier validation workloads (CPU smoke pass, benchmarks, LLM judges) are
+# deferred to a forthcoming "validate" phase that opts in via outrider.yaml
+# in the target repo; this phase sticks to checks that fit in a stock runner
+# without needing GPU or special-cased infra.
 
-VALIDATION_LABEL_TRIGGER = "outrider:convention-done"
-VALIDATION_LABEL_READY = "outrider:ready-for-review"
-VALIDATION_LABEL_FAILED = "outrider:validation-failed"
+TEST_LABEL_TRIGGER = "outrider:convention-done"
+TEST_LABEL_READY = "outrider:ready-for-review"
+TEST_LABEL_FAILED = "outrider:test-failed"
 
-_VALIDATION_LINT_TIMEOUT_S = 120
-_VALIDATION_TEST_TIMEOUT_S = 240
+TEST_BODY_SECTION_HEADER = "## Refinement checks"
+
+_TEST_LINT_TIMEOUT_S = 120
+_TEST_PYTEST_TIMEOUT_S = 240
+_TEST_DEP_INSTALL_TIMEOUT_S = 480  # 8 min upper bound; most pure-Python repos finish in <2 min
+
+
+def _install_target_repo_deps(workdir: Path) -> tuple[bool, str]:
+    """Best-effort install of the target repo + its declared deps so the
+    subsequent pytest run can actually exercise the PR's code rather than
+    falling through on a missing-dep collection error.
+
+    Strategy in order of preference:
+      1. ``pip install -e .`` when the repo is pip-installable
+         (pyproject.toml / setup.py / setup.cfg present)
+      2. ``pip install -r requirements.txt`` as a fallback
+      3. No-op when nothing actionable is detected
+
+    Returns ``(installed, summary)`` where ``installed`` is True only when
+    a real install command ran to completion successfully. Heavy ML deps
+    (vllm, deepspeed) tend to time out or fail on binary wheels — that's
+    a graceful "we tried, fall back to unvalidated" outcome, not an error.
+    """
+    has_pyproject = (workdir / "pyproject.toml").is_file()
+    has_setup_py = (workdir / "setup.py").is_file()
+    has_setup_cfg = (workdir / "setup.cfg").is_file()
+    has_requirements = (workdir / "requirements.txt").is_file()
+
+    if not (has_pyproject or has_setup_py or has_setup_cfg or has_requirements):
+        return False, "no pyproject.toml / setup.py / requirements.txt detected"
+
+    if has_pyproject or has_setup_py or has_setup_cfg:
+        cmd = ["python", "-m", "pip", "install", "--quiet",
+               "--disable-pip-version-check", "-e", "."]
+        label = "pip install -e ."
+    else:
+        cmd = ["python", "-m", "pip", "install", "--quiet",
+               "--disable-pip-version-check", "-r", "requirements.txt"]
+        label = "pip install -r requirements.txt"
+
+    log.info(f"  → {label} (timeout={_TEST_DEP_INSTALL_TIMEOUT_S}s)")
+    try:
+        proc = subprocess.run(
+            cmd, cwd=workdir, capture_output=True, text=True,
+            timeout=_TEST_DEP_INSTALL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{label} timed out after {_TEST_DEP_INSTALL_TIMEOUT_S}s"
+    if proc.returncode != 0:
+        # Capture the tail of stderr — heavy ML repos commonly fail on
+        # binary-wheel resolution (torch/vllm/deepspeed) which is an
+        # environmental constraint rather than a code defect.
+        tail = (proc.stderr or proc.stdout or "")[-1500:].strip()
+        return False, f"{label} failed (exit {proc.returncode}):\n{tail}"
+    return True, f"{label} succeeded"
 
 
 def _extract_touched_files(pr_diff: str) -> tuple[list[str], list[str]]:
@@ -9784,7 +9895,7 @@ def _extract_touched_files(pr_diff: str) -> tuple[list[str], list[str]]:
 
     Returns ``(python_files, test_files)``. ``test_files`` is the subset
     of python_files whose path matches the conventional test patterns
-    (``tests/...``, ``**/test_*.py``, ``**/*_test.py``) so the validation
+    (``tests/...``, ``**/test_*.py``, ``**/*_test.py``) so the test
     gate can run a focused pytest invocation.
     """
     py_files: list[str] = []
@@ -9804,7 +9915,7 @@ def _extract_touched_files(pr_diff: str) -> tuple[list[str], list[str]]:
     return py_files, test_files
 
 
-def _run_validation_lint(
+def _run_test_lint(
     workdir: Path, touched_py_files: list[str]
 ) -> tuple[str, str, int]:
     """Run ruff check on PR-touched Python files.
@@ -9836,10 +9947,10 @@ def _run_validation_lint(
         proc = subprocess.run(
             ["ruff", "check", "--no-fix", "--output-format=concise", *existing],
             cwd=workdir, capture_output=True, text=True,
-            timeout=_VALIDATION_LINT_TIMEOUT_S,
+            timeout=_TEST_LINT_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
-        return "failed", f"ruff timed out after {_VALIDATION_LINT_TIMEOUT_S}s", 0
+        return "failed", f"ruff timed out after {_TEST_LINT_TIMEOUT_S}s", 0
     output = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode == 0:
         return "passed", output[-2000:].strip() or "All ruff checks passed.", 0
@@ -9849,7 +9960,7 @@ def _run_validation_lint(
     return "failed", output[-2500:], len(issue_lines)
 
 
-def _run_validation_tests(
+def _run_test_pytest(
     workdir: Path, touched_test_files: list[str]
 ) -> tuple[str, str]:
     """Run pytest on the PR's added/modified test files.
@@ -9871,31 +9982,34 @@ def _run_validation_tests(
         proc = subprocess.run(
             ["python", "-m", "pytest", "-q", "--maxfail=5", *existing],
             cwd=workdir, capture_output=True, text=True,
-            timeout=_VALIDATION_TEST_TIMEOUT_S,
+            timeout=_TEST_PYTEST_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
-        return "failed", f"pytest timed out after {_VALIDATION_TEST_TIMEOUT_S}s"
+        return "failed", f"pytest timed out after {_TEST_PYTEST_TIMEOUT_S}s"
     output = (proc.stdout or "") + ("\n--- STDERR ---\n" + proc.stderr if proc.stderr else "")
     return _classify_pytest(proc.returncode, output), output[-3000:]
 
 
-def _render_validation_comment(
+def _render_test_section(
     lint_status: str, lint_output: str, lint_issues: int,
     test_status: str, test_output: str,
     touched_py: list[str], touched_tests: list[str],
     package_manager: str,
+    deps_installed: bool = False,
+    deps_install_summary: str = "",
 ) -> str:
-    """Compose the PR comment summarising the validation gate's findings."""
+    """Compose the markdown body section summarising the test gate's findings."""
     icon = {"passed": "✓", "failed": "✗", "unvalidated": "—"}
     summary_parts = [
         f"**Lint** {icon.get(lint_status, '?')} {lint_status}",
         f"**Tests** {icon.get(test_status, '?')} {test_status}",
     ]
-    lines = ["## Validation gate", ""]
+    lines = [TEST_BODY_SECTION_HEADER, ""]
     lines.append(" · ".join(summary_parts))
     lines.append("")
     lines.append(f"Touched in this PR: **{len(touched_py)} Python files** "
-                 f"({len(touched_tests)} test). Package manager detected: `{package_manager}`.")
+                 f"({len(touched_tests)} test). Package manager detected: `{package_manager}`. "
+                 f"Deps install: {'succeeded' if deps_installed else 'skipped/failed'}.")
     lines.append("")
 
     lines.append(f"### Lint — `{lint_status}`")
@@ -9940,54 +10054,55 @@ def _render_validation_comment(
         lines.append("```")
     lines.append("")
     lines.append(
-        f"_Generated by [Outrider validation gate]"
+        f"_Generated by [Outrider test gate]"
         f"({CANONICAL_ATTRIBUTION_URL}) at {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}._"
     )
     return "\n".join(lines)
 
 
-def run_validation_gate(target: Target) -> dict:
-    """Phase C — run lint + targeted tests on a remyx-ai[bot] PR, post a
-    result comment, transition labels to ready-for-review or
-    validation-failed.
+def run_test_gate(target: Target) -> dict:
+    """Test gate — lint + targeted pytest on a remyx-ai[bot] PR. Posts a
+    result section into the PR body, transitions labels to
+    ``outrider:ready-for-review`` or ``outrider:test-failed``, and drops
+    the PR's draft state on a passing run.
 
     Status values:
-        validation_passed                — lint passed, tests passed-or-unvalidated
-        validation_failed                — lint surfaced issues OR tests failed
-        validation_skipped_no_pr         — INPUT_PR_NUMBER empty
-        validation_skipped_not_bot       — PR not authored by remyx-ai[bot]
-        validation_failed_setup          — could not clone PR head
+        test_passed                  — lint passed, tests passed-or-unvalidated
+        test_failed                  — lint surfaced issues OR tests failed
+        test_skipped_no_pr           — INPUT_PR_NUMBER empty
+        test_skipped_not_bot         — PR not authored by remyx-ai[bot]
+        test_failed_setup            — could not clone PR head
     """
-    result: dict = {"repo": target.repo, "mode": "validation", "status": "unknown"}
+    result: dict = {"repo": target.repo, "mode": "test", "status": "unknown"}
 
     pr_number_raw = os.environ.get("INPUT_PR_NUMBER", "").strip()
     if not pr_number_raw:
-        result["status"] = "validation_skipped_no_pr"
+        result["status"] = "test_skipped_no_pr"
         return result
     try:
         pr_number = int(pr_number_raw)
     except ValueError:
-        result["status"] = "validation_skipped_no_pr"
+        result["status"] = "test_skipped_no_pr"
         return result
     result["pr_number"] = pr_number
-    log.info(f"  → validation gate on {target.repo}#{pr_number}")
+    log.info(f"  → test gate on {target.repo}#{pr_number}")
 
     try:
         pr = _fetch_pr_metadata(target, pr_number)
     except RuntimeError as e:
-        result["status"] = "validation_failed_setup"
+        result["status"] = "test_failed_setup"
         result["error"] = f"could not fetch PR: {e}"
         return result
 
     author = (pr.get("user") or {}).get("login", "")
     if author != "remyx-ai[bot]":
-        result["status"] = "validation_skipped_not_bot"
+        result["status"] = "test_skipped_not_bot"
         return result
 
     try:
         pr_diff = _fetch_pr_diff(target, pr_number)
     except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        result["status"] = "validation_failed_setup"
+        result["status"] = "test_failed_setup"
         result["error"] = f"could not fetch PR diff: {e}"
         return result
 
@@ -10000,11 +10115,11 @@ def run_validation_gate(target: Target) -> dict:
     head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or target.repo
     head_ref = (pr.get("head") or {}).get("ref", "")
     if not head_ref:
-        result["status"] = "validation_failed_setup"
+        result["status"] = "test_failed_setup"
         result["error"] = "could not resolve PR head branch"
         return result
 
-    workdir = Path(tempfile.mkdtemp(prefix="outrider-validation-"))
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-test-"))
     clone_workdir = workdir / "draft"
     token = _github_token()
     clone_url = f"https://x-access-token:{token}@github.com/{head_repo}.git"
@@ -10016,7 +10131,7 @@ def run_validation_gate(target: Target) -> dict:
             check=True, capture_output=True, timeout=300, env=env,
         )
     except subprocess.CalledProcessError as e:
-        result["status"] = "validation_failed_setup"
+        result["status"] = "test_failed_setup"
         result["error"] = f"clone PR head failed: {e.stderr.decode()[:500]}"
         return result
 
@@ -10024,43 +10139,60 @@ def run_validation_gate(target: Target) -> dict:
     result["package_manager"] = pkg_mgr
 
     # Lint
-    lint_status, lint_output, lint_issues = _run_validation_lint(clone_workdir, touched_py)
+    lint_status, lint_output, lint_issues = _run_test_lint(clone_workdir, touched_py)
     result["lint_status"] = lint_status
     result["lint_issues"] = lint_issues
     log.info(f"  → lint: {lint_status} ({lint_issues} issues)")
 
+    # Try to install the target repo's deps so pytest can actually run.
+    # Heavy ML repos (torch/vllm/deepspeed) often fail this step on
+    # binary-wheel resolution — that's a graceful fall-through to
+    # "unvalidated" in the pytest classifier rather than a failure.
+    install_ok, install_summary = _install_target_repo_deps(clone_workdir)
+    result["deps_installed"] = install_ok
+    result["deps_install_summary"] = install_summary
+    log.info(f"  → deps install: {'ok' if install_ok else 'skipped/failed'} ({install_summary[:80]})")
+
     # Tests
-    test_status, test_output = _run_validation_tests(clone_workdir, touched_tests)
+    test_status, test_output = _run_test_pytest(clone_workdir, touched_tests)
     result["test_status"] = test_status
     log.info(f"  → tests: {test_status}")
 
-    # Post result comment
-    comment_body = _render_validation_comment(
+    # Render the result section and inline it into the PR body — same
+    # idempotent pattern as Phase A's ## Coverage and Phase B's
+    # ## Convention pass sections.
+    section_body = _render_test_section(
         lint_status=lint_status, lint_output=lint_output, lint_issues=lint_issues,
         test_status=test_status, test_output=test_output,
         touched_py=touched_py, touched_tests=touched_tests,
         package_manager=pkg_mgr,
+        deps_installed=install_ok, deps_install_summary=install_summary,
     )
     try:
-        gh_api(
-            "POST",
-            f"/repos/{target.repo}/issues/{pr_number}/comments",
-            {"body": comment_body},
+        current_pr = gh_api("GET", f"/repos/{target.repo}/pulls/{pr_number}")
+        new_body = _append_or_replace_section(
+            current_pr.get("body") or "", TEST_BODY_SECTION_HEADER, section_body,
         )
+        _update_pr_body(target, pr_number, new_body)
     except RuntimeError as e:
-        log.warning(f"  ! result comment failed (non-fatal): {e}")
+        log.warning(f"  ! refinement-checks section update failed (non-fatal): {e}")
 
     # Label transition: ready-for-review iff lint passed AND tests didn't
     # outright fail. Unvalidated tests (missing deps) don't gate — they're
     # informational only.
     hard_failure = (lint_status == "failed") or (test_status == "failed")
     if hard_failure:
-        _add_pr_label(target, pr_number, VALIDATION_LABEL_FAILED)
-        result["status"] = "validation_failed"
+        _add_pr_label(target, pr_number, TEST_LABEL_FAILED)
+        result["status"] = "test_failed"
     else:
-        _add_pr_label(target, pr_number, VALIDATION_LABEL_READY)
-        result["status"] = "validation_passed"
-    _remove_pr_label(target, pr_number, VALIDATION_LABEL_TRIGGER)
+        _add_pr_label(target, pr_number, TEST_LABEL_READY)
+        result["status"] = "test_passed"
+        # On a passing run, drop the PR's draft state so reviewers see
+        # the PR as ready. The label is the metadata signal; un-drafting
+        # is the behavioral one that triggers reviewer notifications.
+        ready_ok = _drop_pr_draft_state(target, pr_number)
+        result["draft_dropped"] = ready_ok
+    _remove_pr_label(target, pr_number, TEST_LABEL_TRIGGER)
 
     result["pr_url"] = pr.get("html_url", "")
     log.info(
@@ -10473,9 +10605,9 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in ("recommend", "weekly-summary", "fidelity", "convention", "validation"):
+    if mode not in ("recommend", "weekly-summary", "fidelity", "convention", "test"):
         log.error(f"Unknown mode {mode!r}; must be 'recommend', "
-                  f"'weekly-summary', 'fidelity', 'convention', or 'validation'.")
+                  f"'weekly-summary', 'fidelity', 'convention', or 'test'.")
         sys.exit(2)
 
     target = build_target_from_env()
@@ -10495,11 +10627,11 @@ def main():
         log.info(f"  mode=convention  pr_number={pr_number}")
         runner = run_convention_pass
         failure_status = "convention_failed_extraction"
-    elif mode == "validation":
+    elif mode == "test":
         pr_number = os.environ.get("INPUT_PR_NUMBER", "").strip()
-        log.info(f"  mode=validation  pr_number={pr_number}")
-        runner = run_validation_gate
-        failure_status = "validation_failed_setup"
+        log.info(f"  mode=test  pr_number={pr_number}")
+        runner = run_test_gate
+        failure_status = "test_failed_setup"
     else:
         log.info(f"  min_confidence={target.min_confidence}  "
                  f"draft_mode={target.draft_mode}  "
