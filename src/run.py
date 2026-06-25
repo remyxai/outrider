@@ -1876,6 +1876,92 @@ def _fetch_arxiv_abstract_page_urls(arxiv_id: str) -> tuple[list[str], list[str]
     return gh, hf
 
 
+# Cached extracted text (title + abstract) per arxiv id. Populated by
+# ``_fetch_arxiv_abstract_text`` for paper-anchored fidelity audits (the
+# Phase A degraded mode used when a paper has no public reference impl).
+_ARXIV_ABSTRACT_TEXT_CACHE: dict[str, str] = {}
+
+# Strip HTML tags + collapse whitespace; the arxiv abstract block has
+# light markup (italics, math, line breaks) but no nested structure that
+# we'd lose to a flat strip.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_WHITESPACE_RE = re.compile(r"\s+")
+
+# Match the arxiv abstract page's title + abstract blocks. Both are
+# stable surfaces — arxiv has rendered titles as ``<h1 class="title
+# mathjax">`` and abstracts as ``<blockquote class="abstract mathjax">``
+# for ~15 years. Greedy-stop on the closing tag.
+_ARXIV_TITLE_RE = re.compile(
+    r'<h1[^>]*class="[^"]*\btitle\b[^"]*"[^>]*>(.*?)</h1>',
+    re.IGNORECASE | re.DOTALL,
+)
+_ARXIV_ABSTRACT_BLOCK_RE = re.compile(
+    r'<blockquote[^>]*class="[^"]*\babstract\b[^"]*"[^>]*>(.*?)</blockquote>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _fetch_arxiv_abstract_text(arxiv_id: str) -> str:
+    """Return the paper's title + abstract as plaintext.
+
+    Used by the paper-anchored Phase A audit (Phase A's degraded mode
+    when a paper has no public reference impl). The abstract is the
+    densest method-summary surface we can fetch deterministically
+    without parsing the PDF; for the audit prompt's purposes, "the paper
+    claims X — does the diff implement X" can be answered from the
+    abstract for most papers, and the audit honestly reports its
+    precision floor via the ``Audit anchor`` line in the Coverage
+    matrix.
+
+    Returns ``""`` for any failure (fetch error, no abstract block
+    found, empty arxiv id) — callers treat that as "no paper anchor
+    available" and fall back to the skip path. Never raises.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return ""
+    if arxiv_id in _ARXIV_ABSTRACT_TEXT_CACHE:
+        return _ARXIV_ABSTRACT_TEXT_CACHE[arxiv_id]
+    url = f"https://arxiv.org/abs/{arxiv_id}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "feature-finder-orchestrator",
+                "Accept": "text/html",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"  arxiv abstract-text fetch for {arxiv_id} failed: {e}")
+        _ARXIV_ABSTRACT_TEXT_CACHE[arxiv_id] = ""
+        return ""
+
+    parts: list[str] = []
+    m_title = _ARXIV_TITLE_RE.search(html)
+    if m_title:
+        title = _HTML_WHITESPACE_RE.sub(
+            " ", _HTML_TAG_RE.sub("", m_title.group(1))
+        ).strip()
+        if title.lower().startswith("title:"):
+            title = title.split(":", 1)[1].strip()
+        if title:
+            parts.append(f"Title: {title}")
+    m_abs = _ARXIV_ABSTRACT_BLOCK_RE.search(html)
+    if m_abs:
+        abstract = _HTML_WHITESPACE_RE.sub(
+            " ", _HTML_TAG_RE.sub("", m_abs.group(1))
+        ).strip()
+        if abstract.lower().startswith("abstract:"):
+            abstract = abstract.split(":", 1)[1].strip()
+        if abstract:
+            parts.append(f"Abstract: {abstract}")
+    text = "\n\n".join(parts)
+    _ARXIV_ABSTRACT_TEXT_CACHE[arxiv_id] = text
+    return text
+
+
 def _classify_license(spdx: str) -> str:
     """Map an SPDX-ish license id onto an adoption bucket.
 
@@ -8790,10 +8876,122 @@ Return ONLY a valid JSON object (no prose before or after):
 """
 
 
-def _render_coverage_matrix(matrix: dict) -> str:
+def _build_fidelity_audit_prompt_paper_anchored(
+    pr_title: str,
+    pr_body: str,
+    pr_diff: str,
+    arxiv_id: str,
+    paper_text: str,
+) -> str:
+    """Compose the paper-anchored fidelity-audit prompt.
+
+    Used as Phase A's degraded mode when the paper has no public
+    reference impl to clone — the audit anchors against the paper's
+    title + abstract (fetched via ``_fetch_arxiv_abstract_text``)
+    instead of a reference codebase. Lower precision than the
+    reference-anchored variant (abstracts can be vague on
+    implementation-level details), but materially better than skipping
+    the entire chain.
+
+    Output schema matches ``_build_fidelity_audit_prompt`` so the same
+    ``_render_coverage_matrix`` renderer + downstream consumers handle
+    both modes. The ``reference_location`` field is interpreted as
+    "paper section/equation" when paper-anchored (the renderer doesn't
+    care; the value is opaque markdown).
+    """
+    diff_excerpt = pr_diff if len(pr_diff) <= 60_000 else (
+        pr_diff[:60_000] + f"\n... [diff truncated, total {len(pr_diff)} chars] ...\n"
+    )
+    body_excerpt = (pr_body or "")[:4000]
+    paper_excerpt = paper_text[:8000]
+
+    return f"""You are auditing a draft PR's fidelity to the paper it claims to implement.
+
+# PR under audit
+
+**Title**: {pr_title}
+
+**Paper**: arxiv:{arxiv_id or "(unknown)"}
+
+**Audit mode**: paper-anchored (no public reference impl available — comparing the diff against the paper's described method instead of a concrete reference codebase).
+
+## Paper text (title + abstract)
+
+```
+{paper_excerpt}
+```
+
+## PR body
+
+```
+{body_excerpt}
+```
+
+## PR diff
+
+```
+{diff_excerpt}
+```
+
+# Task
+
+Compare the diff against the paper's described method. Produce a structured
+Coverage matrix that classifies each notable piece of the PR as one of:
+
+- **covered**: the PR implements something the paper explicitly describes.
+  Cite the paper's claim (a phrase from the abstract or a section reference
+  if mentioned in the PR body) and the PR location.
+- **deferred**: the PR intentionally leaves something out of scope. Cite what
+  the PR body says about it (e.g., "§4.4 adaptive decay deferred as follow-up").
+- **deviation**: the PR implements something the paper does not describe, or
+  implements it in a way the paper's abstract contradicts. Classify as:
+  - **defensible**: a reasonable adaptation when the paper is silent on
+    implementation specifics (e.g., the abstract describes a "filter" without
+    fixing the algorithm; the diff picks a standard choice).
+  - **needs-judgment**: substantive deviation from a claim the paper makes
+    (e.g., different numerical constants, missing a paper-headline mechanism,
+    computing a different mathematical quantity than the abstract describes).
+
+The abstract is a method-summary surface — it tells you what the paper claims
+to do at a high level, but not the implementation-level specifics. When the
+abstract is silent on a detail in the diff, treat that as **deferred** (out
+of scope of what the abstract covers) rather than a deviation. Reserve
+**needs-judgment** for items where the diff clearly conflicts with what the
+abstract claims.
+
+# Output
+
+Return ONLY a valid JSON object (no prose before or after):
+
+{{
+  "summary": "<one-sentence overall verdict>",
+  "needs_judgment": <true if any item.deviation_class == "needs-judgment">,
+  "items": [
+    {{
+      "name": "<paper claim or feature name>",
+      "draft_location": "<file::symbol or null>",
+      "reference_location": "<paper section/claim or null>",
+      "status": "covered" | "deferred" | "deviation",
+      "deviation_class": null | "defensible" | "needs-judgment",
+      "rationale": "<one to three sentences>"
+    }}
+  ]
+}}
+"""
+
+
+def _render_coverage_matrix(matrix: dict, audit_anchor: str = "reference") -> str:
     """Render the Claude-emitted Coverage matrix as a markdown section
     to append to the PR body. Renders as a table with one row per item
-    plus a summary line + needs-judgment callout."""
+    plus a summary line, an audit-anchor line (sets precision
+    expectations for the maintainer), and a needs-judgment callout.
+
+    ``audit_anchor`` is one of ``"reference"`` (Phase A clone-and-diff
+    against the paper's reference impl — higher precision) or
+    ``"paper"`` (Phase A degraded mode anchored against the paper's
+    abstract text only — lower precision). The line is omitted for
+    unknown values to keep older call sites round-trippable.
+    """
     summary = matrix.get("summary", "(no summary)")
     needs_judgment = bool(matrix.get("needs_judgment", False))
     items = matrix.get("items", [])
@@ -8801,6 +8999,16 @@ def _render_coverage_matrix(matrix: dict) -> str:
     lines = [FIDELITY_COVERAGE_SECTION_HEADER, ""]
     lines.append(f"_{summary}_")
     lines.append("")
+    if audit_anchor == "reference":
+        lines.append("_Audit anchor: reference implementation (diff vs. cloned reference codebase)._")
+        lines.append("")
+    elif audit_anchor == "paper":
+        lines.append(
+            "_Audit anchor: paper abstract (no public reference impl available — "
+            "this audit compares the diff to the paper's described method at the "
+            "abstract level, which is less precise than a code-level comparison)._"
+        )
+        lines.append("")
     if needs_judgment:
         lines.append("> ⚠️ One or more items below need human judgment — see rows marked `deviation (needs-judgment)`.")
         lines.append("")
@@ -8948,15 +9156,31 @@ def run_fidelity_audit(target: Target) -> dict:
     Returns a status dict suitable for the action's $GITHUB_OUTPUT and
     the telemetry post. Status values:
 
-        fidelity_audited                — happy path; Coverage matrix posted
-        fidelity_audited_needs_judgment — happy path + at least one item
-                                          flagged for human review
-        fidelity_skipped_no_pr          — INPUT_PR_NUMBER empty
-        fidelity_skipped_not_bot        — PR not authored by remyx-ai[bot]
-        fidelity_skipped_no_reference   — couldn't extract a reference URL
-        fidelity_failed_clone           — reference clone failed
-        fidelity_failed_claude          — Claude call failed or returned
-                                          unparseable JSON
+        fidelity_audited                       — happy path; Coverage
+                                                 matrix posted (reference
+                                                 impl anchor)
+        fidelity_audited_needs_judgment        — happy path + at least
+                                                 one item flagged for
+                                                 human review (reference
+                                                 impl anchor)
+        fidelity_audited_paper_anchored        — happy path; Coverage
+                                                 matrix posted (paper
+                                                 abstract anchor — used
+                                                 when no public reference
+                                                 impl is available)
+        fidelity_audited_paper_anchored_needs_judgment — paper-anchored
+                                                 happy path + needs-judgment
+        fidelity_skipped_no_pr                 — INPUT_PR_NUMBER empty
+        fidelity_skipped_not_bot               — PR not authored by
+                                                 remyx-ai[bot]
+        fidelity_skipped_no_reference          — couldn't extract a
+                                                 reference URL AND no
+                                                 arxiv id available for
+                                                 the paper-anchored
+                                                 degraded mode
+        fidelity_failed_clone                  — reference clone failed
+        fidelity_failed_claude                 — Claude call failed or
+                                                 returned unparseable JSON
     """
     result: dict = {"repo": target.repo, "mode": "fidelity", "status": "unknown"}
 
@@ -8994,41 +9218,76 @@ def run_fidelity_audit(target: Target) -> dict:
     body = pr.get("body") or ""
     title = pr.get("title") or ""
     arxiv_id, reference_url = _extract_reference_url_from_pr_body(body, target.repo)
-    if not reference_url:
-        result["status"] = "fidelity_skipped_no_reference"
-        result["error"] = "no reference URL extracted from PR body"
-        log.info(f"  ✗ no reference URL in PR #{pr_number} body; skipping")
-        return result
     result["arxiv_id"] = arxiv_id
-    result["reference_url"] = reference_url
 
-    # Workdir layout: ./reference/ holds the cloned ref impl; Claude's
-    # cwd will be the workdir root so it can Read/Glob/Grep into it.
+    # Workdir layout: when reference-anchored, ./reference/ holds the
+    # cloned ref impl and Claude's cwd is the workdir root so it can
+    # Read/Glob/Grep into it. In paper-anchored mode the workdir is
+    # still set up (the Claude one-shot needs a cwd) but ./reference/
+    # is absent — the prompt embeds the paper text directly.
     workdir = Path(tempfile.mkdtemp(prefix="outrider-fidelity-"))
     log.info(f"  → workdir: {workdir}")
 
-    ok, ref_dir, err = _clone_reference_repo(reference_url, workdir)
-    if not ok:
-        result["status"] = "fidelity_failed_clone"
-        result["error"] = err
-        log.error(f"  ✗ {err}")
-        return result
+    audit_anchor: str  # "reference" | "paper"
+    if reference_url:
+        result["reference_url"] = reference_url
+        ok, ref_dir, err = _clone_reference_repo(reference_url, workdir)
+        if not ok:
+            result["status"] = "fidelity_failed_clone"
+            result["error"] = err
+            log.error(f"  ✗ {err}")
+            return result
+        try:
+            pr_diff = _fetch_pr_diff(target, pr_number)
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            result["status"] = "fidelity_failed_claude"
+            result["error"] = f"could not fetch PR diff: {e}"
+            return result
+        prompt = _build_fidelity_audit_prompt(
+            pr_title=title,
+            pr_body=body,
+            pr_diff=pr_diff,
+            arxiv_id=arxiv_id,
+            reference_url=reference_url,
+            reference_root=ref_dir,
+        )
+        audit_anchor = "reference"
+        log.info(f"  → reference-anchored audit ({reference_url})")
+    else:
+        # Phase A degraded mode: no public reference impl available, but
+        # we may still have the paper's title + abstract from arxiv. The
+        # audit compares the diff against the paper's described method
+        # at the abstract level — lower precision than a code-anchored
+        # comparison, but materially better than skipping the entire
+        # chain (B + C still run after this).
+        paper_text = _fetch_arxiv_abstract_text(arxiv_id) if arxiv_id else ""
+        if not paper_text:
+            result["status"] = "fidelity_skipped_no_reference"
+            result["error"] = (
+                "no reference URL extracted from PR body and no arxiv "
+                "abstract available for paper-anchored audit"
+            )
+            log.info(
+                f"  ✗ no reference URL in PR #{pr_number} body and no "
+                f"arxiv abstract for {arxiv_id!r}; skipping"
+            )
+            return result
+        try:
+            pr_diff = _fetch_pr_diff(target, pr_number)
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            result["status"] = "fidelity_failed_claude"
+            result["error"] = f"could not fetch PR diff: {e}"
+            return result
+        prompt = _build_fidelity_audit_prompt_paper_anchored(
+            pr_title=title,
+            pr_body=body,
+            pr_diff=pr_diff,
+            arxiv_id=arxiv_id,
+            paper_text=paper_text,
+        )
+        audit_anchor = "paper"
+        log.info(f"  → paper-anchored audit (arxiv:{arxiv_id}, no reference impl)")
 
-    try:
-        pr_diff = _fetch_pr_diff(target, pr_number)
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        result["status"] = "fidelity_failed_claude"
-        result["error"] = f"could not fetch PR diff: {e}"
-        return result
-
-    prompt = _build_fidelity_audit_prompt(
-        pr_title=title,
-        pr_body=body,
-        pr_diff=pr_diff,
-        arxiv_id=arxiv_id,
-        reference_url=reference_url,
-        reference_root=ref_dir,
-    )
     log.info(f"  → Claude one-shot audit (timeout={target.claude_timeout_s}s)")
     ok, raw = _run_claude_oneshot(workdir, prompt, target.claude_timeout_s, max_turns=20)
     if not ok:
@@ -9042,7 +9301,7 @@ def run_fidelity_audit(target: Target) -> dict:
         result["error"] = f"Claude returned unparseable JSON: {raw[-500:]}"
         return result
 
-    coverage_section = _render_coverage_matrix(matrix)
+    coverage_section = _render_coverage_matrix(matrix, audit_anchor=audit_anchor)
     # Per-phase output goes to the action run-summary panel rather than the
     # PR body; the body is reserved for content the convention pass aligns
     # to upstream conventions.
@@ -9051,9 +9310,18 @@ def run_fidelity_audit(target: Target) -> dict:
     needs_judgment = bool(matrix.get("needs_judgment", False))
     if needs_judgment:
         _add_pr_label(target, pr_number, FIDELITY_LABEL_NEEDS_JUDGMENT)
-        result["status"] = "fidelity_audited_needs_judgment"
+        result["status"] = (
+            "fidelity_audited_paper_anchored_needs_judgment"
+            if audit_anchor == "paper"
+            else "fidelity_audited_needs_judgment"
+        )
     else:
-        result["status"] = "fidelity_audited"
+        result["status"] = (
+            "fidelity_audited_paper_anchored"
+            if audit_anchor == "paper"
+            else "fidelity_audited"
+        )
+    result["audit_anchor"] = audit_anchor
 
     # Transition the trigger label → fidelity-done so the convention pass
     # workflow picks it up.
