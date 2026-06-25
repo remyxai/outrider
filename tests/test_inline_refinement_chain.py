@@ -115,6 +115,21 @@ def test_chain_runs_all_phases_on_needs_judgment(monkeypatch):
     assert [c[0] for c in calls] == ["fidelity", "convention", "test"]
 
 
+@pytest.mark.parametrize("audited_status", [
+    "fidelity_audited_paper_anchored",
+    "fidelity_audited_paper_anchored_needs_judgment",
+])
+def test_chain_runs_all_phases_for_paper_anchored_audit(monkeypatch, audited_status):
+    # Phase A's paper-anchored degraded mode still produces an audited
+    # state — B + C must run. Without this the chain bails whenever a
+    # paper lacks a public reference impl (observed on NeMo-Curator
+    # PR #4 during v1.6.15 validation).
+    _base_env(monkeypatch)
+    calls = _record_phases(monkeypatch, audited_status)
+    run.run_refinement_chain(run.Target(repo="owner/repo"), 9)
+    assert [c[0] for c in calls] == ["fidelity", "convention", "test"]
+
+
 @pytest.mark.parametrize("skip_status", [
     "fidelity_skipped_no_reference",
     "fidelity_skipped_not_bot",
