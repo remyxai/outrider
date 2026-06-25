@@ -8529,10 +8529,31 @@ _REF_REPO_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Marker-prefixed reference URL: ``Reference: <url>``, ``Code: <url>``,
+# ``Project page: <url>``, ``Official implementation: <url>``. Tolerates
+# markdown formatting on the marker line (``**Code**:``, ``- **Code**:``,
+# ``**Reference impl** ([permissive](<url>)):``) by scanning for the first
+# ``github.com/<owner>/<repo>`` URL within a short on-line window after the
+# marker word — robust to bold, list bullets, parenthesized license tags,
+# and same-line annotations, all of which the initial draft's
+# ``_render_license_section`` is allowed to add.
+_REF_MARKER_RE = re.compile(
+    r"(?:reference(?:\s+impl)?|code|project\s+page|official\s+implementation)"
+    r"[^\n]{0,120}?https?://github\.com/([\w.-]+/[\w.-]+)",
+    re.IGNORECASE,
+)
+
 _ARXIV_URL_RE = re.compile(
     r"https?://arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})(?:v\d+)?",
     re.IGNORECASE,
 )
+
+# Owners whose URLs are never the paper's reference impl — they're our
+# own attribution (Outrider's docs, the engine, the action repo). Without
+# this, a body that mentions ``engine.remyx.ai``-class links gets the
+# attribution URL picked as the "reference," producing a wasted Phase A
+# clone against an unrelated repo.
+_REFERENCE_DENY_OWNERS = frozenset({"remyxai"})
 
 
 def _extract_reference_url_from_pr_body(
@@ -8546,28 +8567,48 @@ def _extract_reference_url_from_pr_body(
     Description section. Either may be absent. Returns ``("", "")`` for
     anything that can't be parsed.
 
+    Extraction strategy:
+
+    1. Prefer a **marker-prefixed URL** (``Reference:``, ``Code:``,
+       ``Project page:``, ``Official implementation:``). When the
+       drafting pass renders the paper's known reference URL with this
+       marker, the audit picks it up unambiguously regardless of what
+       other github URLs are in the body.
+    2. Fall back to the **first github URL not owned by an excluded
+       owner** — the target's own owner, or any of the action's own
+       attribution-link owners (``remyxai/*``).
+
     The reference URL is normalised to the ``owner/repo`` clone URL —
     the file-specific suffix is preserved separately if the caller
     needs a file-path anchor.
-
-    Self-references (URLs pointing at the same owner as the target
-    repo, e.g. the bot's footer attribution) are skipped; the caller's
-    intent is to locate the *upstream* paper's reference impl.
     """
+    body = body or ""
     arxiv_id = ""
-    m = _ARXIV_URL_RE.search(body or "")
+    m = _ARXIV_URL_RE.search(body)
     if m:
         arxiv_id = m.group(1)
+
     target_owner = target_repo.split("/", 1)[0].lower() if target_repo else ""
-    reference_url = ""
-    for m in _REF_REPO_URL_RE.finditer(body or ""):
+    excluded_owners = _REFERENCE_DENY_OWNERS | ({target_owner} if target_owner else set())
+
+    # Layer 1: marker-prefixed URL. The regex's capture group is already
+    # the normalised ``owner/repo`` (no trailing /blob/... path).
+    for m in _REF_MARKER_RE.finditer(body):
         owner_repo = m.group(1)
         owner = owner_repo.split("/", 1)[0].lower()
-        if target_owner and owner == target_owner:
+        if owner in excluded_owners:
             continue
-        reference_url = f"https://github.com/{owner_repo}"
-        break
-    return arxiv_id, reference_url
+        return arxiv_id, f"https://github.com/{owner_repo}"
+
+    # Layer 2: first github URL not owned by an excluded owner.
+    for m in _REF_REPO_URL_RE.finditer(body):
+        owner_repo = m.group(1)
+        owner = owner_repo.split("/", 1)[0].lower()
+        if owner in excluded_owners:
+            continue
+        return arxiv_id, f"https://github.com/{owner_repo}"
+
+    return arxiv_id, ""
 
 
 def _clone_reference_repo(url: str, workdir: Path) -> tuple[bool, Path | None, str]:
@@ -9409,10 +9450,21 @@ Produce an updated PR body that:
 2. **Preserves the existing ``## Coverage`` section verbatim** if present —
    that section is the fidelity-audit output and must not be modified or
    moved. If a Coverage section is present, keep it at the end of the body.
-3. **Reuses the same factual content** from the current body (code locations,
+3. **Preserves the paper's reference repo URL** if present. The original
+   body may carry a ``- **Code**: https://github.com/...`` line (or
+   similar ``Reference:`` / ``Project page:`` / ``Official implementation:``
+   marker) under a License-or-availability section that the target repo's
+   convention may not have. **Do not silently drop the URL.** If the
+   convention has no natural home for it, append it under a single line
+   like ``Reference: https://github.com/<owner>/<repo>`` at the bottom of
+   the body (above ``## Coverage`` if present). The fidelity audit (Phase A)
+   reads this URL to clone the paper's reference and produce its diff;
+   without it, the audit silently skips and the maintainer loses the
+   fidelity signal.
+4. **Reuses the same factual content** from the current body (code locations,
    numbers, behavior callouts, test results) — do not invent new claims and
    do not remove substantive details. Restructure, don't rewrite.
-4. **Does not add boilerplate** that isn't in the canonical example (no
+5. **Does not add boilerplate** that isn't in the canonical example (no
    "Generated by..." footers, no horizontal rules unless the canonical
    example shows them).
 
@@ -9460,6 +9512,20 @@ def _apply_pr_body_convention_update(
     if FIDELITY_COVERAGE_SECTION_HEADER in current_body:
         if FIDELITY_COVERAGE_SECTION_HEADER not in new_body:
             return False, "", "body-rewrite dropped the ## Coverage section"
+    # Sanity check: if the input had a non-self-owner github URL the
+    # fidelity audit could anchor against, the rewrite must keep at least
+    # one such URL reachable. Stripping the License-or-availability
+    # section without preserving the reference URL would leave Phase A
+    # with no anchor on re-runs (the normal chain runs Phase A before
+    # this rewrite, but re-running Phase A afterwards must still work).
+    _, current_ref = _extract_reference_url_from_pr_body(current_body, target.repo)
+    if current_ref:
+        _, new_ref = _extract_reference_url_from_pr_body(new_body, target.repo)
+        if not new_ref:
+            return False, "", (
+                f"body-rewrite dropped the reference URL ({current_ref}); "
+                f"Phase A would lose the fidelity anchor"
+            )
     try:
         _update_pr_body(target, pr_number, new_body)
     except RuntimeError as e:
