@@ -93,6 +93,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 | `claude-timeout` | `900` | Wall-clock seconds for the Claude Code implementation step. Bump for very large repos; lower to cap cost. |
 | `pin-arxiv` | `''` | Optional `arxiv_id`. When set and present in the candidate pool, the action implements that exact paper and skips the selection pass — use it for reproducible eval re-runs. Empty = normal selection. |
 | `mode` | `recommend` | `recommend` (classic per-run flow) / `weekly-summary` (post a weekly digest to a Discussion — see [Weekly Discussion summary](#weekly-discussion-summary-opt-in)) |
+| `chain` | `true` | When `true`, `recommend` mode continues into the refinement chain (fidelity audit → convention pass → test gate) on the draft PR it just filed, within the same run — no extra workflow files required. Set `false` for cost-sensitive runs or to drive the chain via separate workflows with `mode: fidelity/convention/test`. |
 | `weekly-discussion-id` | `''` | Discussion number (from its URL) or GraphQL node ID. Only read in `weekly-summary` mode. |
 
 ## Outputs
@@ -101,6 +102,9 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 |---|---|---|
 | `status` | always | Run outcome — see status codes below |
 | `pr_url` | `pr_opened*` | URL of the opened PR |
+| `pr_number` | `pr_opened*` | Number of the opened PR (handed to the inline refinement chain) |
+| `chain_fidelity_status` / `chain_convention_status` / `chain_test_status` | chain ran | Per-phase outcome of the inline refinement chain (`recommend` mode, `chain: true`) |
+| `chain_draft_dropped` | chain ran | `true` if the test gate flipped the draft to ready-for-review |
 | `issue_url` | `issue_opened*` | URL of the opened Issue |
 | `arxiv` | when a paper was picked | arxiv_id |
 | `tier` | when a paper was picked | `high` / `moderate` / `low` / `noise` |
@@ -110,9 +114,9 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 
 ## Costs
 
-- **Claude Code**: ~$2–3 per PR-track run (pre-flight + selection + implementation + self-review). Issue-track runs cost less since they skip the implementation pass. You bring `ANTHROPIC_API_KEY`.
+- **Claude Code**: ~$2–3 per PR-track run for the recommend pass alone (pre-flight + selection + implementation + self-review). With the inline refinement chain on (the default), a full PR-track run is ~$5–6 and ~15–25 min, since fidelity audit + convention pass + test gate each add a Claude pass. Set `chain: false` to keep runs at the recommend-only cost. Issue-track runs cost less since they skip the implementation pass and never enter the chain. You bring `ANTHROPIC_API_KEY`.
 - **Remyx API**: included in your engine.remyx.ai subscription.
-- **GitHub Actions**: ~6–8 min on `ubuntu-latest` per run.
+- **GitHub Actions**: ~6–8 min per recommend-only run; ~15–25 min with the chain (single workflow run on `ubuntu-latest`).
 
 With the default cadence guard (gate enabled), expect ~$2–4/mo Claude at typical engagement patterns.
 
@@ -235,7 +239,14 @@ Pre-flight Claude pass: PR or Issue?
                      diff preserved in Issue body for manual review)
                                       ↓
                      Commit (bundle scrubbed) + push + open draft PR
+                                      ↓
+                     Inline refinement chain (chain: true, default):
+                       fidelity audit  → Coverage matrix on PR body
+                       convention pass → align to repo conventions
+                       test gate       → lint + tests; drop draft on pass
 ```
+
+When `chain: true` (the default), the same run continues into the refinement chain on the PR it just filed — fidelity audit, then (only if the audit ran) convention pass and test gate — so the whole pipeline is one workflow run with no extra workflow files. The chain phases are also invokable individually via `mode: fidelity/convention/test` + `pr-number` for the separate-workflow pattern or to re-run a single phase. Opt out of the inline chain with `chain: false`.
 
 The Remyx engine (commit-history extraction, candidate pool, embedding pre-filter, ranking) runs server-side. This action is a pure consumer.
 

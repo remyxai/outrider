@@ -1181,6 +1181,13 @@ class Target:
     # LLM selection pass) so eval re-runs are reproducible. Empty = normal
     # selection.
     pin_arxiv: str = ""
+    # Inline refinement chain: when True (default), recommend mode continues
+    # sequentially into fidelity audit → convention pass → test gate on the
+    # just-opened PR, so the chain runs by default without the customer
+    # deploying the standalone outrider-fidelity/convention/test workflows.
+    # Set to False (action input `chain: false`) for cost-sensitive runs or
+    # when using the separate-workflow chain pattern.
+    chain_enabled: bool = True
     notes: str = ""
 
 
@@ -5528,8 +5535,13 @@ def detect_default_branch(workdir: Path) -> str:
 def open_pr(
     target: Target, branch: str, title: str, body: str, draft: bool,
     base: str = "main",
-) -> str:
-    """Open a PR on the target repo; returns the PR URL."""
+) -> tuple[str, int]:
+    """Open a PR on the target repo; returns ``(pr_url, pr_number)``.
+
+    The number is threaded back so recommend mode can hand it to the inline
+    refinement chain (fidelity → convention → test all key off the PR
+    number) without a second API round-trip to look it up.
+    """
     log.info(f"  → opening {'draft' if draft else ''} PR on {target.repo} "
              f"(base={base})")
     pr = gh_api("POST", f"/repos/{target.repo}/pulls", {
@@ -5539,7 +5551,7 @@ def open_pr(
         "body": body,
         "draft": draft,
     })
-    return pr["html_url"]
+    return pr["html_url"], pr["number"]
 
 
 def open_issue(
@@ -7051,11 +7063,12 @@ def process_target(target: Target) -> dict:
         commit_and_push(
             workdir, branch, pr_title, repo=target.repo, base_branch=default_branch
         )
-        pr_url = open_pr(
+        pr_url, pr_number = open_pr(
             target, branch, pr_title, pr_body, draft=draft, base=default_branch
         )
         result["status"] = "pr_opened_draft" if draft else "pr_opened"
         result["pr_url"] = pr_url
+        result["pr_number"] = pr_number
         log.info(f"  ✓ {result['status']}: {pr_url}")
         return result
 
@@ -7247,6 +7260,13 @@ def build_target_from_env() -> Target:
         log.error(f"INPUT_CLAUDE_TIMEOUT={timeout_raw!r} is not an integer.")
         sys.exit(2)
 
+    # Inline refinement chain toggle. Default on; any of the usual falsey
+    # spellings disables it so cost-sensitive customers can opt out via
+    # `chain: false` in the action's `with:` block.
+    chain_enabled = _optional_env("INPUT_CHAIN", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
     return Target(
         repo=repo,
         interest_id=interest_id,
@@ -7257,6 +7277,7 @@ def build_target_from_env() -> Target:
         test_integration_policy=test_integration_policy,
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
+        chain_enabled=chain_enabled,
         notes="",
     )
 
@@ -10881,6 +10902,57 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         log.warning(f"  run telemetry POST failed (non-fatal): {str(e)[:200]}")
 
 
+def run_refinement_chain(target: Target, pr_number: int) -> dict:
+    """Continue a freshly-filed recommend-mode PR into the refinement chain.
+
+    Runs the three phases sequentially on ``pr_number`` —
+    ``run_fidelity_audit`` → ``run_convention_pass`` → ``run_test_gate`` —
+    so the chain runs by default inside the recommend workflow run rather
+    than requiring the customer to deploy the standalone
+    outrider-fidelity/convention/test workflows.
+
+    Convention and test only run once fidelity actually audited the PR
+    (status ``fidelity_audited*``); a skip/failure short-circuits the
+    chain since the downstream phases have nothing meaningful to act on.
+    Convention and test run as a pair after that — the test gate is what
+    flips the draft to ready, so it runs regardless of the convention
+    phase's individual outcome.
+
+    The phase runners read the PR number from ``INPUT_PR_NUMBER`` (the same
+    seam the standalone ``mode: <phase>`` workflows use), so we set it here
+    before delegating. Returns a dict of per-phase statuses for telemetry
+    and the run summary.
+    """
+    log.info(f"  → continuing into refinement chain on PR #{pr_number}")
+    # The phase runners read INPUT_PR_NUMBER from the environment (shared
+    # seam with the standalone workflow_dispatch chain). Set it so the
+    # inline call targets the PR recommend mode just opened.
+    os.environ["INPUT_PR_NUMBER"] = str(pr_number)
+
+    chain: dict = {"pr_number": pr_number}
+
+    log.info("  ─── chain phase: fidelity audit ───")
+    fidelity = run_fidelity_audit(target)
+    chain["fidelity_status"] = fidelity.get("status")
+    if not str(fidelity.get("status", "")).startswith("fidelity_audited"):
+        log.info(
+            f"  ↪ fidelity did not audit (status={fidelity.get('status')!r}); "
+            f"skipping convention + test phases"
+        )
+        return chain
+
+    log.info("  ─── chain phase: convention pass ───")
+    convention = run_convention_pass(target)
+    chain["convention_status"] = convention.get("status")
+
+    log.info("  ─── chain phase: test gate ───")
+    test = run_test_gate(target)
+    chain["test_status"] = test.get("status")
+    chain["draft_dropped"] = test.get("draft_dropped", False)
+
+    return chain
+
+
 def main():
     # Mode dispatch: "recommend" is the classic
     # scout-and-implement run; "weekly-summary" aggregates the past week
@@ -10932,6 +11004,26 @@ def main():
         log.exception(f"  ✗ unhandled error: {e}")
         result = {"repo": target.repo, "status": failure_status, "error": str(e)}
 
+    # Inline refinement chain: once recommend mode files a draft
+    # PR, continue sequentially into fidelity → convention → test on that PR
+    # so the chain runs by default — no standalone workflow files required.
+    # Gated on `chain_enabled` (action input `chain`, default true) and on a
+    # PR actually having opened. Runs before the cost-totals block so the
+    # chain's Claude spend rolls into this run's reported totals.
+    if (
+        mode == "recommend"
+        and target.chain_enabled
+        and str(result.get("status", "")).startswith("pr_opened")
+        and result.get("pr_number")
+    ):
+        try:
+            result["chain"] = run_refinement_chain(target, result["pr_number"])
+        except Exception as e:
+            log.exception(f"  ✗ refinement chain failed (non-fatal): {e}")
+            result["chain"] = {"error": str(e)}
+    elif mode == "recommend" and not target.chain_enabled:
+        log.info("  chain disabled (chain: false); skipping refinement chain")
+
     # Token/cost totals across every Claude pass this run, captured even when
     # process_target raised.
     result["cost_usd"] = round(_RUN_COST["cost_usd"], 4)
@@ -10956,6 +11048,20 @@ def main():
                 f.write(f"status={result.get('status', 'unknown')}\n")
                 if "pr_url" in result:
                     f.write(f"pr_url={result['pr_url']}\n")
+                if "pr_number" in result:
+                    f.write(f"pr_number={result['pr_number']}\n")
+                # Inline refinement-chain phase outcomes (recommend mode with
+                # chain enabled). Lets downstream steps branch on whether the
+                # draft was dropped to ready, etc.
+                chain = result.get("chain") or {}
+                if "fidelity_status" in chain:
+                    f.write(f"chain_fidelity_status={chain['fidelity_status']}\n")
+                if "convention_status" in chain:
+                    f.write(f"chain_convention_status={chain['convention_status']}\n")
+                if "test_status" in chain:
+                    f.write(f"chain_test_status={chain['test_status']}\n")
+                if "draft_dropped" in chain:
+                    f.write(f"chain_draft_dropped={str(chain['draft_dropped']).lower()}\n")
                 if "issue_url" in result:
                     f.write(f"issue_url={result['issue_url']}\n")
                 if "discussion_comment_url" in result:
