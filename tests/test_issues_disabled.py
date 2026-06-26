@@ -51,12 +51,13 @@ def test_open_issue_succeeds_when_post_works(monkeypatch):
     def fake_gh_api(method, path, body=None):
         calls.append((method, path))
         if method == "POST" and "/issues" in path:
-            return {"html_url": "https://github.com/owner/repo/issues/42"}
+            return {"html_url": "https://github.com/owner/repo/issues/42", "number": 42}
         raise AssertionError(f"unexpected call: {method} {path}")
 
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
-    url = run.open_issue(_target(), "title", "body")
+    url, number = run.open_issue(_target(), "title", "body")
     assert url == "https://github.com/owner/repo/issues/42"
+    assert number == 42
     assert calls == [("POST", "/repos/owner/repo/issues")]
 
 
@@ -74,12 +75,13 @@ def test_open_issue_retries_after_410_when_patch_succeeds(monkeypatch):
         if method == "PATCH" and path == "/repos/owner/repo":
             return {"has_issues": True}
         if method == "POST" and "/issues" in path and len(call_log) >= 3:
-            return {"html_url": "https://github.com/owner/repo/issues/7"}
+            return {"html_url": "https://github.com/owner/repo/issues/7", "number": 7}
         raise AssertionError(f"unexpected call sequence: {call_log}")
 
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
-    url = run.open_issue(_target(), "title", "body")
+    url, number = run.open_issue(_target(), "title", "body")
     assert url == "https://github.com/owner/repo/issues/7"
+    assert number == 7
     # Three calls: POST (410) → PATCH (success) → POST (success)
     assert len(call_log) == 3
     assert call_log[1] == ("PATCH", "/repos/owner/repo")

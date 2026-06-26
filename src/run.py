@@ -5642,8 +5642,8 @@ def open_pr(
 
 def open_issue(
     target: Target, title: str, body: str, *, footer_override: str = "",
-) -> str:
-    """Open a discussion Issue on the target repo. Returns the issue URL.
+) -> tuple[str, int]:
+    """Open a discussion Issue on the target repo. Returns ``(url, number)``.
 
     The default footer attributes the Issue to the coding agent's
     Issue-mode election (the original use case). When the actual route
@@ -5701,7 +5701,7 @@ def open_issue(
                 raise
         else:
             raise
-    return issue["html_url"]
+    return issue["html_url"], int(issue["number"])
 
 
 def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
@@ -6031,7 +6031,7 @@ def _open_downgrade_issue(
     suppress_suggested_experiment: bool = False,
     replacement_experiment: str = "",
     footer_override: str = "",
-) -> str:
+) -> tuple[str, int]:
     """Open an Issue when an automated gate downgrades a PR-candidate.
 
     Used for preflight / integration / stub-density / test-integration /
@@ -6654,7 +6654,7 @@ def process_target(target: Target) -> dict:
                         f"fall outside the PR guardrails."
                     )
                 _record_verdict_fields(result, rec)
-                issue_url = _open_downgrade_issue(
+                issue_url, issue_number = _open_downgrade_issue(
                     target, rec,
                     reason=f"Selection identified an {shape_label} candidate",
                     detail=detail,
@@ -6678,6 +6678,7 @@ def process_target(target: Target) -> dict:
                     "candidates_considered": len(viable),
                     "status": "issue_opened_substitution",
                     "issue_url": issue_url,
+                    "issue_number": issue_number,
                 })
                 log.info(
                     f"  ✓ issue_opened_substitution ({shape}, external): "
@@ -6726,7 +6727,7 @@ def process_target(target: Target) -> dict:
                         f"can decide whether to merge the upgrade."
                     )
                     _record_verdict_fields(result, rec)
-                    issue_url = _open_downgrade_issue(
+                    issue_url, issue_number = _open_downgrade_issue(
                         target, rec,
                         reason=f"Selection identified a {shape_label} candidate",
                         detail=detail,
@@ -6750,6 +6751,7 @@ def process_target(target: Target) -> dict:
                         "candidates_considered": len(viable),
                         "status": "issue_opened_substitution",
                         "issue_url": issue_url,
+                        "issue_number": issue_number,
                     })
                     log.info(f"  ✓ issue_opened_substitution ({shape}): {issue_url}")
                     return result
@@ -6811,7 +6813,7 @@ def process_target(target: Target) -> dict:
                 f"{preflight.get('reasoning', '(no reasoning provided)')}\n\n"
                 f"{issue_body_inner}"
             )
-            issue_url = _open_downgrade_issue(
+            issue_url, issue_number = _open_downgrade_issue(
                 target, rec,
                 reason="Pre-flight routed to Issue before implementation",
                 detail=preflight_detail,
@@ -6842,6 +6844,7 @@ def process_target(target: Target) -> dict:
             # more specific than the generic paper title.
             result["status"] = "issue_opened_preflight"
             result["issue_url"] = issue_url
+            result["issue_number"] = issue_number
             log.info(f"  ✓ issue_opened_preflight: {issue_url}")
             return result
 
@@ -6875,9 +6878,10 @@ def process_target(target: Target) -> dict:
                 f"\n---\n\n"
                 f"{issue_body_inner}"
             )
-            issue_url = open_issue(target, issue_title, issue_body)
+            issue_url, issue_number = open_issue(target, issue_title, issue_body)
             result["status"] = "issue_opened"
             result["issue_url"] = issue_url
+            result["issue_number"] = issue_number
             log.info(f"  ✓ issue_opened: {issue_url}")
             return result
 
@@ -6898,7 +6902,7 @@ def process_target(target: Target) -> dict:
         if not passed_integration:
             result["integration_violations"] = int_violations
             log.warning(f"  ✗ integration check failed: {int_violations}")
-            issue_url = _open_downgrade_issue(
+            issue_url, issue_number = _open_downgrade_issue(
                 target, rec,
                 reason="No real integration with the existing codebase",
                 detail=(
@@ -6922,6 +6926,7 @@ def process_target(target: Target) -> dict:
             )
             result["status"] = "issue_opened_no_integration"
             result["issue_url"] = issue_url
+            result["issue_number"] = issue_number
             return result
 
         # 7.6. Stub density (§3). Routes to Issue if the new module's
@@ -6935,7 +6940,7 @@ def process_target(target: Target) -> dict:
                 f"  ✗ stub density {density:.0%} ≥ "
                 f"{STUB_DENSITY_DOWNGRADE_THRESHOLD:.0%}; downgrading to Issue"
             )
-            issue_url = _open_downgrade_issue(
+            issue_url, issue_number = _open_downgrade_issue(
                 target, rec,
                 reason=(
                     f"New module is mostly unimplemented "
@@ -6964,6 +6969,7 @@ def process_target(target: Target) -> dict:
             )
             result["status"] = "issue_opened_stub_density"
             result["issue_url"] = issue_url
+            result["issue_number"] = issue_number
             return result
 
         # 7.7. Diff Risk Score (RADAR). Calibrated static-diff risk band
@@ -6977,7 +6983,7 @@ def process_target(target: Target) -> dict:
         if risk.band == "high":
             log.warning(f"  ✗ diff risk {risk.score:.2f} ≥ "
                         f"{DIFF_RISK_ISSUE_THRESHOLD:.2f} (high); → Issue")
-            issue_url = _open_downgrade_issue(
+            issue_url, issue_number = _open_downgrade_issue(
                 target, rec,
                 reason=(f"Diff Risk Score {risk.score:.2f} exceeds the "
                         f"auto-land threshold ({DIFF_RISK_ISSUE_THRESHOLD:.2f})"),
@@ -6999,6 +7005,7 @@ def process_target(target: Target) -> dict:
             )
             result["status"] = "issue_opened_high_risk"
             result["issue_url"] = issue_url
+            result["issue_number"] = issue_number
             return result
 
         # 8. Tests
@@ -7038,7 +7045,7 @@ def process_target(target: Target) -> dict:
                         "  ✗ no new test imports from an existing module — "
                         "tests only self-test the new file"
                     )
-                    issue_url = _open_downgrade_issue(
+                    issue_url, issue_number = _open_downgrade_issue(
                         target, rec,
                         reason=(
                             "New tests don't touch any pre-existing module"
@@ -7065,6 +7072,7 @@ def process_target(target: Target) -> dict:
                     )
                     result["status"] = "issue_opened_no_test_integration"
                     result["issue_url"] = issue_url
+                    result["issue_number"] = issue_number
                     return result
 
         # 9. Self-review (§4). Second Claude pass over the diff. Renders
@@ -7095,7 +7103,7 @@ def process_target(target: Target) -> dict:
                 detail_body += (
                     f"\n### Self-review summary\n\n{summary}\n"
                 )
-            issue_url = _open_downgrade_issue(
+            issue_url, issue_number = _open_downgrade_issue(
                 target, rec,
                 reason="Self-review judged the new code an orphan (no production call path)",
                 detail=detail_body,
@@ -7113,6 +7121,7 @@ def process_target(target: Target) -> dict:
             )
             result["status"] = "issue_opened_self_review"
             result["issue_url"] = issue_url
+            result["issue_number"] = issue_number
             return result
         review_section = _render_self_review_section(review) if review else ""
 
@@ -10293,6 +10302,538 @@ def run_convention_pass(target: Target) -> dict:
     return result
 
 
+# ─── Refinement-pass: Issue-route convention alignment ────────────────────
+#
+# Parallel to the PR-route convention pass above, but for Outrider Issues.
+# When recommend mode routes to an Issue (issue_opened_preflight,
+# issue_opened_self_review, issue_opened_substitution, etc.), this pass
+# reads the target repo's .github/ISSUE_TEMPLATE/ files, picks the best-
+# fitting template via a Claude one-shot, and rewrites the Issue body to
+# match that template's shape — folding Outrider scaffolding into matching
+# sections and relegating non-mapping content to a single <details> block.
+# Issues have no diff, no draft state, and no Phase C, so this is a single
+# Claude call + a PATCH to the Issue body — much cheaper than the PR-route
+# convention pass.
+#
+# Input (workflow surface):
+#   INPUT_ISSUE_NUMBER — Issue number to refine (set by the inline
+#                        dispatcher or a standalone `mode: issue-convention`
+#                        workflow_dispatch)
+#
+# Output:
+#   - Issue body PATCHed with the rewritten content
+#   - Label applied: outrider:issue-convention-done
+#   - status: issue_convention_aligned / issue_convention_aligned_no_fitting_template
+#             / issue_convention_skipped_no_templates / issue_convention_failed_*
+
+ISSUE_CONVENTION_LABEL_DONE = "outrider:issue-convention-done"
+
+# Template-kind heuristic keywords. The picker filters out templates whose
+# kind is 'bug' or 'question' before passing the candidate set to Claude —
+# Outrider's paper-pitch shape would be a bad fit for either, and rewriting
+# as a bug report (lerobot's case in test forks) would actively harm the
+# Issue's reception.
+# Priority order: bug + new_model are checked before feature so that
+# specific contributions get specific kinds. e.g. "New dataset request"
+# matches `dataset` (new_model) before `request` (feature).
+_TEMPLATE_KIND_KEYWORDS = {
+    "bug": ("bug", "crash", "error", "broken", "regression", "fault"),
+    "new_model": ("model", "dataset", "benchmark", "evaluation", "eval"),
+    "feature": ("feature", "enhancement", "improvement", "request"),
+    "question": ("question", "help", "discussion", "support", "how do"),
+}
+
+# Frontmatter / Issue-form metadata extractors. Both formats expose `name`
+# and `description` as top-level keys; regex extraction is robust enough
+# for the kind-classifier without pulling in a YAML dependency. Markdown
+# frontmatter is delimited by `---` on its own line; Issue Forms have no
+# such delimiter (the YAML is the whole file).
+_TEMPLATE_NAME_RE = re.compile(r'^name:\s*(.+?)\s*$', re.MULTILINE | re.IGNORECASE)
+_TEMPLATE_DESCRIPTION_RE = re.compile(r'^description:\s*(.+?)\s*$', re.MULTILINE | re.IGNORECASE)
+
+# Filenames to skip when walking .github/ISSUE_TEMPLATE/. config.yml is
+# GitHub's metadata file (controls "blank issue allowed" + contact links),
+# not a template itself.
+_ISSUE_TEMPLATE_SKIP_FILES = frozenset({"config.yml", "config.yaml"})
+
+# Accepted template file extensions. mteb uses .yaml, ag2/dspy/lerobot use
+# .yml, haystack uses .md — discovery walks all three.
+_ISSUE_TEMPLATE_EXTENSIONS = (".md", ".yml", ".yaml")
+
+
+def _fetch_issue_templates_from_repo(target_repo: str) -> list[dict]:
+    """Return the parsed Issue templates from ``.github/ISSUE_TEMPLATE/``.
+
+    Each element of the returned list is a dict shaped like:
+
+        {
+          "filename": "feature_request.yml",
+          "name": "Feature Request",          # from frontmatter or YAML top
+          "description": "Suggest a feature", # may be empty
+          "kind": "feature",                  # heuristic classification
+          "raw_content": "<full file body>",
+        }
+
+    Returns ``[]`` when the directory is missing or empty, or when every
+    file is `config.yml`-style metadata. Never raises — the caller falls
+    back to the no-templates path on an empty list.
+    """
+    try:
+        listing = gh_api("GET", f"/repos/{target_repo}/contents/.github/ISSUE_TEMPLATE")
+    except RuntimeError as e:
+        # 404 → no template directory; that's a normal case, not an error.
+        log.debug(f"  no ISSUE_TEMPLATE/ on {target_repo}: {e}")
+        return []
+    if not isinstance(listing, list):
+        return []
+
+    templates: list[dict] = []
+    for entry in listing:
+        if entry.get("type") != "file":
+            continue
+        filename = entry.get("name", "")
+        if filename in _ISSUE_TEMPLATE_SKIP_FILES:
+            continue
+        if not filename.endswith(_ISSUE_TEMPLATE_EXTENSIONS):
+            continue
+        # Fetch the raw content. The Contents API returns base64 when the
+        # file is small; for files > 1MB it returns a download_url instead
+        # — Issue templates are always tiny so we only handle the base64
+        # path here.
+        content_b64 = entry.get("content", "")
+        if not content_b64:
+            # Some API responses elide content for directory listings;
+            # fetch the file directly in that case.
+            try:
+                file_meta = gh_api(
+                    "GET",
+                    f"/repos/{target_repo}/contents/.github/ISSUE_TEMPLATE/{filename}",
+                )
+                content_b64 = file_meta.get("content", "")
+            except RuntimeError:
+                continue
+        try:
+            raw = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+        except (ValueError, UnicodeDecodeError):
+            continue
+
+        name = ""
+        description = ""
+        m_name = _TEMPLATE_NAME_RE.search(raw)
+        if m_name:
+            name = m_name.group(1).strip().strip('"').strip("'")
+        m_desc = _TEMPLATE_DESCRIPTION_RE.search(raw)
+        if m_desc:
+            description = m_desc.group(1).strip().strip('"').strip("'")
+
+        templates.append({
+            "filename": filename,
+            "name": name or filename,
+            "description": description,
+            "kind": _classify_template_kind(name, description),
+            "raw_content": raw,
+        })
+    return templates
+
+
+def _classify_template_kind(name: str, description: str) -> str:
+    """Heuristic classifier — returns ``bug | feature | new_model | question | other``.
+
+    Walks the kind keywords in priority order (bug > feature > new_model > question).
+    Bug + question kinds are filtered out by the picker since Outrider's
+    paper-pitch shape doesn't fit either. ``new_model`` covers the mteb-style
+    "add a new model / dataset / benchmark" templates that are the strongest
+    Outrider fit when present.
+    """
+    haystack = f"{name} {description}".lower()
+    for kind, keywords in _TEMPLATE_KIND_KEYWORDS.items():
+        if any(kw in haystack for kw in keywords):
+            return kind
+    return "other"
+
+
+def _filter_eligible_templates(templates: list[dict]) -> list[dict]:
+    """Drop templates whose kind doesn't fit Outrider's paper-pitch shape.
+
+    ``bug`` and ``question`` templates would actively harm the rewrite —
+    forcing a "describe the bug" / "what's your question" shape onto a
+    paper recommendation is a worse outcome than the default body. Keeps
+    ``feature`` / ``new_model`` / ``other``.
+    """
+    return [t for t in templates if t.get("kind") not in ("bug", "question")]
+
+
+def _build_issue_body_rewrite_prompt(
+    issue_title: str, current_body: str, eligible_templates: list[dict]
+) -> str:
+    """Compose the Claude one-shot that picks the best-fitting Issue template
+    and rewrites the Issue body to match it.
+
+    Combines the picker + body-rewrite into one call (vs two) since both
+    operate on the same inputs and an isolated picker doesn't materially
+    constrain the rewrite's quality. The LLM picks template_id by best
+    structural match against the Outrider body and produces the rewritten
+    body in the same JSON response.
+    """
+    template_blocks = []
+    for t in eligible_templates[:6]:  # cap to keep the prompt bounded
+        template_blocks.append(
+            f"### Template: `{t['filename']}` (kind: {t['kind']})\n\n"
+            f"**Name**: {t['name']}\n"
+            f"**Description**: {t.get('description') or '(no description)'}\n\n"
+            f"**Raw file:**\n\n```\n{t['raw_content'][:2500]}\n```"
+        )
+    templates_section = "\n\n".join(template_blocks) if template_blocks else "(none — only bug/question templates were available)"
+
+    return f"""You are rewriting a draft Issue's body to match the target repo's Issue template conventions.
+
+# Issue being refined
+
+**Title**: {issue_title}
+
+# Current Issue body
+
+```
+{current_body[:8000]}
+```
+
+# Eligible templates from the target repo's `.github/ISSUE_TEMPLATE/`
+
+{templates_section}
+
+# Task
+
+The Outrider Issue body above carries the orchestrator's draft scaffolding
+(paper provenance, "Why this paper is interesting for the team", "Why this
+candidate", license metadata, "Suggested experiment", "Intentionally out
+of scope", routing-reason sections). That scaffolding is **secondary
+context**, not first-class content. The target repo's Issue templates are
+the **primary structure** — a maintainer reading the rewritten Issue
+should see the template's shape, not the Outrider sections.
+
+Pick the **best-fitting template** from the eligible set. "Best fit" means
+the template whose `name` / `description` / body fields most closely match
+the Outrider Issue's actual ask:
+
+- If a template specifically targets the kind of contribution Outrider is
+  proposing (e.g. `new_model.yaml` for a paper-anchored model addition),
+  prefer it over a generic `feature_request` template.
+- If no template is a clear fit (e.g. only generic `feature` templates
+  exist for what is structurally a model-addition Issue), pick the closest
+  match and note the fit-quality in the rationale.
+- If the eligible set is empty, return `(none)` for `TEMPLATE_ID` — the
+  body is rewritten with only the scaffolding-collapse rule applied (no
+  upstream structure to fold into).
+
+Produce an updated Issue body that:
+
+1. **Treats the picked template as the primary structure.** Use its
+   section headings (or its YAML Issue Form labels rendered as `**Bold
+   field name**` lines, in the order the form declares them) as the
+   body's primary reading surface. For YAML Issue Forms, render each
+   `body[].attributes.label` as a `**Label**` line followed by the
+   matching content from the Outrider body.
+2. **Folds the current body's facts INTO the template's fields.** The
+   Outrider "Why this paper is interesting" / "Suggested experiment" /
+   delivery-rationale content fills the template's `Description` /
+   `Problem` / `Solution` / similar fields. Quote arxiv IDs, GitHub
+   URLs, and license metadata into the template's dedicated fields if
+   any exist (e.g. mteb's `Arxiv link` input).
+3. **Relegates Outrider-only context to ONE collapsed block.** Sections
+   from the current body that don't map to any template field (the
+   discovery-loop blockquote, "Why this candidate" selection reasoning,
+   "What else Outrider considered" rejection list, paper-provenance
+   confidence/relevance lines, footer promos) go inside a single
+   ``<details><summary>Discovery context</summary>`` block placed at
+   the bottom of the body. If there's no such content, omit the block.
+4. **Compresses attribution to one italicized line** placed immediately
+   above the Discovery-context block (or at the very bottom if the
+   block was omitted): ``_Drafted by [Outrider](https://github.com/remyxai/outrider)
+   — paper: [arXiv:<id>](<arxiv-url>)._``
+5. **Preserves the paper's reference repo URL** if present. If the
+   picked template has a dedicated code/link field, put it there.
+   Otherwise put it inside the Discovery-context block as
+   ``Reference: https://github.com/<owner>/<repo>``.
+6. **Reuses substantive facts** — paper title, arxiv id, call-site
+   notes, the routing-reason section ("Why the orchestrator opened an
+   Issue instead of a PR"), the re-engagement note ("Reopen this Issue
+   if you want Outrider to revisit this paper later"). Do not invent
+   new claims; do not drop the routing-reason content (it's auditable
+   evidence of why this is an Issue, not a PR) — fold it into the
+   template's discussion/context field if available, otherwise keep it
+   as a clearly-labeled section above the Discovery-context block.
+7. **Does not add boilerplate** that isn't in the picked template
+   beyond the one-line attribution and the Discovery-context block.
+
+# Output format
+
+Return ONLY a delimited response in EXACTLY this format (no prose before
+or after, no markdown code fences):
+
+===TEMPLATE_ID===
+<filename of picked template, or (none) if no template fits>
+===RATIONALE===
+<one-sentence note on what structurally changed>
+===UPDATED_BODY===
+<the full new Issue body in markdown, verbatim — may contain any
+characters including newlines, quotes, braces, etc.>
+===END===
+
+The delimited format is required because the body is long markdown that
+would be hard to escape in JSON. Do not wrap the response in code fences;
+do not add prose before the first marker or after the last marker. The
+exact section markers (``===TEMPLATE_ID===``, ``===RATIONALE===``,
+``===UPDATED_BODY===``, ``===END===``) must each appear on their own line.
+"""
+
+
+def _update_issue_body(target: Target, issue_number: int, new_body: str) -> None:
+    """PATCH the Issue body via the GitHub Issues API."""
+    gh_api("PATCH", f"/repos/{target.repo}/issues/{issue_number}", {"body": new_body})
+
+
+# Section markers used by the Issue-body-rewrite Claude one-shot's delimited
+# output format. JSON-wrapped output is brittle when the body is long markdown
+# (one unescaped quote in a 30k-token response trashes the parse); a delimited
+# format lets the body contain any chars including quotes, braces, and
+# newlines without any escaping concerns.
+_ISSUE_REWRITE_MARKER_TEMPLATE_ID = "===TEMPLATE_ID==="
+_ISSUE_REWRITE_MARKER_RATIONALE = "===RATIONALE==="
+_ISSUE_REWRITE_MARKER_UPDATED_BODY = "===UPDATED_BODY==="
+_ISSUE_REWRITE_MARKER_END = "===END==="
+
+
+def _parse_issue_rewrite_response(raw: str) -> dict | None:
+    """Parse the delimited Issue-body-rewrite response.
+
+    Expects sections in order: TEMPLATE_ID, RATIONALE, UPDATED_BODY, END.
+    Returns ``{template_id, rationale, updated_body}`` on success, or
+    ``None`` if any marker is missing or out-of-order. Empty
+    ``UPDATED_BODY`` is also treated as a parse failure — the rewrite
+    must produce a body.
+
+    ``(none)`` and the literal string ``null`` in TEMPLATE_ID are both
+    normalised to an empty string (meaning "no template was picked"); the
+    orchestrator treats both as the "no-fitting-template" outcome.
+    """
+    if not raw:
+        return None
+    try:
+        t_start = raw.index(_ISSUE_REWRITE_MARKER_TEMPLATE_ID)
+        r_start = raw.index(_ISSUE_REWRITE_MARKER_RATIONALE)
+        b_start = raw.index(_ISSUE_REWRITE_MARKER_UPDATED_BODY)
+        # END is optional — the body extends to EOF if absent.
+        try:
+            e_start = raw.index(_ISSUE_REWRITE_MARKER_END, b_start)
+        except ValueError:
+            e_start = len(raw)
+    except ValueError:
+        return None
+    # Order check.
+    if not (t_start < r_start < b_start <= e_start):
+        return None
+    template_id = raw[t_start + len(_ISSUE_REWRITE_MARKER_TEMPLATE_ID):r_start].strip()
+    rationale = raw[r_start + len(_ISSUE_REWRITE_MARKER_RATIONALE):b_start].strip()
+    updated_body = raw[b_start + len(_ISSUE_REWRITE_MARKER_UPDATED_BODY):e_start].strip()
+    if not updated_body:
+        return None
+    # Normalise the no-pick sentinels.
+    if template_id.lower() in ("(none)", "null", "none", "", "<none>"):
+        template_id = ""
+    return {
+        "template_id": template_id,
+        "rationale": rationale,
+        "updated_body": updated_body,
+    }
+
+
+def _apply_issue_body_convention_update(
+    target: Target,
+    issue_number: int,
+    current_body: str,
+    eligible_templates: list[dict],
+    issue_title: str,
+    timeout_s: int,
+    workdir: Path,
+) -> tuple[bool, str, str, str]:
+    """Run the Issue-body rewrite one-shot and PATCH the Issue body.
+
+    Returns ``(ok, picked_template_id, rationale, error)``. On non-fatal
+    failure returns ``ok=False`` with an error message; the caller treats
+    that as ``issue_convention_failed_claude`` and moves on.
+    """
+    prompt = _build_issue_body_rewrite_prompt(
+        issue_title, current_body, eligible_templates,
+    )
+    ok, raw = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=4)
+    if not ok:
+        return False, "", "", f"issue-body-rewrite Claude call failed: {raw[-300:]}"
+    rewrite = _parse_issue_rewrite_response(raw)
+    if not rewrite:
+        return False, "", "", (
+            f"issue-body-rewrite returned unparseable delimited response: "
+            f"{raw[-300:]}"
+        )
+    new_body = rewrite["updated_body"]
+    # Sanity check: if the input carried an arXiv link (paper provenance),
+    # the rewrite must keep one. Same guard as the PR-route Phase B.
+    current_arxiv = _ARXIV_URL_RE.search(current_body)
+    if current_arxiv:
+        if not _ARXIV_URL_RE.search(new_body):
+            return False, "", "", (
+                f"issue-body-rewrite dropped the arXiv link "
+                f"({current_arxiv.group(0)}); paper provenance must "
+                f"remain reachable"
+            )
+    try:
+        _update_issue_body(target, issue_number, new_body)
+    except RuntimeError as e:
+        return False, "", "", f"Issue body PATCH failed: {e}"
+    return (
+        True,
+        rewrite.get("template_id") or "",
+        rewrite.get("rationale", "structurally aligned to Issue template"),
+        "",
+    )
+
+
+def run_issue_convention_pass(target: Target) -> dict:
+    """Phase B (Issue route) — fold Outrider scaffolding into the target
+    repo's Issue template shape.
+
+    Status values:
+        issue_convention_aligned                       — picked a template
+                                                         and rewrote the body
+        issue_convention_aligned_no_fitting_template   — templates exist but
+                                                         none fit Outrider's
+                                                         paper-pitch shape
+                                                         (e.g. bug-only sets);
+                                                         rewrote with scaffolding
+                                                         collapsed
+        issue_convention_skipped_no_templates          — no .github/ISSUE_TEMPLATE/
+                                                         directory; rewrote with
+                                                         scaffolding collapsed
+        issue_convention_skipped_no_issue              — INPUT_ISSUE_NUMBER empty
+        issue_convention_skipped_not_bot               — Issue not authored by
+                                                         remyx-ai[bot]
+        issue_convention_failed_claude                 — Claude call failed or
+                                                         returned unparseable JSON
+        issue_convention_failed_patch                  — PATCH to Issue body
+                                                         failed
+    """
+    result: dict = {"repo": target.repo, "mode": "issue-convention", "status": "unknown"}
+
+    issue_number_raw = os.environ.get("INPUT_ISSUE_NUMBER", "").strip()
+    if not issue_number_raw:
+        result["status"] = "issue_convention_skipped_no_issue"
+        log.info("  ✗ issue-convention mode invoked without INPUT_ISSUE_NUMBER")
+        return result
+    try:
+        issue_number = int(issue_number_raw)
+    except ValueError:
+        result["status"] = "issue_convention_skipped_no_issue"
+        log.error(f"  ✗ INPUT_ISSUE_NUMBER={issue_number_raw!r} is not an integer")
+        return result
+    result["issue_number"] = issue_number
+    log.info(f"  → issue convention pass on {target.repo}#{issue_number}")
+
+    try:
+        issue = gh_api("GET", f"/repos/{target.repo}/issues/{issue_number}")
+    except RuntimeError as e:
+        result["status"] = "issue_convention_failed_claude"
+        result["error"] = f"could not fetch Issue: {e}"
+        return result
+
+    author = (issue.get("user") or {}).get("login", "")
+    if author != "remyx-ai[bot]":
+        result["status"] = "issue_convention_skipped_not_bot"
+        result["error"] = f"Issue author is {author!r}, not remyx-ai[bot]"
+        log.info(f"  ✗ Issue #{issue_number} authored by {author!r}; skipping")
+        return result
+
+    issue_title = issue.get("title") or ""
+    current_body = issue.get("body") or ""
+
+    upstream_repo = _resolve_upstream_for_conventions(target)
+    log.info(f"  → fetching issue templates from {upstream_repo}")
+    templates = _fetch_issue_templates_from_repo(upstream_repo)
+    result["templates_found"] = len(templates)
+
+    if not templates:
+        # The "no templates at all" path. We still want to clean up the
+        # Outrider scaffolding (collapse into <details>) even without a
+        # canonical structure to fold into — partial improvement is still
+        # an improvement. The rewrite prompt handles the empty-templates
+        # case by setting template_id=null and applying only the
+        # scaffolding-collapse rule.
+        workdir = Path(tempfile.mkdtemp(prefix="outrider-issue-convention-"))
+        log.info(f"  → workdir: {workdir} (no templates — scaffolding-collapse only)")
+        ok, picked, rationale, err = _apply_issue_body_convention_update(
+            target, issue_number, current_body, [], issue_title,
+            target.claude_timeout_s, workdir,
+        )
+        if not ok:
+            result["status"] = "issue_convention_failed_claude"
+            result["error"] = err
+            return result
+        result["status"] = "issue_convention_skipped_no_templates"
+        result["rationale"] = rationale
+        _add_pr_label(target, issue_number, ISSUE_CONVENTION_LABEL_DONE)
+        log.info(f"  ✓ {result['status']}: {rationale}")
+        return result
+
+    eligible = _filter_eligible_templates(templates)
+    result["templates_eligible"] = len(eligible)
+    result["templates_filtered_kinds"] = sorted({
+        t["kind"] for t in templates if t.get("kind") in ("bug", "question")
+    })
+
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-issue-convention-"))
+    log.info(f"  → workdir: {workdir}")
+    log.info(
+        f"  → {len(templates)} templates found, "
+        f"{len(eligible)} eligible after kind-filter"
+    )
+
+    ok, picked_template_id, rationale, err = _apply_issue_body_convention_update(
+        target, issue_number, current_body,
+        eligible if eligible else [],  # if all filtered, prompt sees empty set
+        issue_title,
+        target.claude_timeout_s, workdir,
+    )
+    if not ok:
+        if "PATCH failed" in err:
+            result["status"] = "issue_convention_failed_patch"
+        else:
+            result["status"] = "issue_convention_failed_claude"
+        result["error"] = err
+        log.error(f"  ✗ {result['status']}: {err}")
+        return result
+
+    result["picked_template"] = picked_template_id
+    result["rationale"] = rationale
+
+    if not eligible:
+        # Templates existed but the kind-filter dropped them all (e.g.
+        # bug-only sets like lerobot). The body was still rewritten with
+        # scaffolding collapsed, but no upstream template was applied.
+        result["status"] = "issue_convention_aligned_no_fitting_template"
+    elif not picked_template_id:
+        # Eligible templates existed but the LLM declined to pick one
+        # (judged none a fit). Same outcome shape as the no-fitting case.
+        result["status"] = "issue_convention_aligned_no_fitting_template"
+    else:
+        result["status"] = "issue_convention_aligned"
+
+    _add_pr_label(target, issue_number, ISSUE_CONVENTION_LABEL_DONE)
+    result["issue_url"] = issue.get("html_url", "")
+    log.info(
+        f"  ✓ {result['status']} "
+        f"(template={picked_template_id or '(none)'}): {rationale}"
+    )
+    return result
+
+
 # ─── Refinement-pass: test gate ────────────────────────────────────────────
 #
 # Triggered after the convention pass completes. Runs lint + targeted tests
@@ -11277,9 +11818,13 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in ("recommend", "weekly-summary", "fidelity", "convention", "test"):
+    if mode not in (
+        "recommend", "weekly-summary", "fidelity", "convention", "test",
+        "issue-convention",
+    ):
         log.error(f"Unknown mode {mode!r}; must be 'recommend', "
-                  f"'weekly-summary', 'fidelity', 'convention', or 'test'.")
+                  f"'weekly-summary', 'fidelity', 'convention', 'test', "
+                  f"or 'issue-convention'.")
         sys.exit(2)
 
     target = build_target_from_env()
@@ -11304,6 +11849,11 @@ def main():
         log.info(f"  mode=test  pr_number={pr_number}")
         runner = run_test_gate
         failure_status = "test_failed_setup"
+    elif mode == "issue-convention":
+        issue_number = os.environ.get("INPUT_ISSUE_NUMBER", "").strip()
+        log.info(f"  mode=issue-convention  issue_number={issue_number}")
+        runner = run_issue_convention_pass
+        failure_status = "issue_convention_failed_claude"
     else:
         log.info(f"  min_confidence={target.min_confidence}  "
                  f"draft_mode={target.draft_mode}  "
@@ -11334,6 +11884,27 @@ def main():
             result["chain"] = run_refinement_chain(target, result["pr_number"])
         except Exception as e:
             log.exception(f"  ✗ refinement chain failed (non-fatal): {e}")
+            result["chain"] = {"error": str(e)}
+    # Issue-route convention pass: when recommend mode opens an Issue
+    # instead of a PR (preflight downgrade, self-review orphan, substitution,
+    # etc.), run the Issue-route equivalent of Phase B to align the Issue
+    # body to the target repo's ISSUE_TEMPLATE shape. No Phase A (no diff to
+    # audit) and no Phase C (no tests to run / no draft state); this is a
+    # single body-rewrite call.
+    elif (
+        mode == "recommend"
+        and target.chain_enabled
+        and str(result.get("status", "")).startswith("issue_opened")
+        and result.get("issue_number")
+    ):
+        try:
+            os.environ["INPUT_ISSUE_NUMBER"] = str(result["issue_number"])
+            result["chain"] = {
+                "issue_number": result["issue_number"],
+                "issue_convention_status": run_issue_convention_pass(target).get("status"),
+            }
+        except Exception as e:
+            log.exception(f"  ✗ issue-convention pass failed (non-fatal): {e}")
             result["chain"] = {"error": str(e)}
     elif mode == "recommend" and not target.chain_enabled:
         log.info("  chain disabled (chain: false); skipping refinement chain")

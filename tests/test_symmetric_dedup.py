@@ -180,7 +180,7 @@ def test_open_issue_default_footer_includes_reengage_note(monkeypatch):
 
     def fake_gh_api(method, path, body=None):
         captured["body"] = body["body"]
-        return {"html_url": "https://github.com/example/repo/issues/1"}
+        return {"html_url": "https://github.com/example/repo/issues/1", "number": 1}
 
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
     run.open_issue(
@@ -205,7 +205,7 @@ def test_open_issue_footer_override_keeps_reengage_note(monkeypatch):
     monkeypatch.setattr(
         run, "gh_api",
         lambda m, p, b=None: captured.update({"body": b["body"]})
-        or {"html_url": "https://github.com/example/repo/issues/1"},
+        or {"html_url": "https://github.com/example/repo/issues/1", "number": 1},
     )
     run.open_issue(
         Target(repo="example/repo", interest_id="iid"),
