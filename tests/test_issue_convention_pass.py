@@ -191,10 +191,13 @@ def test_rewrite_prompt_embeds_templates_and_outrider_body():
     assert "🤖 New model" in prompt
     # Outrider body is embedded
     assert "arxiv:2606.99999" in prompt
-    # Output schema includes template_id + updated_body
-    assert '"template_id"' in prompt
-    assert '"updated_body"' in prompt
-    assert '"rationale"' in prompt
+    # Output uses delimited format (TEMPLATE_ID / RATIONALE / UPDATED_BODY
+    # markers) rather than JSON — long markdown bodies break JSON parsing
+    # when Claude leaves an unescaped quote in a 30k-token output.
+    assert "===TEMPLATE_ID===" in prompt
+    assert "===RATIONALE===" in prompt
+    assert "===UPDATED_BODY===" in prompt
+    assert "===END===" in prompt
     # The canonical-first folding rules carry over from the PR-route
     # design (Discovery context details block + one-line attribution).
     assert "Discovery context" in prompt
@@ -209,6 +212,115 @@ def test_rewrite_prompt_signals_empty_template_set():
         issue_title="x", current_body="y", eligible_templates=[],
     )
     assert "none" in prompt.lower() or "(none" in prompt
+
+
+# ─── Delimited rewrite-response parser ──────────────────────────────────────
+
+
+def test_parse_rewrite_response_happy_path():
+    raw = (
+        "===TEMPLATE_ID===\n"
+        "feature_request.yml\n"
+        "===RATIONALE===\n"
+        "folded into Feature Request template\n"
+        "===UPDATED_BODY===\n"
+        "**Description**\n\n"
+        "Sample paper from https://arxiv.org/abs/2606.11127v1\n\n"
+        '<details><summary>Discovery context</summary>...</details>\n'
+        "===END===\n"
+    )
+    parsed = run._parse_issue_rewrite_response(raw)
+    assert parsed is not None
+    assert parsed["template_id"] == "feature_request.yml"
+    assert "Feature Request template" in parsed["rationale"]
+    assert "arxiv.org/abs/2606.11127v1" in parsed["updated_body"]
+    # Body extends across multiple lines; the parser must preserve newlines
+    assert "\n\n" in parsed["updated_body"]
+
+
+def test_parse_rewrite_response_normalises_no_pick_sentinels():
+    # Various forms the LLM might use to signal "no template picked"
+    for sentinel in ("(none)", "null", "none", "<none>", ""):
+        raw = (
+            f"===TEMPLATE_ID===\n{sentinel}\n"
+            f"===RATIONALE===\nno fit\n"
+            f"===UPDATED_BODY===\n**Body**\n"
+            f"===END===\n"
+        )
+        parsed = run._parse_issue_rewrite_response(raw)
+        assert parsed is not None
+        assert parsed["template_id"] == "", f"sentinel {sentinel!r} not normalised"
+
+
+def test_parse_rewrite_response_body_with_special_chars():
+    # The whole point of switching from JSON to delimited: the body can
+    # contain ANY chars without escape concerns. Quotes, braces, backslashes.
+    raw = (
+        "===TEMPLATE_ID===\n"
+        "feature.yml\n"
+        "===RATIONALE===\n"
+        "rewrite\n"
+        "===UPDATED_BODY===\n"
+        'Body with "quoted strings", {braces}, and \\backslashes\\.\n'
+        '<details><summary>"Discovery context"</summary>x</details>\n'
+        "===END===\n"
+    )
+    parsed = run._parse_issue_rewrite_response(raw)
+    assert parsed is not None
+    assert '"quoted strings"' in parsed["updated_body"]
+    assert "{braces}" in parsed["updated_body"]
+    assert "\\backslashes\\" in parsed["updated_body"]
+
+
+def test_parse_rewrite_response_tolerates_missing_end_marker():
+    # If Claude omits the ===END=== marker, the body extends to EOF.
+    raw = (
+        "===TEMPLATE_ID===\n"
+        "feature.yml\n"
+        "===RATIONALE===\n"
+        "x\n"
+        "===UPDATED_BODY===\n"
+        "Body content here\n"
+        "with multiple lines\n"
+    )
+    parsed = run._parse_issue_rewrite_response(raw)
+    assert parsed is not None
+    assert "Body content here" in parsed["updated_body"]
+    assert "with multiple lines" in parsed["updated_body"]
+
+
+def test_parse_rewrite_response_returns_none_when_markers_missing():
+    assert run._parse_issue_rewrite_response("just prose, no markers") is None
+    # Missing UPDATED_BODY marker
+    assert run._parse_issue_rewrite_response(
+        "===TEMPLATE_ID===\nfeature.yml\n===RATIONALE===\nx\n"
+    ) is None
+
+
+def test_parse_rewrite_response_returns_none_when_body_empty():
+    raw = (
+        "===TEMPLATE_ID===\n"
+        "feature.yml\n"
+        "===RATIONALE===\n"
+        "x\n"
+        "===UPDATED_BODY===\n"
+        "\n"
+        "===END===\n"
+    )
+    assert run._parse_issue_rewrite_response(raw) is None
+
+
+def test_parse_rewrite_response_returns_none_on_out_of_order_markers():
+    # UPDATED_BODY before RATIONALE → not the expected sequence.
+    raw = (
+        "===TEMPLATE_ID===\n"
+        "feature.yml\n"
+        "===UPDATED_BODY===\n"
+        "body\n"
+        "===RATIONALE===\n"
+        "x\n"
+    )
+    assert run._parse_issue_rewrite_response(raw) is None
 
 
 # ─── run_issue_convention_pass end-to-end ──────────────────────────────────
@@ -279,7 +391,14 @@ def test_run_issue_convention_pass_no_templates_still_rewrites(monkeypatch):
     # must keep the arxiv link (matches _ARXIV_URL_RE) so the sanity check
     # passes — paper provenance can't be silently dropped.
     monkeypatch.setattr(run, "_run_claude_oneshot",
-        lambda wd, p, t, max_turns=4: (True, '{"template_id": null, "rationale": "scaffolding collapsed; no templates available", "updated_body": "## Description\\n\\nSample paper from https://arxiv.org/abs/2606.11127v1\\n\\n<details><summary>Discovery context</summary>...</details>"}'))
+        lambda wd, p, t, max_turns=4: (True,
+            "===TEMPLATE_ID===\n(none)\n"
+            "===RATIONALE===\nscaffolding collapsed; no templates available\n"
+            "===UPDATED_BODY===\n"
+            "## Description\n\nSample paper from https://arxiv.org/abs/2606.11127v1\n\n"
+            "<details><summary>Discovery context</summary>...</details>\n"
+            "===END===\n"
+        ))
     # _resolve_upstream_for_conventions falls back to target.repo when no
     # upstream is configured.
     monkeypatch.setattr(run, "_resolve_upstream_for_conventions",
@@ -321,7 +440,13 @@ def test_run_issue_convention_pass_no_fitting_template(monkeypatch):
 
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
     monkeypatch.setattr(run, "_run_claude_oneshot",
-        lambda wd, p, t, max_turns=4: (True, '{"template_id": null, "rationale": "no fitting template", "updated_body": "## Description\\n\\nSample paper from https://arxiv.org/abs/2606.11127v1"}'))
+        lambda wd, p, t, max_turns=4: (True,
+            "===TEMPLATE_ID===\n(none)\n"
+            "===RATIONALE===\nno fitting template\n"
+            "===UPDATED_BODY===\n"
+            "## Description\n\nSample paper from https://arxiv.org/abs/2606.11127v1\n"
+            "===END===\n"
+        ))
     monkeypatch.setattr(run, "_resolve_upstream_for_conventions",
         lambda target: "owner/repo")
 
@@ -360,7 +485,14 @@ def test_run_issue_convention_pass_aligned_happy_path(monkeypatch):
 
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
     monkeypatch.setattr(run, "_run_claude_oneshot",
-        lambda wd, p, t, max_turns=4: (True, '{"template_id": "feature_request.yml", "rationale": "folded into Feature Request template", "updated_body": "**Description**\\n\\nSample paper from https://arxiv.org/abs/2606.11127v1\\n\\n<details>...</details>"}'))
+        lambda wd, p, t, max_turns=4: (True,
+            "===TEMPLATE_ID===\nfeature_request.yml\n"
+            "===RATIONALE===\nfolded into Feature Request template\n"
+            "===UPDATED_BODY===\n"
+            "**Description**\n\nSample paper from https://arxiv.org/abs/2606.11127v1\n\n"
+            "<details>...</details>\n"
+            "===END===\n"
+        ))
     monkeypatch.setattr(run, "_resolve_upstream_for_conventions",
         lambda target: "owner/repo")
 
@@ -391,7 +523,13 @@ def test_run_issue_convention_pass_arxiv_sanity_check(monkeypatch):
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
     # Rewrite drops the arxiv link entirely.
     monkeypatch.setattr(run, "_run_claude_oneshot",
-        lambda wd, p, t, max_turns=4: (True, '{"template_id": "feature_request.yml", "rationale": "...", "updated_body": "**Description**\\n\\nSome paper without provenance"}'))
+        lambda wd, p, t, max_turns=4: (True,
+            "===TEMPLATE_ID===\nfeature_request.yml\n"
+            "===RATIONALE===\n...\n"
+            "===UPDATED_BODY===\n"
+            "**Description**\n\nSome paper without provenance\n"
+            "===END===\n"
+        ))
     monkeypatch.setattr(run, "_resolve_upstream_for_conventions",
         lambda target: "owner/repo")
 

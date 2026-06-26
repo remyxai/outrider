@@ -10521,9 +10521,9 @@ the Outrider Issue's actual ask:
 - If no template is a clear fit (e.g. only generic `feature` templates
   exist for what is structurally a model-addition Issue), pick the closest
   match and note the fit-quality in the rationale.
-- If the eligible set is empty, return `template_id: null` — the body is
-  rewritten with only the scaffolding-collapse rule applied (no upstream
-  structure to fold into).
+- If the eligible set is empty, return `(none)` for `TEMPLATE_ID` — the
+  body is rewritten with only the scaffolding-collapse rule applied (no
+  upstream structure to fold into).
 
 Produce an updated Issue body that:
 
@@ -10565,21 +10565,86 @@ Produce an updated Issue body that:
 7. **Does not add boilerplate** that isn't in the picked template
    beyond the one-line attribution and the Discovery-context block.
 
-# Output
+# Output format
 
-Return ONLY valid JSON (no prose before or after):
+Return ONLY a delimited response in EXACTLY this format (no prose before
+or after, no markdown code fences):
 
-{{
-  "template_id": "<filename of picked template, or null>",
-  "rationale": "<one-sentence note on what structurally changed>",
-  "updated_body": "<the full new Issue body in markdown>"
-}}
+===TEMPLATE_ID===
+<filename of picked template, or (none) if no template fits>
+===RATIONALE===
+<one-sentence note on what structurally changed>
+===UPDATED_BODY===
+<the full new Issue body in markdown, verbatim — may contain any
+characters including newlines, quotes, braces, etc.>
+===END===
+
+The delimited format is required because the body is long markdown that
+would be hard to escape in JSON. Do not wrap the response in code fences;
+do not add prose before the first marker or after the last marker. The
+exact section markers (``===TEMPLATE_ID===``, ``===RATIONALE===``,
+``===UPDATED_BODY===``, ``===END===``) must each appear on their own line.
 """
 
 
 def _update_issue_body(target: Target, issue_number: int, new_body: str) -> None:
     """PATCH the Issue body via the GitHub Issues API."""
     gh_api("PATCH", f"/repos/{target.repo}/issues/{issue_number}", {"body": new_body})
+
+
+# Section markers used by the Issue-body-rewrite Claude one-shot's delimited
+# output format. JSON-wrapped output is brittle when the body is long markdown
+# (one unescaped quote in a 30k-token response trashes the parse); a delimited
+# format lets the body contain any chars including quotes, braces, and
+# newlines without any escaping concerns.
+_ISSUE_REWRITE_MARKER_TEMPLATE_ID = "===TEMPLATE_ID==="
+_ISSUE_REWRITE_MARKER_RATIONALE = "===RATIONALE==="
+_ISSUE_REWRITE_MARKER_UPDATED_BODY = "===UPDATED_BODY==="
+_ISSUE_REWRITE_MARKER_END = "===END==="
+
+
+def _parse_issue_rewrite_response(raw: str) -> dict | None:
+    """Parse the delimited Issue-body-rewrite response.
+
+    Expects sections in order: TEMPLATE_ID, RATIONALE, UPDATED_BODY, END.
+    Returns ``{template_id, rationale, updated_body}`` on success, or
+    ``None`` if any marker is missing or out-of-order. Empty
+    ``UPDATED_BODY`` is also treated as a parse failure — the rewrite
+    must produce a body.
+
+    ``(none)`` and the literal string ``null`` in TEMPLATE_ID are both
+    normalised to an empty string (meaning "no template was picked"); the
+    orchestrator treats both as the "no-fitting-template" outcome.
+    """
+    if not raw:
+        return None
+    try:
+        t_start = raw.index(_ISSUE_REWRITE_MARKER_TEMPLATE_ID)
+        r_start = raw.index(_ISSUE_REWRITE_MARKER_RATIONALE)
+        b_start = raw.index(_ISSUE_REWRITE_MARKER_UPDATED_BODY)
+        # END is optional — the body extends to EOF if absent.
+        try:
+            e_start = raw.index(_ISSUE_REWRITE_MARKER_END, b_start)
+        except ValueError:
+            e_start = len(raw)
+    except ValueError:
+        return None
+    # Order check.
+    if not (t_start < r_start < b_start <= e_start):
+        return None
+    template_id = raw[t_start + len(_ISSUE_REWRITE_MARKER_TEMPLATE_ID):r_start].strip()
+    rationale = raw[r_start + len(_ISSUE_REWRITE_MARKER_RATIONALE):b_start].strip()
+    updated_body = raw[b_start + len(_ISSUE_REWRITE_MARKER_UPDATED_BODY):e_start].strip()
+    if not updated_body:
+        return None
+    # Normalise the no-pick sentinels.
+    if template_id.lower() in ("(none)", "null", "none", "", "<none>"):
+        template_id = ""
+    return {
+        "template_id": template_id,
+        "rationale": rationale,
+        "updated_body": updated_body,
+    }
 
 
 def _apply_issue_body_convention_update(
@@ -10603,9 +10668,12 @@ def _apply_issue_body_convention_update(
     ok, raw = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=4)
     if not ok:
         return False, "", "", f"issue-body-rewrite Claude call failed: {raw[-300:]}"
-    rewrite = _extract_json_object(raw)
-    if not rewrite or "updated_body" not in rewrite:
-        return False, "", "", f"issue-body-rewrite returned unparseable JSON: {raw[-300:]}"
+    rewrite = _parse_issue_rewrite_response(raw)
+    if not rewrite:
+        return False, "", "", (
+            f"issue-body-rewrite returned unparseable delimited response: "
+            f"{raw[-300:]}"
+        )
     new_body = rewrite["updated_body"]
     # Sanity check: if the input carried an arXiv link (paper provenance),
     # the rewrite must keep one. Same guard as the PR-route Phase B.
