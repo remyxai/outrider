@@ -45,6 +45,16 @@ inputs:
           failure (lint surfaced issues or tests failed). PR body is
           untouched — that's the convention pass's surface. Triggered
           after the convention pass; requires ``pr-number``.
+        - "issue-convention": fold an Outrider-drafted Issue's body to
+          the target repo's ``.github/ISSUE_TEMPLATE/`` shape (markdown
+          frontmatter or Issue Forms). Picks the best-fitting template
+          via a single Claude one-shot (filtering out bug/question
+          kinds), then PATCHes the Issue body. Mirrors the PR-route
+          convention pass but with no diff to patch, no draft state,
+          and no test gate — just the body rewrite. Triggered inline
+          in recommend mode when routing to Issue, or explicitly via
+          a standalone ``mode: issue-convention`` workflow_dispatch;
+          requires ``issue-number``.
     required: false
     default: 'recommend'
   chain:
@@ -70,6 +80,17 @@ inputs:
       weekly-summary modes — the inline chain (``chain: true``, default)
       threads the just-opened PR number through automatically, so most
       installs never set this.
+    required: false
+    default: ''
+  issue-number:
+    description: |
+      Issue number to operate on. Read in ``mode: issue-convention`` only;
+      set from the workflow's issues event payload (or a workflow_dispatch
+      input) when driving the Issue-route convention pass against an
+      existing Issue. Empty in recommend / weekly-summary modes — the
+      inline chain (``chain: true``, default) threads the just-opened
+      Issue number through automatically when recommend mode routes to an
+      Issue instead of a PR, so most installs never set this.
     required: false
     default: ''
   weekly-discussion-id:
@@ -292,6 +313,10 @@ runs:
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        # Issue number to operate on in ``mode: issue-convention``. Empty
+        # in recommend mode — the inline chain reads result["issue_number"]
+        # directly when recommend routes to an Issue.
+        INPUT_ISSUE_NUMBER: ${{ inputs.issue-number }}
         # Inline refinement chain toggle (recommend mode continues into
         # fidelity → convention → test by default; 'false' opts out).
         INPUT_CHAIN: ${{ inputs.chain }}

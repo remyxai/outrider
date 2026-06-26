@@ -199,12 +199,62 @@ def test_main_skips_chain_when_disabled(monkeypatch):
 
 
 def test_main_skips_chain_when_no_pr_opened(monkeypatch):
-    # An Issue-routed run (no PR) must not trigger the chain even with
-    # chain_enabled, since there's no PR number to operate on.
+    # An Issue-routed run without an issue_number must not trigger
+    # either the PR-route or the Issue-route chain, since there's
+    # nothing to operate on.
     _base_env(monkeypatch)
     invoked = _make_recommend_main(
         monkeypatch, chain_enabled=True,
         process_result={"repo": "owner/repo", "status": "issue_opened"},
     )
+    issue_invoked = []
+    monkeypatch.setattr(
+        run, "run_issue_convention_pass",
+        lambda t: issue_invoked.append(run.os.environ.get("INPUT_ISSUE_NUMBER")) or {"status": "issue_convention_aligned"},
+    )
     run.main()
     assert invoked == []
+    assert issue_invoked == []
+
+
+def test_main_invokes_issue_convention_when_issue_opened(monkeypatch):
+    # REMYX-146: when recommend mode opens an Issue with a known
+    # issue_number, the inline dispatcher invokes run_issue_convention_pass
+    # with INPUT_ISSUE_NUMBER set to the just-opened Issue.
+    _base_env(monkeypatch)
+    invoked = _make_recommend_main(
+        monkeypatch, chain_enabled=True,
+        process_result={
+            "repo": "owner/repo",
+            "status": "issue_opened_preflight",
+            "issue_number": 17,
+        },
+    )
+    issue_invoked = []
+    monkeypatch.setattr(
+        run, "run_issue_convention_pass",
+        lambda t: issue_invoked.append(run.os.environ.get("INPUT_ISSUE_NUMBER")) or {"status": "issue_convention_aligned"},
+    )
+    run.main()
+    assert invoked == []  # PR-route chain not called for Issue-route artifact
+    assert issue_invoked == ["17"]  # Issue-route convention pass called with the issue number
+
+
+def test_main_skips_issue_convention_when_chain_disabled(monkeypatch):
+    _base_env(monkeypatch)
+    invoked = _make_recommend_main(
+        monkeypatch, chain_enabled=False,
+        process_result={
+            "repo": "owner/repo",
+            "status": "issue_opened_substitution",
+            "issue_number": 8,
+        },
+    )
+    issue_invoked = []
+    monkeypatch.setattr(
+        run, "run_issue_convention_pass",
+        lambda t: issue_invoked.append(t.repo) or {"status": "issue_convention_aligned"},
+    )
+    run.main()
+    assert invoked == []
+    assert issue_invoked == []
