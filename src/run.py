@@ -1181,6 +1181,12 @@ class Target:
     # LLM selection pass) so eval re-runs are reproducible. Empty = normal
     # selection.
     pin_arxiv: str = ""
+    # Optional: free-text method/technique query. When set, the recommend
+    # phase resolves it to the top arxiv hit via /search/assets, builds a
+    # single-item viable pool from that asset, and pins to it — bypassing
+    # both the interest's candidate pool and the selection pass. Mutually
+    # exclusive with pin_arxiv (validated in build_target_from_env).
+    pin_method: str = ""
     # Inline refinement chain: when True (default), recommend mode continues
     # sequentially into fidelity audit → convention pass → test gate on the
     # just-opened PR, so the chain runs by default without the customer
@@ -2334,6 +2340,28 @@ def _remyx_get_asset(arxiv_id: str) -> dict | None:
     if isinstance(resp, dict) and (resp.get("arxiv_id") or resp.get("title")):
         return resp
     return None
+
+
+_PIN_METHOD_ARXIV_RE = re.compile(r"^\d{4}\.\d{4,5}(v\d+)?$")
+
+
+def _resolve_pin_method(query: str) -> dict | None:
+    """Resolve a pin-method query to a single /search/assets envelope dict.
+
+    Detects whether the input is a literal arxiv_id (post-2007 form
+    ``NNNN.NNNN[N][vN]``) and short-circuits to direct asset lookup via
+    ``_remyx_get_asset`` — both faster and immune to keyword-search
+    retrieval gaps. Otherwise treats it as a free-text method query and
+    returns the top hit from ``_remyx_search_assets``. Returns ``None``
+    when nothing matches.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    if _PIN_METHOD_ARXIV_RE.match(q):
+        return _remyx_get_asset(q)
+    assets = _remyx_search_assets(q, max_results=1)
+    return assets[0] if assets else None
 
 
 def _asset_to_recommendation(
@@ -6379,7 +6407,45 @@ def process_target(target: Target) -> dict:
     #    past week). The old flow took only papers[0], wasting the
     #    lookback; we keep the whole pool so the selection pass can pick
     #    the most implementable candidate.
-    candidates = query_remyx_candidates(target)
+    #
+    #    Pin-method short-circuit: when the user passes a method query
+    #    (or a literal arxiv_id) via `pin-method`, resolve it to a single
+    #    /search/assets envelope and use that asset as the sole
+    #    candidate — bypassing both the interest's recommendation pool
+    #    and the LLM selection pass. The downstream pin_arxiv check at
+    #    §4 then picks this candidate naturally (no extra plumbing).
+    if target.pin_method:
+        asset = _resolve_pin_method(target.pin_method)
+        if asset is None:
+            log.info(f"  ✗ skipped_no_method_match: pin-method "
+                     f"{target.pin_method!r} resolved to no asset")
+            result["status"] = "skipped_no_method_match"
+            result["pin_method"] = target.pin_method
+            return result
+        rec = _asset_to_recommendation(
+            asset, refine_query=f"pin-method:{target.pin_method}",
+            fallback_interest_name="(pin-method)",
+            interest_context="",
+            experiment_history="",
+        )
+        log.info(
+            f"  → pin-method {target.pin_method!r} resolved to "
+            f"{rec.arxiv_id} ({rec.paper_title[:60]}…)"
+        )
+        candidates = [rec]
+        result["pin_method"] = target.pin_method
+        result["pin_method_resolution"] = {
+            "query": target.pin_method,
+            "arxiv_id": rec.arxiv_id,
+            "title": rec.paper_title,
+        }
+        # Reduce pin-method to pin_arxiv so the existing pinning logic at
+        # §4 selects this candidate without a parallel code path. The
+        # original pin_method string is preserved in result["pin_method"]
+        # for the step summary.
+        target.pin_arxiv = rec.arxiv_id
+    else:
+        candidates = query_remyx_candidates(target)
     result["candidates_returned"] = len(candidates)
     # Pool-composition + license-distribution telemetry.
     # Post-dedup counts (query_remyx_candidates coalesces families before
@@ -6480,9 +6546,18 @@ def process_target(target: Target) -> dict:
                             f"pool; falling back to the selection pass")
         if pinned_idx is not None:
             rec = viable[pinned_idx]
-            result["selection_reasoning"] = (
-                f"(pinned via pin-arxiv={target.pin_arxiv})"
-            )
+            # pin-method reduces to pin-arxiv internally (see §2); surface
+            # the original user-facing source in the reasoning so step
+            # summaries / telemetry are honest about which input drove the pin.
+            if target.pin_method:
+                result["selection_reasoning"] = (
+                    f"(pinned via pin-method={target.pin_method!r} → "
+                    f"{target.pin_arxiv})"
+                )
+            else:
+                result["selection_reasoning"] = (
+                    f"(pinned via pin-arxiv={target.pin_arxiv})"
+                )
             log.info(f"  ✓ pinned candidate [{pinned_idx}] {rec.paper_title[:50]}…")
         else:
             selection = select_recommendation(
@@ -7372,6 +7447,7 @@ def build_target_from_env() -> Target:
         test_integration_policy=test_integration_policy,
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
+        pin_method=_optional_env("INPUT_PIN_METHOD", ""),
         chain_enabled=chain_enabled,
         notes="",
     )
@@ -11828,6 +11904,12 @@ def main():
         sys.exit(2)
 
     target = build_target_from_env()
+    if target.pin_arxiv and target.pin_method:
+        log.error(
+            "pin-arxiv and pin-method are mutually exclusive; set one or "
+            "the other, not both."
+        )
+        sys.exit(2)
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
     if mode == "weekly-summary":
