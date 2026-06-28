@@ -203,6 +203,15 @@ inputs:
       use it for reproducible eval re-runs. Empty = normal selection.
     required: false
     default: ''
+  pin-method:
+    description: |
+      Optional method/technique query (e.g. "knowledge distillation", "MoE
+      expert routing"). When set, Outrider runs the engine's search to find
+      the top arxiv paper for the query and implements it — bypassing the
+      selection pass and the interest's candidate pool entirely. Empty =
+      normal selection. Mutually exclusive with pin-arxiv.
+    required: false
+    default: ''
 
 outputs:
   status:
@@ -211,8 +220,8 @@ outputs:
       "skipped_low_confidence" | "skipped_open_artifact" |
       "skipped_issues_disabled" | "skipped_pr_exists" |
       "skipped_issue_exists" | "skipped_test_failure" | "claude_failed" |
-      "rejected_path_violations" | "aborted_secret_in_payload" |
-      "error". In weekly-summary mode:
+      "skipped_no_method_match" | "rejected_path_violations" |
+      "aborted_secret_in_payload" | "error". In weekly-summary mode:
       "weekly_summary_posted" | "weekly_summary_skipped_no_discussion_id" |
       "weekly_summary_failed".
     value: ${{ steps.recommend.outputs.status }}
@@ -310,6 +319,7 @@ runs:
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
+        INPUT_PIN_METHOD: ${{ inputs.pin-method }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
