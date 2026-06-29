@@ -55,7 +55,7 @@ Common backends:
 | GCP Vertex (Claude) | `https://<region>-aiplatform.googleapis.com/v1/projects/<proj>/...` |
 | On-prem Anthropic-compat proxy | `https://<your-proxy>/v1` |
 
-Cost telemetry caveat: the `total_cost_usd` field is computed by the Claude Code CLI using its built-in Anthropic-rate pricing. When routed to a non-Anthropic backend (e.g. z.ai), it's an estimate, not a bill. Token counts (`input_tokens`, `output_tokens`) stay accurate — derive your real cost from those + your provider's rate card.
+Cost telemetry is backend-aware. When `model-base-url` matches a known backend in the action's rate table (currently `api.z.ai` for GLM Coding Plan PAYG), the action overrides Claude Code's Anthropic-rate `total_cost_usd` and computes cost from `tokens × backend rates` — the dollars in the step summary are authoritative for that rate sheet. For unknown backends the action falls back to the CLI's reported value and flags it as approximate in the step summary. Token counts are accurate for any backend that speaks the Anthropic Messages protocol. The step summary surfaces both the **agent** (Claude Code) and the **model backend** (Anthropic / z.ai (GLM) / your-host) so you can see which model server actually served the run.
 
 ### Filesystem reach — `guardrails-allowlist`
 

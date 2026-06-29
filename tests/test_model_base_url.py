@@ -112,6 +112,85 @@ def test_main_exports_anthropic_base_url_when_set(monkeypatch):
     assert seen["env_base_url"] == "https://api.z.ai/anthropic"
 
 
+# ─── _detect_backend + cost-override behavior ─────────────────────────────
+
+
+def test_detect_backend_returns_anthropic_for_empty_url():
+    name, rates = run._detect_backend("")
+    assert name == "Anthropic"
+    assert rates is None  # caller trusts the CLI's envelope cost
+
+
+def test_detect_backend_recognizes_zai():
+    name, rates = run._detect_backend("https://api.z.ai/api/anthropic")
+    assert name == "z.ai (GLM)"
+    assert rates is not None and rates[0] > 0 and rates[1] > 0
+
+
+def test_detect_backend_unknown_returns_host_with_no_rates():
+    name, rates = run._detect_backend("https://api.example.com/anthropic")
+    assert name == "api.example.com"
+    assert rates is None  # caller falls back to CLI's envelope cost
+
+
+def test_cost_override_for_zai_uses_glm_rates(monkeypatch):
+    """When ANTHROPIC_BASE_URL routes to z.ai, _record_claude_usage
+    must compute cost from tokens × GLM rates and ignore the CLI's
+    Anthropic-rate estimate in total_cost_usd."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic")
+    run._reset_run_cost()
+    # Pretend Claude Code reported a (wrong, Anthropic-rate) cost of $1.00
+    # for 1M input + 1M output tokens. With GLM rates (0.60 + 2.20), the
+    # real cost is $2.80, not $1.00.
+    envelope = {
+        "total_cost_usd": 1.00,
+        "usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+        "num_turns": 1,
+    }
+    run._record_claude_usage(envelope)
+    # Cost should be computed from GLM rates, not the envelope's value.
+    assert run._RUN_COST["cost_usd"] == pytest.approx(0.60 + 2.20, abs=0.01)
+    assert run._RUN_COST["cost_basis"] == "backend_rate_table"
+    assert run._RUN_COST["model_backend"] == "z.ai (GLM)"
+    # Token counts come straight from the envelope — accurate regardless.
+    assert run._RUN_COST["input_tokens"] == 1_000_000
+    assert run._RUN_COST["output_tokens"] == 1_000_000
+
+
+def test_cost_trusts_envelope_for_default_anthropic(monkeypatch):
+    """The default (no ANTHROPIC_BASE_URL) trusts the CLI's
+    total_cost_usd — Claude Code's Anthropic-rate calc is correct
+    when talking to Anthropic."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    run._reset_run_cost()
+    envelope = {
+        "total_cost_usd": 1.5,
+        "usage": {"input_tokens": 100_000, "output_tokens": 50_000},
+        "num_turns": 2,
+    }
+    run._record_claude_usage(envelope)
+    assert run._RUN_COST["cost_usd"] == pytest.approx(1.5, abs=0.001)
+    assert run._RUN_COST["cost_basis"] == "claude_code_envelope"
+    assert run._RUN_COST["model_backend"] == "Anthropic"
+
+
+def test_cost_trusts_envelope_for_unknown_backend(monkeypatch):
+    """Unknown backends fall back to the envelope's value — accurate
+    or not, that's the best signal available without a rate-table entry.
+    The step summary will flag this case with a 'may be approximate' note."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.example.com/v1")
+    run._reset_run_cost()
+    envelope = {
+        "total_cost_usd": 0.75,
+        "usage": {"input_tokens": 50_000, "output_tokens": 25_000},
+        "num_turns": 1,
+    }
+    run._record_claude_usage(envelope)
+    assert run._RUN_COST["cost_usd"] == pytest.approx(0.75, abs=0.001)
+    assert run._RUN_COST["cost_basis"] == "claude_code_envelope"
+    assert run._RUN_COST["model_backend"] == "api.example.com"  # raw host
+
+
 def test_main_does_not_set_base_url_when_input_empty(monkeypatch):
     """Empty model-base-url input must not touch os.environ — preserves the
     workaround where customers set ANTHROPIC_BASE_URL directly in their
