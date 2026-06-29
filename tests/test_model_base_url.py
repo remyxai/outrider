@@ -1,4 +1,4 @@
-"""Tests for the pluggable ANTHROPIC_BASE_URL — REMYX-151.
+"""Tests for the pluggable ANTHROPIC_BASE_URL.
 
 Covers:
 - `Target.model_base_url` defaults empty and propagates from INPUT_MODEL_BASE_URL
@@ -64,7 +64,7 @@ def test_anthropic_auth_token_in_subprocess_whitelist():
     so Claude Code can authenticate against non-default Anthropic-compat
     backends (z.ai's GLM Coding Plan requires Bearer auth — sending
     x-api-key returns HTTP 401). Without this, every glm-routed run
-    fails at auth. See REMYX-154."""
+    fails at auth."""
     assert "ANTHROPIC_AUTH_TOKEN" in run._CLAUDE_ENV_WHITELIST
 
 

@@ -255,7 +255,7 @@ def test_env_strip_complements_outbound_scrubber():
     Three TOKEN-shaped entries are intentional:
       - ANTHROPIC_API_KEY: the Claude CLI's default Anthropic auth (x-api-key)
       - ANTHROPIC_AUTH_TOKEN: the Claude CLI's Bearer auth for non-default
-        backends (REMYX-154; required by z.ai's GLM Coding Plan)
+        backends (required by z.ai's GLM Coding Plan)
       - GITHUB_TOKEN: the workflow built-in for the agent's `gh` CLI
         verification tooling
     Any other TOKEN-shaped entry should be reviewed before landing."""

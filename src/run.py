@@ -3827,6 +3827,13 @@ _RUN_COST = {
     # unknown backends).
     "model_backend": "Anthropic",
     "cost_basis": "claude_code_envelope",
+    # Number of `--output-format json` envelopes that parsed cleanly,
+    # were not error envelopes, but carried no input/output token counts.
+    # Observed against some non-Anthropic backends where the CLI's
+    # terminal envelope occasionally drops the `usage` block on
+    # otherwise-successful responses. When > 0 the run's token totals
+    # are an under-count.
+    "envelopes_without_usage": 0,
 }
 
 # Refine queries the audit pass actually executed this run, including ones
@@ -3841,6 +3848,7 @@ def _reset_run_cost() -> None:
         cost_usd=0.0, input_tokens=0, output_tokens=0,
         cache_read_input_tokens=0, num_turns=0, claude_calls=0,
         model_backend="Anthropic", cost_basis="claude_code_envelope",
+        envelopes_without_usage=0,
     )
     _RUN_REFINE_QUERIES.clear()
     _BOT_TOKEN.update(attempted=False, token="", permissions={})
@@ -3909,6 +3917,15 @@ def _record_claude_usage(env: dict) -> None:
     _RUN_COST["input_tokens"] += in_tok
     _RUN_COST["output_tokens"] += out_tok
     _RUN_COST["cache_read_input_tokens"] += cache_in
+
+    # Successful envelope but no usage payload — accumulate a counter
+    # so the rate of these is observable in telemetry, without
+    # surfacing in customer-visible logs or the step summary. Error
+    # envelopes legitimately carry no usage; don't count those.
+    if in_tok == 0 and out_tok == 0 and not bool(env.get("is_error")):
+        _RUN_COST["envelopes_without_usage"] = (
+            _RUN_COST.get("envelopes_without_usage", 0) + 1
+        )
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
     backend_name, rates = _detect_backend(base_url)
@@ -12183,7 +12200,7 @@ def main():
     result["cache_read_input_tokens"] = _RUN_COST["cache_read_input_tokens"]
     result["claude_calls"] = _RUN_COST["claude_calls"]
     # Coding-agent and model-backend identity. Fixed to Claude Code today;
-    # the agent field is the seam for REMYX-65's per-CLI adapters
+    # the agent field is the seam for future per-CLI adapters
     # (Aider / Goose / Codex). model_backend tracks the API endpoint the
     # agent talked to — "Anthropic" by default, "z.ai (GLM)" / "AWS
     # Bedrock" / etc. when ANTHROPIC_BASE_URL routes elsewhere. cost_basis
@@ -12192,6 +12209,9 @@ def main():
     result["agent"] = "Claude Code"
     result["model_backend"] = _RUN_COST.get("model_backend", "Anthropic")
     result["cost_basis"] = _RUN_COST.get("cost_basis", "claude_code_envelope")
+    result["envelopes_without_usage"] = _RUN_COST.get(
+        "envelopes_without_usage", 0
+    )
     log.info(f"  cost: ${result['cost_usd']} "
              f"({result['input_tokens']} in / {result['output_tokens']} out "
              f"tokens, {result['claude_calls']} claude calls) "

@@ -1,4 +1,4 @@
-"""Tests for the pin-method input — REMYX-148.
+"""Tests for the pin-method input.
 
 Covers the pure logic of pin-method resolution:
 

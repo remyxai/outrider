@@ -1,4 +1,4 @@
-"""Tests for Phase A paper-anchored fidelity-audit helpers (REMYX-145).
+"""Tests for Phase A paper-anchored fidelity-audit helpers.
 
 Covers the three new surfaces:
   - `_fetch_arxiv_abstract_text` extracts title + abstract from the arxiv
@@ -187,7 +187,7 @@ def test_render_coverage_matrix_surfaces_reference_anchor():
 
 
 def test_render_coverage_matrix_default_anchor_is_reference():
-    # Pre-REMYX-145 call sites pass no audit_anchor — they were always
+    # Legacy call sites pass no audit_anchor — they were always
     # reference-anchored, so the default preserves that behavior.
     out = run._render_coverage_matrix(_MATRIX_FIXTURE)
     assert "Audit anchor: reference implementation" in out

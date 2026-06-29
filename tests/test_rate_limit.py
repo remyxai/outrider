@@ -1,6 +1,6 @@
 """Tests for the cadence guard `open_remyx_artifact_exists`.
 
-Semantic (2026-06-29, REMYX-152): time-decayed. Skip a run only if
+Semantic (2026-06-29): time-decayed. Skip a run only if
 the most recently opened Remyx PR/Issue on the target is younger than
 ``rate_limit_days``. Older open artifacts age out of the throttle
 window and stop blocking — recognizing that real maintainers leave
@@ -99,7 +99,7 @@ def test_open_remyx_issue_fires_the_gate_when_recent(monkeypatch):
 
 def test_stale_open_pr_ages_out_of_the_throttle(monkeypatch):
     """A Remyx PR opened 30 days ago no longer blocks runs under the
-    default 7-day window — the core REMYX-152 fix. Real maintainers
+    default 7-day window — the core time-decay behavior. Real maintainers
     leave PRs open for weeks; the action should resume cadence rather
     than mute the repo indefinitely."""
     def fake_gh_api(method, path, body=None):

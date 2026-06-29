@@ -1,4 +1,4 @@
-"""Tests for the Issue-route convention pass (REMYX-146).
+"""Tests for the Issue-route convention pass.
 
 Covers the new helpers in `src/run.py`:
   - `_fetch_issue_templates_from_repo`: walks .github/ISSUE_TEMPLATE/,

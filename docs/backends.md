@@ -102,7 +102,8 @@ Outrider tracks token counts straight from each Claude Code response envelope. C
 | `backend_rate_table` | Outrider has a per-million-token rate entry for the configured backend (currently: `api.z.ai`). Cost is computed from `tokens × table rates`, overriding the CLI's Anthropic-rate estimate |
 | (none + step-summary warning) | Backend isn't in the rate table; falling back to the CLI's value with a "may be approximate" annotation. Token counts stay accurate; dollars are approximate by however much the backend's pricing differs from Anthropic's |
 
-Customers routing at a backend Outrider doesn't yet recognize see accurate token counts and a step-summary annotation flagging the cost approximation. Track [REMYX-158](https://linear.app/remyx/issue/REMYX-158) for upcoming customer-supplied-rate inputs.
+Customers routing at a backend Outrider doesn't yet recognize see accurate token counts and a step-summary annotation flagging the cost approximation. Customer-supplied per-backend rate inputs are on the roadmap.
+
 
 The step summary shows the agent + backend pair on every run:
 
@@ -168,13 +169,10 @@ Probe the backend directly with the same env var the action receives. If the cur
     head -c 200 /tmp/probe.json
 ```
 
-If the probe returns 200 but the action still gets 401, check whether Claude Code's bundled client has its own auth-config precedence (some versions may prefer cached OAuth credentials over env vars). [REMYX-155](https://linear.app/remyx/issue/REMYX-155) tracks adding a startup guard for this class of failure.
+If the probe returns 200 but the action still gets 401, check whether Claude Code's bundled client has its own auth-config precedence (some versions may prefer cached OAuth credentials over env vars). A startup guard for this class of failure is on the roadmap.
 
 
 ## Related
 
 - [`customization.md`](customization.md) — overview of every action input
 - [`configuration.md`](configuration.md) — full reference table
-- [REMYX-155](https://linear.app/remyx/issue/REMYX-155) — defensive guard for truncated/bogus auth secrets (in flight)
-- [REMYX-157](https://linear.app/remyx/issue/REMYX-157) — CLI ergonomics for backend-switchable workflows (in flight)
-- [REMYX-158](https://linear.app/remyx/issue/REMYX-158) — per-backend rate-table coverage + customer-supplied rates (in flight)

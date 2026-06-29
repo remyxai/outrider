@@ -69,7 +69,7 @@ The selection pass is **agentic** — Claude has read-only tools and consults mu
 ### Convention signals
 
 - **Recent merged PRs** — Phase B (convention pass) extracts your PR-body template and merge cadence from the last ~30 merged PRs. Re-uses your headings, table shapes, checklist patterns.
-- **`.github/ISSUE_TEMPLATE/`** — Phase B' (Issue-route convention pass) reads markdown frontmatter and Issue Forms (`.md` / `.yml` / `.yaml`), classifies templates by kind (bug / feature / new_model / question / other), and folds Outrider Issues into the best-fitting template. See [REMYX-146 design](architecture.md#issue-route-convention-pass) for the picker logic.
+- **`.github/ISSUE_TEMPLATE/`** — Phase B' (Issue-route convention pass) reads markdown frontmatter and Issue Forms (`.md` / `.yml` / `.yaml`), classifies templates by kind (bug / feature / new_model / question / other), and folds Outrider Issues into the best-fitting template. See [architecture.md](architecture.md#issue-route-convention-pass) for the picker logic.
 - **`CONTRIBUTING.md` / `ORIENTATION.md`** — if present, the drafting prompt consults them for lint configs and house style. Defers to your repo's own config (ruff / pre-commit / black / flake8) rather than hardcoding rules.
 
 ### Direction signals (for **extension**-shape picks)

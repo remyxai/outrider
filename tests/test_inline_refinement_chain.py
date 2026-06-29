@@ -218,9 +218,9 @@ def test_main_skips_chain_when_no_pr_opened(monkeypatch):
 
 
 def test_main_invokes_issue_convention_when_issue_opened(monkeypatch):
-    # REMYX-146: when recommend mode opens an Issue with a known
-    # issue_number, the inline dispatcher invokes run_issue_convention_pass
-    # with INPUT_ISSUE_NUMBER set to the just-opened Issue.
+    # When recommend mode opens an Issue with a known issue_number,
+    # the inline dispatcher invokes run_issue_convention_pass with
+    # INPUT_ISSUE_NUMBER set to the just-opened Issue.
     _base_env(monkeypatch)
     invoked = _make_recommend_main(
         monkeypatch, chain_enabled=True,
