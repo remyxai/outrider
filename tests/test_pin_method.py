@@ -141,3 +141,64 @@ def test_main_exits_when_both_pin_inputs_set(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         run.main()
     assert exc.value.code == 2
+
+
+# ─── pin-method bypasses the discharge filter ─────────────────────────────
+
+
+def test_pin_method_bypasses_discharge_filter(monkeypatch):
+    """When pin_method names a paper that already has a prior Outrider
+    Issue, the run still proceeds — user intent overrides the discharge
+    throttle. Without this, A/B re-runs on the same paper always skip.
+    """
+    monkeypatch.setenv("TARGET_REPO", "owner/name")
+    monkeypatch.setenv(
+        "INPUT_INTEREST_ID", "00000000-0000-0000-0000-000000000000"
+    )
+    monkeypatch.setenv("INPUT_PIN_METHOD", "2410.20305v2")
+
+    # Resolve the pin to a synthetic asset
+    asset = {
+        "arxiv_id": "2410.20305v2",
+        "title": "DPO Prefix Sharing",
+        "abstract": "...",
+    }
+    monkeypatch.setattr(run, "_resolve_pin_method", lambda q: asset)
+
+    # Prior open Issue for the same arxiv id — would normally discharge
+    prior = {
+        "title": "[Remyx Recommendation] DPO Prefix Sharing",
+        "body": "https://arxiv.org/abs/2410.20305",
+        "html_url": "https://github.com/owner/name/issues/1",
+        "number": 1,
+        "state": "open",
+    }
+    monkeypatch.setattr(run, "_all_discharge_issues", lambda t: [prior])
+
+    # Stub everything downstream of viable so the test only verifies
+    # the gate decision.
+    monkeypatch.setattr(run, "gh_api", lambda *a, **kw:
+                        {"has_issues": True} if "/repos/" in a[1] and "?" not in a[1]
+                        else [])
+    monkeypatch.setattr(run, "_candidate_enrichment", lambda v: [])
+    monkeypatch.setattr(run, "_pool_composition", lambda c: (0, 0))
+    monkeypatch.setattr(run, "open_remyx_artifact_exists", lambda t: False)
+    monkeypatch.setattr(run, "_license_class_counts", lambda c: {})
+
+    captured = {}
+
+    def fake_prepare_workdir(target):
+        # By the time we reach prepare_workdir, the discharge gate has
+        # already passed — that's what we're verifying.
+        captured["reached_workdir"] = True
+        raise RuntimeError("test stops here")
+
+    monkeypatch.setattr(run, "prepare_workdir", fake_prepare_workdir)
+
+    target = run.build_target_from_env()
+    # We expect process_target to reach prepare_workdir (proving the
+    # discharge gate passed) and then raise our sentinel — the
+    # alternative would be an early skip on skipped_issue_exists.
+    with pytest.raises(RuntimeError, match="test stops here"):
+        run.process_target(target)
+    assert captured.get("reached_workdir") is True

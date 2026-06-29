@@ -6614,6 +6614,14 @@ def process_target(target: Target) -> dict:
     # don't waste budget re-deriving it" regardless of who opened the
     # Issue.
     open_issues = _all_discharge_issues(target)
+    # Pin-method / pin-arxiv = user explicitly named the paper; their
+    # intent overrides the discharge throttle (which is otherwise a
+    # "don't keep re-recommending what Outrider already pitched" guard
+    # for the normal selection flow). Without this override, A/B-style
+    # re-runs, demo re-takes, and "improve the prior artifact" workflows
+    # would always skip with skipped_issue_exists. PR-collision check
+    # below stays active — that's a real safety property.
+    pin_override = bool(target.pin_method or target.pin_arxiv)
     viable: list[Recommendation] = []
     dropped_low_conf = 0
     dropped_pr_exists = 0
@@ -6626,10 +6634,11 @@ def process_target(target: Target) -> dict:
         if existing_pr_for(target, c_branch):
             dropped_pr_exists += 1
             continue
-        prior_issue = issue_for_paper(open_issues, c)
-        if prior_issue:
-            dropped_issue_exists += 1
-            continue
+        if not pin_override:
+            prior_issue = issue_for_paper(open_issues, c)
+            if prior_issue:
+                dropped_issue_exists += 1
+                continue
         viable.append(c)
 
     if not viable:
