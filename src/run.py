@@ -3978,6 +3978,13 @@ def _record_claude_usage(env: dict) -> None:
 # agent shouldn't see verbatim.
 _CLAUDE_ENV_WHITELIST: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
+    # ANTHROPIC_AUTH_TOKEN — used by Claude Code as a Bearer credential
+    # for non-default backends (z.ai's GLM Coding Plan requires this:
+    # https://docs.z.ai/devpack/tool/claude). When set, Claude Code sends
+    # "Authorization: Bearer <token>" instead of "x-api-key: <key>". z.ai's
+    # gateway rejects x-api-key with HTTP 401, so without this whitelist
+    # entry, any glm-routed run fails at auth.
+    "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
     "PATH",

@@ -59,6 +59,23 @@ def test_anthropic_base_url_in_subprocess_whitelist():
     assert "ANTHROPIC_BASE_URL" in run._CLAUDE_ENV_WHITELIST
 
 
+def test_anthropic_auth_token_in_subprocess_whitelist():
+    """Regression guard: ANTHROPIC_AUTH_TOKEN must stay in the whitelist
+    so Claude Code can authenticate against non-default Anthropic-compat
+    backends (z.ai's GLM Coding Plan requires Bearer auth — sending
+    x-api-key returns HTTP 401). Without this, every glm-routed run
+    fails at auth. See REMYX-154."""
+    assert "ANTHROPIC_AUTH_TOKEN" in run._CLAUDE_ENV_WHITELIST
+
+
+def test_claude_subprocess_env_forwards_auth_token(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-zai-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-default")
+    env = run._claude_subprocess_env()
+    assert env.get("ANTHROPIC_AUTH_TOKEN") == "test-zai-token"
+    assert env.get("ANTHROPIC_API_KEY") == "sk-ant-default"
+
+
 def test_claude_subprocess_env_forwards_anthropic_base_url(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
