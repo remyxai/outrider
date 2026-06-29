@@ -12086,8 +12086,14 @@ def main():
     # this input is the documented surface.
     if target.model_base_url:
         os.environ["ANTHROPIC_BASE_URL"] = target.model_base_url
+        backend_name, backend_rates = _detect_backend(target.model_base_url)
+        if backend_rates is not None:
+            cost_note = f"cost computed from {backend_name} rate table"
+        else:
+            cost_note = (f"cost telemetry is Anthropic-rate estimate "
+                         f"(no rate table for {backend_name})")
         log.info(f"  routing Claude Code via {target.model_base_url} "
-                 "(cost telemetry is Anthropic-rate estimate)")
+                 f"({cost_note})")
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
     if mode == "weekly-summary":
