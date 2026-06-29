@@ -44,7 +44,7 @@ Extra path globs Claude Code may touch, **added on top of** the defaults (`*.py`
 
 ### Cadence guard — `rate-limit-days`
 
-Any value > 0: skip the run if any open Remyx PR or Issue is still on the target. The default (`7`) keeps the gate enabled; engagement (merge or close) releases it. Set `0` to disable — useful for batch trials.
+Time-decayed throttle. Skip a run only if the most recently opened Remyx PR/Issue on the target is *younger* than `rate-limit-days`. The default `7` means "don't pile on within a week of the last artifact"; older open artifacts age out of the window and stop blocking — recognizing that maintainers often leave Issues open for weeks without active triage. Engagement (merge or close) still clears the gate immediately. Set `0` to disable the guard entirely (useful for batch trials); set a higher value (e.g. `30`) for a stricter, slower cadence on busy repos.
 
 
 ## 2. What Outrider reads from your repo
