@@ -212,6 +212,19 @@ inputs:
       normal selection. Mutually exclusive with pin-arxiv.
     required: false
     default: ''
+  model-base-url:
+    description: |
+      Optional override for the Claude Code subprocess's ANTHROPIC_BASE_URL.
+      Use this to route the coding agent to any Anthropic-Messages-compatible
+      backend — e.g. z.ai's GLM Coding Plan, AWS Bedrock, GCP Vertex, an
+      on-prem proxy. The ANTHROPIC_API_KEY repo secret should hold the
+      backend's API key when this is set, not your Anthropic key. Empty
+      (default) = api.anthropic.com. Note: when set, the `total_cost_usd`
+      that the Claude Code CLI reports is computed with Anthropic-rate
+      pricing applied to the backend's tokens — it's an estimate, not a
+      bill. Token counts remain accurate.
+    required: false
+    default: ''
 
 outputs:
   status:
@@ -320,6 +333,7 @@ runs:
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         INPUT_PIN_METHOD: ${{ inputs.pin-method }}
+        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}

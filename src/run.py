@@ -1187,6 +1187,15 @@ class Target:
     # both the interest's candidate pool and the selection pass. Mutually
     # exclusive with pin_arxiv (validated in build_target_from_env).
     pin_method: str = ""
+    # Optional: route the Claude Code subprocess at a non-default base URL.
+    # When set, becomes ``ANTHROPIC_BASE_URL`` for every Claude CLI call,
+    # which is the Anthropic-Messages-compatible protocol any z.ai/GLM,
+    # Bedrock, Vertex, or on-prem proxy backend speaks. The ANTHROPIC_API_KEY
+    # secret should then be the backend's key, not the Anthropic key. Cost
+    # telemetry (``total_cost_usd``) is the Claude CLI's estimate using its
+    # built-in Anthropic-rate pricing — accurate for Anthropic, approximate
+    # for any other backend. Token counts remain accurate regardless.
+    model_base_url: str = ""
     # Inline refinement chain: when True (default), recommend mode continues
     # sequentially into fidelity audit → convention pass → test gate on the
     # just-opened PR, so the chain runs by default without the customer
@@ -3809,6 +3818,15 @@ _RUN_COST = {
     "cache_read_input_tokens": 0,
     "num_turns": 0,
     "claude_calls": 0,
+    # Set by _record_claude_usage on each call so the result dict can
+    # surface them. "Anthropic" by default; "z.ai (GLM)" / "AWS Bedrock"
+    # / etc. when ANTHROPIC_BASE_URL routes elsewhere. cost_basis is
+    # "backend_rate_table" when we computed cost from a known per-backend
+    # rate card, or "claude_code_envelope" when we trusted the CLI's
+    # total_cost_usd field (correct for Anthropic, approximate for
+    # unknown backends).
+    "model_backend": "Anthropic",
+    "cost_basis": "claude_code_envelope",
 }
 
 # Refine queries the audit pass actually executed this run, including ones
@@ -3822,22 +3840,88 @@ def _reset_run_cost() -> None:
     _RUN_COST.update(
         cost_usd=0.0, input_tokens=0, output_tokens=0,
         cache_read_input_tokens=0, num_turns=0, claude_calls=0,
+        model_backend="Anthropic", cost_basis="claude_code_envelope",
     )
     _RUN_REFINE_QUERIES.clear()
     _BOT_TOKEN.update(attempted=False, token="", permissions={})
 
 
+# ── Per-backend pricing for cost telemetry ─────────────────────────────────
+#
+# When ``ANTHROPIC_BASE_URL`` routes Claude Code at a non-Anthropic backend
+# (z.ai / GLM, Bedrock, on-prem proxies), the CLI's ``total_cost_usd`` field
+# uses its built-in Anthropic-rate table — wrong by a constant factor for
+# any other backend. This table lets us override with the backend's actual
+# rate card when the URL matches a known host substring.
+#
+# Rates are USD per million tokens: ``(input, output, cache_read)``. Update
+# as providers publish new rates. Backends not in the table fall back to
+# the CLI's ``total_cost_usd`` (with a "may be approximate" note in the
+# step summary so the operator knows the figure isn't authoritative for
+# their backend).
+_BACKEND_RATES: dict[str, tuple[float, float, float]] = {
+    # z.ai GLM (Anthropic-Messages-compat endpoint) — PAYG rates for the
+    # default GLM-4.6 routing. Users on the GLM Coding Plan subscription
+    # don't pay per-token, but the per-token estimate stays useful as a
+    # "what would this cost outside the subscription" indicator.
+    "api.z.ai": (0.60, 2.20, 0.06),
+}
+
+
+def _detect_backend(base_url: str) -> tuple[str, tuple[float, float, float] | None]:
+    """Identify the Anthropic-Messages-compat backend behind ANTHROPIC_BASE_URL.
+
+    Returns ``(display_name, rates_or_None)``. When the host isn't in the
+    rate table, returns the raw host as the display name and ``None`` for
+    rates — the caller falls back to the CLI's reported ``total_cost_usd``
+    (which is Anthropic-rate; only correct for default Anthropic or
+    Bedrock-Claude, miscalibrated for any other backend).
+    """
+    if not base_url:
+        return ("Anthropic", None)  # default — CLI's envelope cost is correct
+    host = base_url.split("://", 1)[-1].split("/", 1)[0]
+    display_overrides = {
+        "api.z.ai": "z.ai (GLM)",
+    }
+    for key, rates in _BACKEND_RATES.items():
+        if key in host:
+            return (display_overrides.get(key, host), rates)
+    return (host, None)
+
+
 def _record_claude_usage(env: dict) -> None:
-    """Accumulate one `claude --output-format json` envelope's usage."""
+    """Accumulate one `claude --output-format json` envelope's usage.
+
+    Tokens come straight from the envelope (accurate for any backend that
+    speaks the Anthropic Messages protocol). Cost is either:
+    - computed from tokens × per-backend rates when ``ANTHROPIC_BASE_URL``
+      matches a known non-Anthropic backend (``_BACKEND_RATES``), or
+    - taken from the CLI's ``total_cost_usd`` field otherwise (default
+      Anthropic — correct; Bedrock-Claude — correct; unknown backend —
+      approximate, flagged via ``cost_basis``).
+    """
     _RUN_COST["claude_calls"] += 1
-    _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
     _RUN_COST["num_turns"] += int(env.get("num_turns") or 0)
     u = env.get("usage") or {}
-    _RUN_COST["input_tokens"] += int(u.get("input_tokens") or 0)
-    _RUN_COST["output_tokens"] += int(u.get("output_tokens") or 0)
-    _RUN_COST["cache_read_input_tokens"] += int(
-        u.get("cache_read_input_tokens") or 0
-    )
+    in_tok = int(u.get("input_tokens") or 0)
+    out_tok = int(u.get("output_tokens") or 0)
+    cache_in = int(u.get("cache_read_input_tokens") or 0)
+    _RUN_COST["input_tokens"] += in_tok
+    _RUN_COST["output_tokens"] += out_tok
+    _RUN_COST["cache_read_input_tokens"] += cache_in
+
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    backend_name, rates = _detect_backend(base_url)
+    if rates is not None and "api.anthropic.com" not in base_url:
+        # Compute from tokens × backend rates (USD per million).
+        rate_in, rate_out, rate_cache = rates
+        cost = (in_tok * rate_in + out_tok * rate_out + cache_in * rate_cache) / 1_000_000
+        _RUN_COST["cost_usd"] += cost
+        _RUN_COST["cost_basis"] = "backend_rate_table"
+    else:
+        _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
+        _RUN_COST["cost_basis"] = "claude_code_envelope"
+    _RUN_COST["model_backend"] = backend_name
 
 
 # Subprocess env whitelist for Claude Code invocations. The Claude CLI
@@ -7498,6 +7582,7 @@ def build_target_from_env() -> Target:
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
         pin_method=_optional_env("INPUT_PIN_METHOD", ""),
+        model_base_url=_optional_env("INPUT_MODEL_BASE_URL", ""),
         chain_enabled=chain_enabled,
         notes="",
     )
@@ -11733,8 +11818,24 @@ def _write_step_summary(result: dict) -> None:
     token_line = f"{in_tok:,} in / {out_tok:,} out"
     if cache_in_tok:
         token_line += f" ({cache_in_tok:,} cache-read)"
+    agent = result.get("agent", "Claude Code")
+    backend = result.get("model_backend", "Anthropic")
+    cost_basis = result.get("cost_basis", "claude_code_envelope")
+    # Annotate the cost line when the figure is the CLI's
+    # Anthropic-rate estimate applied to a non-Anthropic backend's tokens
+    # — accurate token counts, approximate dollars. When we compute from
+    # the backend's own rate card (cost_basis == "backend_rate_table"),
+    # the dollars are authoritative for that rate sheet.
+    if cost_basis == "backend_rate_table":
+        cost_note = f" *(computed from {backend} PAYG rates)*"
+    elif backend != "Anthropic":
+        cost_note = (" *(Anthropic-rate estimate on backend tokens; "
+                     "see provider billing for the real number)*")
+    else:
+        cost_note = ""
     lines.append("\n**Cost & tokens this run**\n")
-    lines.append(f"- **Cost**: `${cost:.4f}`")
+    lines.append(f"- **Agent**: {agent} → {backend}")
+    lines.append(f"- **Cost**: `${cost:.4f}`{cost_note}")
     lines.append(f"- **Tokens**: {token_line}")
     if claude_calls:
         lines.append(f"- **Claude calls**: {claude_calls}")
@@ -11960,6 +12061,17 @@ def main():
             "the other, not both."
         )
         sys.exit(2)
+    # Plumb the configured backend URL through to the Claude Code subprocess
+    # via the existing _CLAUDE_ENV_WHITELIST passthrough. Set it on the
+    # parent process env so every Claude invocation in this run inherits the
+    # routing — single point of truth, no need to thread `target` into the
+    # subprocess-env builder. The customer's ANTHROPIC_BASE_URL set directly
+    # in the workflow `env:` block (the pre-input workaround) still works;
+    # this input is the documented surface.
+    if target.model_base_url:
+        os.environ["ANTHROPIC_BASE_URL"] = target.model_base_url
+        log.info(f"  routing Claude Code via {target.model_base_url} "
+                 "(cost telemetry is Anthropic-rate estimate)")
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
     if mode == "weekly-summary":
@@ -12048,9 +12160,20 @@ def main():
     result["output_tokens"] = _RUN_COST["output_tokens"]
     result["cache_read_input_tokens"] = _RUN_COST["cache_read_input_tokens"]
     result["claude_calls"] = _RUN_COST["claude_calls"]
+    # Coding-agent and model-backend identity. Fixed to Claude Code today;
+    # the agent field is the seam for REMYX-65's per-CLI adapters
+    # (Aider / Goose / Codex). model_backend tracks the API endpoint the
+    # agent talked to — "Anthropic" by default, "z.ai (GLM)" / "AWS
+    # Bedrock" / etc. when ANTHROPIC_BASE_URL routes elsewhere. cost_basis
+    # tells the step summary whether cost was computed from a known rate
+    # card or trusted from the CLI's envelope.
+    result["agent"] = "Claude Code"
+    result["model_backend"] = _RUN_COST.get("model_backend", "Anthropic")
+    result["cost_basis"] = _RUN_COST.get("cost_basis", "claude_code_envelope")
     log.info(f"  cost: ${result['cost_usd']} "
              f"({result['input_tokens']} in / {result['output_tokens']} out "
-             f"tokens, {result['claude_calls']} claude calls)")
+             f"tokens, {result['claude_calls']} claude calls) "
+             f"via {result['agent']} → {result['model_backend']}")
 
     print("\n=== RUN SUMMARY ===")
     print(json.dumps(result, indent=2))

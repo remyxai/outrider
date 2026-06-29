@@ -38,6 +38,25 @@ Outrider tags each candidate paper with a confidence tier (`high` / `moderate` /
 
 Set to a specific `arxiv_id` and Outrider skips the selection pass entirely, implementing that exact paper. Use for eval re-runs and demos.
 
+### Method-targeted runs — `pin-method`
+
+Set to a free-text method query (e.g. `"knowledge distillation"`) or a literal `arxiv_id`. Outrider resolves it to the top arxiv match and implements it directly — bypassing the candidate pool and selection pass. Strict superset of `pin-arxiv`: it also works on papers outside the interest's pool (via direct asset lookup). Mutually exclusive with `pin-arxiv`.
+
+### Model backend — `model-base-url`
+
+Optional override that points the Claude Code subprocess at any Anthropic-Messages-compatible backend. Empty (default) = `api.anthropic.com`. The `ANTHROPIC_API_KEY` repo secret should hold the backend's key when this is set, not your Anthropic key.
+
+Common backends:
+
+| Backend | `model-base-url` |
+|---|---|
+| z.ai / GLM Coding Plan | `https://api.z.ai/anthropic` |
+| AWS Bedrock (Claude) | `https://bedrock-runtime.<region>.amazonaws.com` |
+| GCP Vertex (Claude) | `https://<region>-aiplatform.googleapis.com/v1/projects/<proj>/...` |
+| On-prem Anthropic-compat proxy | `https://<your-proxy>/v1` |
+
+Cost telemetry is backend-aware. When `model-base-url` matches a known backend in the action's rate table (currently `api.z.ai` for GLM Coding Plan PAYG), the action overrides Claude Code's Anthropic-rate `total_cost_usd` and computes cost from `tokens × backend rates` — the dollars in the step summary are authoritative for that rate sheet. For unknown backends the action falls back to the CLI's reported value and flags it as approximate in the step summary. Token counts are accurate for any backend that speaks the Anthropic Messages protocol. The step summary surfaces both the **agent** (Claude Code) and the **model backend** (Anthropic / z.ai (GLM) / your-host) so you can see which model server actually served the run.
+
 ### Filesystem reach — `guardrails-allowlist`
 
 Extra path globs Claude Code may touch, **added on top of** the defaults (`*.py`, `.remyx-recommendation/**`, `**/*.md`). Most repos don't need this. See [`guardrails.md`](guardrails.md) for full details on what's allowed and what's always blocked.
