@@ -6400,6 +6400,25 @@ def _compact_selection_rejected_for_telemetry(
     return compact
 
 
+def _compact_string_list_for_telemetry(
+    items: list[str] | None,
+    max_entries: int = 50,
+    max_chars: int = 300,
+) -> list[str] | None:
+    """Bound a list-of-strings field for the engine telemetry payload.
+
+    Used for unbounded list fields the agent can produce (integration
+    violations, lint findings) so a misbehaving run can't bloat the
+    posted row. Returns ``None`` for ``None`` / non-list input (engine
+    can distinguish "field wasn't shipped" from "field was empty").
+    """
+    if items is None:
+        return None
+    if not isinstance(items, list):
+        return None
+    return [str(s)[:max_chars] for s in items[:max_entries]]
+
+
 def _candidate_enrichment(candidates: "list[Recommendation]") -> list[dict]:
     """Per-candidate code/model/license metadata for the run-telemetry payload.
 
@@ -12006,7 +12025,93 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "cost_usd": result.get("cost_usd"),
         "input_tokens": result.get("input_tokens"),
         "output_tokens": result.get("output_tokens"),
+        "cache_read_input_tokens": result.get("cache_read_input_tokens"),
         "claude_calls": result.get("claude_calls"),
+        "num_turns": result.get("num_turns"),
+        # Coding-agent identity + backend / cost-basis annotations. These
+        # let SQL slice telemetry by which backend served a run (Anthropic
+        # vs z.ai (GLM) vs Bedrock vs ...) and whether the dollar figure
+        # came from the CLI's envelope or a backend-specific rate table.
+        "agent": result.get("agent"),
+        "model_backend": result.get("model_backend"),
+        "cost_basis": result.get("cost_basis"),
+        # Successful envelopes that arrived without a `usage` block.
+        # Non-zero means the run's token totals are an under-count.
+        "envelopes_without_usage": result.get("envelopes_without_usage"),
+        # Preflight / routing decisions made before (or in lieu of) the
+        # implementation pass. Together these capture *why* a run ended
+        # up as PR / Issue / preflight-Issue / no-integration.
+        "preflight_decision": result.get("preflight_decision"),
+        "audit_anchor": result.get("audit_anchor"),
+        "pin_method": result.get("pin_method"),
+        "pin_method_resolution": result.get("pin_method_resolution"),
+        "selection_proposed_call_site": (
+            (result.get("selection_proposed_call_site") or "")[:512] or None
+        ),
+        "selection_team_direction_signal":
+            result.get("selection_team_direction_signal"),
+        "selection_contract_match": result.get("selection_contract_match"),
+        "selection_migration_cost": result.get("selection_migration_cost"),
+        "selection_external_arxiv_id": result.get("selection_external_arxiv_id"),
+        "selection_external_query_used": (
+            (result.get("selection_external_query_used") or "")[:512] or None
+        ),
+        "selection_code_override_justification": (
+            (result.get("selection_code_override_justification") or "")[:1024]
+            or None
+        ),
+        # Refinement-chain stage outcomes — observability for self-review,
+        # convention pass, draft-state flip, test integration gate,
+        # diff-risk band, lint/test status, etc. Bool-typed fields stay
+        # bool/None; counters stay int/None; verbose lists are bounded.
+        "chain": result.get("chain"),
+        "self_review": result.get("self_review"),
+        "needs_judgment": result.get("needs_judgment"),
+        "pr_body_updated": result.get("pr_body_updated"),
+        "pr_body_rationale": (
+            (result.get("pr_body_rationale") or "")[:2048] or None
+        ),
+        "draft_dropped": result.get("draft_dropped"),
+        "test_integration_gate": result.get("test_integration_gate"),
+        "tests_status": result.get("tests_status"),
+        "test_status": result.get("test_status"),
+        "tests_touch_existing": result.get("tests_touch_existing"),
+        "stub_density": result.get("stub_density"),
+        "integration_violations": _compact_string_list_for_telemetry(
+            result.get("integration_violations")
+        ),
+        "lint_status": result.get("lint_status"),
+        "lint_issues": result.get("lint_issues"),
+        "diff_risk_band": result.get("diff_risk_band"),
+        "diff_risk_score": result.get("diff_risk_score"),
+        "diff_risk_factors": result.get("diff_risk_factors"),
+        "coverage_summary": (
+            (result.get("coverage_summary") or "")[:2048] or None
+        ),
+        # Issue-route convention-pass outcomes.
+        "picked_template": result.get("picked_template"),
+        "templates_eligible": result.get("templates_eligible"),
+        "templates_filtered_kinds": result.get("templates_filtered_kinds"),
+        "templates_found": result.get("templates_found"),
+        "existing_issue_state": result.get("existing_issue_state"),
+        "existing_issue_url": result.get("existing_issue_url"),
+        # Repo / file-touch telemetry.
+        "files_touched": result.get("files_touched"),
+        "touched_py_files": result.get("touched_py_files"),
+        "touched_test_files": result.get("touched_test_files"),
+        "files_dropped_out_of_scope": result.get("files_dropped_out_of_scope"),
+        "package_manager": result.get("package_manager"),
+        "deps_installed": result.get("deps_installed"),
+        "deps_install_summary": result.get("deps_install_summary"),
+        # Paper metadata snapshot — arxiv_id is also reachable via the
+        # recommendation_id FK, but having it on the row makes SQL slicing
+        # by paper trivial.
+        "arxiv_id": result.get("arxiv_id"),
+        "upstream_repo": result.get("upstream_repo"),
+        "paper_license": result.get("paper_license"),
+        "license_class": result.get("license_class"),
+        "license_compat": result.get("license_compat"),
+        "reference_url": result.get("reference_url"),
         "error": result.get("error"),
     }
     try:
@@ -12199,6 +12304,7 @@ def main():
     result["output_tokens"] = _RUN_COST["output_tokens"]
     result["cache_read_input_tokens"] = _RUN_COST["cache_read_input_tokens"]
     result["claude_calls"] = _RUN_COST["claude_calls"]
+    result["num_turns"] = _RUN_COST["num_turns"]
     # Coding-agent and model-backend identity. Fixed to Claude Code today;
     # the agent field is the seam for future per-CLI adapters
     # (Aider / Goose / Codex). model_backend tracks the API endpoint the
