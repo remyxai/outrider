@@ -130,16 +130,16 @@ inputs:
     default: 'always'
   rate-limit-days:
     description: |
-      Cadence guard: skip the run if an *open* Remyx Recommendation
-      artifact (PR or Issue) from a prior run still exists on the
-      target repo. Engagement (merge or close) signals the channel is
-      clear and the next run can proceed. Per-paper dedup (a separate
-      gate) handles same-recommendation retries — this guard is purely
-      about not stacking unresolved work. Any value > 0 enables the
-      guard; 0 disables it. The numeric value is otherwise ignored
-      (retained as an on/off bit so existing workflow files continue
-      to work unchanged; pre-2026-06 versions interpreted it as a
-      sliding "opened within N days" window).
+      Cadence guard window. Skip the run if the most recently opened
+      Remyx Recommendation artifact (PR or Issue) on the target repo is
+      *younger* than this many days. Older open artifacts age out of the
+      throttle window and stop blocking — real maintainers leave Issues
+      open for weeks without active triage, and the action should resume
+      cadence rather than mute the repo indefinitely. Engagement (merge
+      or close) still clears the gate immediately. Per-paper dedup (a
+      separate gate) handles same-recommendation retries — this guard is
+      purely about not stacking *recent* unresolved work. Set to 0 to
+      disable the guard entirely (useful for batch trials).
     required: false
     default: '7'
   guardrails-allowlist:

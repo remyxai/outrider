@@ -3231,25 +3231,37 @@ def issue_for_paper(open_issues: list[dict], rec: Recommendation) -> dict | None
     return None
 
 
-def open_remyx_artifact_exists(target: Target) -> bool:
-    """Return True if any **open** Remyx Recommendation PR or Issue exists
-    on the target repo.
+def _most_recent_open_artifact_age_days(target: Target) -> int | None:
+    """Return the age in days of the most recently opened Remyx PR/Issue,
+    or ``None`` if no open Remyx artifact exists on the target.
 
-    The cadence guard's job is to avoid stacking unresolved work on a
-    maintainer who hasn't engaged with the prior recommendation. Once
-    they merge or close it, the channel is clear and the next run can
-    proceed — engagement IS the signal. Per-paper dedup (a separate
-    gate) already prevents the same recommendation from re-surfacing,
-    so the cadence guard doesn't need its own time window.
+    Used by the cadence guard to time-decay throttling: only artifacts
+    opened *within* ``rate_limit_days`` block subsequent runs; older open
+    artifacts have aged out of the throttle window and don't fire the
+    gate. The caller does the threshold comparison so it can also surface
+    the age in run telemetry.
 
-    `target.rate_limit_days > 0` enables this gate; `<= 0` disables it.
-    The numeric value is otherwise ignored — preserved as an on/off bit
-    so existing `outrider.yml` workflows continue to work unchanged.
+    Age is days since ``created_at``, floored. When multiple open
+    artifacts exist, returns the *smallest* age (the most recently
+    opened) — that's the one the throttle cares about ("was something
+    just opened?"). Older co-existing artifacts don't matter for cadence;
+    the per-paper discharge filter handles same-paper retries
+    independently.
     """
-    if target.rate_limit_days <= 0:
-        return False
+    now = dt.datetime.now(dt.timezone.utc)
 
-    # PRs — identified by branch prefix. Only open PRs block.
+    def _age_days(created_iso: str) -> int | None:
+        try:
+            created = dt.datetime.fromisoformat(
+                (created_iso or "").replace("Z", "+00:00")
+            )
+        except (ValueError, TypeError):
+            return None
+        return max(0, int((now - created).total_seconds() // 86400))
+
+    ages: list[int] = []
+
+    # PRs — identified by branch prefix. Only open PRs are returned.
     prs = gh_api(
         "GET", f"/repos/{target.repo}/pulls?state=open&per_page=50"
     ) or []
@@ -3257,8 +3269,11 @@ def open_remyx_artifact_exists(target: Target) -> bool:
         ref = pr.get("head", {}).get("ref", "")
         if not ref.startswith(BRANCH_PREFIX):
             continue
-        log.info(f"  open Remyx PR exists: {pr['html_url']}")
-        return True
+        age = _age_days(pr.get("created_at", ""))
+        if age is None:
+            continue
+        log.info(f"  open Remyx PR exists ({age}d old): {pr['html_url']}")
+        ages.append(age)
 
     # Issues — identified by title prefix or body attribution marker.
     # GitHub's /issues endpoint also returns PRs (they carry a
@@ -3273,10 +3288,35 @@ def open_remyx_artifact_exists(target: Target) -> bool:
         body = it.get("body") or ""
         if not (title.startswith(PR_TITLE_PREFIX) or "Remyx Recommendation" in body):
             continue
-        log.info(f"  open Remyx Issue exists: {it['html_url']}")
-        return True
+        age = _age_days(it.get("created_at", ""))
+        if age is None:
+            continue
+        log.info(f"  open Remyx Issue exists ({age}d old): {it['html_url']}")
+        ages.append(age)
 
-    return False
+    return min(ages) if ages else None
+
+
+def open_remyx_artifact_exists(target: Target) -> bool:
+    """Cadence guard — return True iff a *recent* open Remyx artifact
+    blocks the run.
+
+    Time-decayed: an open Remyx PR/Issue blocks new runs only while it's
+    younger than ``rate_limit_days``. Older open artifacts have aged out
+    of the throttle window and no longer fire the gate — recognizing that
+    real maintainers often leave Issues open for weeks without active
+    triage, and the action should resume cadence rather than mute the
+    repo indefinitely. Engagement (merge or close) clears the gate
+    immediately. Per-paper dedup (a separate gate) handles same-paper
+    retries; this guard is purely about not stacking *recent* unresolved
+    work.
+
+    ``rate_limit_days = 0`` disables the guard entirely.
+    """
+    if target.rate_limit_days <= 0:
+        return False
+    age = _most_recent_open_artifact_age_days(target)
+    return age is not None and age < target.rate_limit_days
 
 
 # ─── Workdir + spec bundle ─────────────────────────────────────────────────
@@ -6373,14 +6413,24 @@ def process_target(target: Target) -> dict:
     result: dict = {"repo": target.repo, "status": "unknown"}
 
     # 1. Cadence guard — cheapest gate, before any candidate work or
-    #    checkout. Skip if any *open* Remyx artifact exists on the
-    #    target. Engagement (merge/close) IS the signal that the
-    #    channel is clear; the guard exists to avoid stacking
-    #    unresolved work, not to enforce a time window. Per-paper
-    #    dedup (further down) handles same-recommendation retries.
-    if open_remyx_artifact_exists(target):
-        result["status"] = "skipped_open_artifact"
-        return result
+    #    checkout. Time-decayed: skip only if the most recently opened
+    #    Remyx artifact on the target is *younger* than rate_limit_days.
+    #    Older open artifacts age out of the throttle window (real
+    #    maintainers leave Issues open for weeks; the action should
+    #    resume cadence rather than mute the repo indefinitely).
+    #    Engagement (merge/close) still clears the gate immediately.
+    #    Per-paper dedup (further down) handles same-recommendation retries.
+    if target.rate_limit_days > 0:
+        age = _most_recent_open_artifact_age_days(target)
+        if age is not None and age < target.rate_limit_days:
+            log.info(
+                f"  cadence guard: most recent open Remyx artifact is "
+                f"{age}d old (< rate_limit_days={target.rate_limit_days}); "
+                f"skipping. Older open artifacts no longer block."
+            )
+            result["status"] = "skipped_open_artifact"
+            result["most_recent_artifact_age_days"] = age
+            return result
 
     # 1b. Issues-disabled pre-flight — GitHub disables the Issues tab on
     #     forks (and some repos) by default; without it, every Issue-route
