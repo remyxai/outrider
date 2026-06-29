@@ -44,50 +44,9 @@ Set to a free-text method query (e.g. `"knowledge distillation"`) or a literal `
 
 ### Model backend — `model-base-url`
 
-Optional override that points the Claude Code subprocess at any Anthropic-Messages-compatible backend. Empty (default) = `api.anthropic.com`. The `ANTHROPIC_API_KEY` repo secret holds the backend's key when this is set, not your Anthropic key.
+Optional override that routes the Claude Code subprocess at any Anthropic-Messages-compatible backend (z.ai's GLM Coding Plan, AWS Bedrock, GCP Vertex, on-prem proxies). Empty (default) = Anthropic's API.
 
-Common backends:
-
-| Backend | `model-base-url` | Recommended secret name |
-|---|---|---|
-| z.ai / GLM Coding Plan | `https://api.z.ai/anthropic` | `ZAI_API_KEY` |
-| AWS Bedrock (Claude) | `https://bedrock-runtime.<region>.amazonaws.com` | `AWS_BEARER_TOKEN_BEDROCK` |
-| GCP Vertex (Claude) | `https://<region>-aiplatform.googleapis.com/v1/projects/<proj>/...` | `GOOGLE_APPLICATION_CREDENTIALS` |
-| On-prem Anthropic-compat proxy | `https://<your-proxy>/v1` | (your convention) |
-
-**Important — auth env vars are mutually exclusive.** Different Anthropic-Messages-compatible backends use different auth headers:
-
-| Backend | Auth header Claude Code sends | Env var the workflow sets | Must leave UNSET |
-|---|---|---|---|
-| Anthropic (default) | `x-api-key: <key>` | `ANTHROPIC_API_KEY` | `ANTHROPIC_AUTH_TOKEN` |
-| z.ai / GLM Coding Plan | `Authorization: Bearer <token>` | `ANTHROPIC_AUTH_TOKEN` | `ANTHROPIC_API_KEY` |
-
-When **both** env vars are set in the runner env, Claude Code uses `ANTHROPIC_API_KEY` (the x-api-key path) — which z.ai's gateway rejects with HTTP 401. The two env vars must be set **conditionally**, not both at once.
-
-For per-dispatch backend switching, store each provider's key under its own canonical name (`ANTHROPIC_API_KEY` + `ZAI_API_KEY`) and let a `backend` `workflow_dispatch` input pick which env var to set at runtime:
-
-```yaml
-on:
-  workflow_dispatch:
-    inputs:
-      backend:
-        type: choice
-        options: [anthropic, glm]
-        default: anthropic
-env:
-  # Mutually exclusive: only one of these is non-empty per dispatch.
-  ANTHROPIC_API_KEY: ${{ inputs.backend == 'glm' && '' || secrets.ANTHROPIC_API_KEY }}
-  ANTHROPIC_AUTH_TOKEN: ${{ inputs.backend == 'glm' && secrets.ZAI_API_KEY || '' }}
-steps:
-  - uses: remyxai/outrider@v1
-    with:
-      interest-id: <uuid>
-      model-base-url: ${{ inputs.backend == 'glm' && 'https://api.z.ai/api/anthropic' || '' }}
-```
-
-Naming convention: each provider's secret follows `<PROVIDER>_API_KEY` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `ZAI_API_KEY`) — matches upstream conventions and reads cleanly at the workflow-YAML level. The action passes both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` env vars through to the Claude Code subprocess; the workflow YAML is what decides which one carries a value for any given dispatch.
-
-Cost telemetry is backend-aware. When `model-base-url` matches a known backend in the action's rate table (currently `api.z.ai` for GLM Coding Plan PAYG), the action overrides Claude Code's Anthropic-rate `total_cost_usd` and computes cost from `tokens × backend rates` — the dollars in the step summary are authoritative for that rate sheet. For unknown backends the action falls back to the CLI's reported value and flags it as approximate in the step summary. Token counts are accurate for any backend that speaks the Anthropic Messages protocol. The step summary surfaces both the **agent** (Claude Code) and the **model backend** (Anthropic / z.ai (GLM) / your-host) so you can see which model server actually served the run.
+The full backend matrix — including the auth-header gotcha that bites on z.ai (the env vars `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are mutually exclusive), the per-dispatch backend-switching workflow template, cost-telemetry behavior per backend, and a 401-debug checklist — lives in [`backends.md`](backends.md).
 
 ### Filesystem reach — `guardrails-allowlist`
 
