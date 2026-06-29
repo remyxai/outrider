@@ -252,14 +252,18 @@ def test_env_strip_complements_outbound_scrubber():
     exist and the env strip's TOKEN-shaped whitelist entries are
     intentional (not accidental inclusions).
 
-    Two TOKEN-shaped entries are intentional:
-      - ANTHROPIC_API_KEY: the Claude CLI's auth requirement
+    Three TOKEN-shaped entries are intentional:
+      - ANTHROPIC_API_KEY: the Claude CLI's default Anthropic auth (x-api-key)
+      - ANTHROPIC_AUTH_TOKEN: the Claude CLI's Bearer auth for non-default
+        backends (REMYX-154; required by z.ai's GLM Coding Plan)
       - GITHUB_TOKEN: the workflow built-in for the agent's `gh` CLI
         verification tooling
     Any other TOKEN-shaped entry should be reviewed before landing."""
     assert hasattr(run, "_scrub_outbound_payload")
     assert hasattr(run, "_claude_subprocess_env")
-    intentional_token_entries = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN"}
+    intentional_token_entries = {
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GITHUB_TOKEN",
+    }
     for name in run._CLAUDE_ENV_WHITELIST:
         if "TOKEN" in name.upper() or "KEY" in name.upper():
             assert name in intentional_token_entries, (
