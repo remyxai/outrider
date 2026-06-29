@@ -1187,6 +1187,15 @@ class Target:
     # both the interest's candidate pool and the selection pass. Mutually
     # exclusive with pin_arxiv (validated in build_target_from_env).
     pin_method: str = ""
+    # Optional: route the Claude Code subprocess at a non-default base URL.
+    # When set, becomes ``ANTHROPIC_BASE_URL`` for every Claude CLI call,
+    # which is the Anthropic-Messages-compatible protocol any z.ai/GLM,
+    # Bedrock, Vertex, or on-prem proxy backend speaks. The ANTHROPIC_API_KEY
+    # secret should then be the backend's key, not the Anthropic key. Cost
+    # telemetry (``total_cost_usd``) is the Claude CLI's estimate using its
+    # built-in Anthropic-rate pricing — accurate for Anthropic, approximate
+    # for any other backend. Token counts remain accurate regardless.
+    model_base_url: str = ""
     # Inline refinement chain: when True (default), recommend mode continues
     # sequentially into fidelity audit → convention pass → test gate on the
     # just-opened PR, so the chain runs by default without the customer
@@ -7448,6 +7457,7 @@ def build_target_from_env() -> Target:
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
         pin_method=_optional_env("INPUT_PIN_METHOD", ""),
+        model_base_url=_optional_env("INPUT_MODEL_BASE_URL", ""),
         chain_enabled=chain_enabled,
         notes="",
     )
@@ -11910,6 +11920,17 @@ def main():
             "the other, not both."
         )
         sys.exit(2)
+    # Plumb the configured backend URL through to the Claude Code subprocess
+    # via the existing _CLAUDE_ENV_WHITELIST passthrough. Set it on the
+    # parent process env so every Claude invocation in this run inherits the
+    # routing — single point of truth, no need to thread `target` into the
+    # subprocess-env builder. The customer's ANTHROPIC_BASE_URL set directly
+    # in the workflow `env:` block (the pre-input workaround) still works;
+    # this input is the documented surface.
+    if target.model_base_url:
+        os.environ["ANTHROPIC_BASE_URL"] = target.model_base_url
+        log.info(f"  routing Claude Code via {target.model_base_url} "
+                 "(cost telemetry is Anthropic-rate estimate)")
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
     if mode == "weekly-summary":

@@ -38,6 +38,25 @@ Outrider tags each candidate paper with a confidence tier (`high` / `moderate` /
 
 Set to a specific `arxiv_id` and Outrider skips the selection pass entirely, implementing that exact paper. Use for eval re-runs and demos.
 
+### Method-targeted runs — `pin-method`
+
+Set to a free-text method query (e.g. `"knowledge distillation"`) or a literal `arxiv_id`. Outrider resolves it to the top arxiv match and implements it directly — bypassing the candidate pool and selection pass. Strict superset of `pin-arxiv`: it also works on papers outside the interest's pool (via direct asset lookup). Mutually exclusive with `pin-arxiv`.
+
+### Model backend — `model-base-url`
+
+Optional override that points the Claude Code subprocess at any Anthropic-Messages-compatible backend. Empty (default) = `api.anthropic.com`. The `ANTHROPIC_API_KEY` repo secret should hold the backend's key when this is set, not your Anthropic key.
+
+Common backends:
+
+| Backend | `model-base-url` |
+|---|---|
+| z.ai / GLM Coding Plan | `https://api.z.ai/anthropic` |
+| AWS Bedrock (Claude) | `https://bedrock-runtime.<region>.amazonaws.com` |
+| GCP Vertex (Claude) | `https://<region>-aiplatform.googleapis.com/v1/projects/<proj>/...` |
+| On-prem Anthropic-compat proxy | `https://<your-proxy>/v1` |
+
+Cost telemetry caveat: the `total_cost_usd` field is computed by the Claude Code CLI using its built-in Anthropic-rate pricing. When routed to a non-Anthropic backend (e.g. z.ai), it's an estimate, not a bill. Token counts (`input_tokens`, `output_tokens`) stay accurate — derive your real cost from those + your provider's rate card.
+
 ### Filesystem reach — `guardrails-allowlist`
 
 Extra path globs Claude Code may touch, **added on top of** the defaults (`*.py`, `.remyx-recommendation/**`, `**/*.md`). Most repos don't need this. See [`guardrails.md`](guardrails.md) for full details on what's allowed and what's always blocked.
