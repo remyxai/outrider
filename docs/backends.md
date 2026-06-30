@@ -118,42 +118,17 @@ The step summary shows the agent + backend pair on every run:
 
 ## Troubleshooting: HTTP 401 from a non-Anthropic backend
 
-When a glm-routed (or other-backend-routed) run fails with `Failed to authenticate. API Error: 401 token expired or incorrect`, work down this checklist before anything else:
+The action runs a startup auth-env validation before any agent call that catches the most common misconfigurations — missing var, the literal `-` value (from `gh secret set --body -` stdin-disconnect ambiguity), suspiciously short values, leading/trailing whitespace, and both `ANTHROPIC_API_KEY` + `ANTHROPIC_AUTH_TOKEN` set non-empty under a non-default backend. If the check fires it surfaces an ERROR with a short hash + length diagnostic (the value itself is never echoed into the log) and exits non-zero before wasting any clone or prompt-build work.
 
-### 1. Which env var is set?
+When the startup check passes but a run still fails with `Failed to authenticate. API Error: 401`, work down the remaining checklist:
 
-The workflow must set `ANTHROPIC_AUTH_TOKEN` (Bearer) for any non-default backend that uses Bearer auth, NOT `ANTHROPIC_API_KEY` (x-api-key). Inspect the workflow YAML — if you see both set unconditionally at the job level, that's the bug.
+### 1. Did the startup check log a warning?
 
-### 2. Is the secret value truncated?
+The action emits a `⚠ auth check:` warning (non-fatal) on a few softer conditions — leading/trailing whitespace was stripped, or both env vars are set under a non-default backend. The warning text names the fix. If you see one, address it first.
 
-If the env var name is right, the value might still be wrong. The most common cause is `gh secret set --body -` with disconnected stdin — `gh` interprets the literal `-` as the body value, leaving the secret as a single `-` character. The backend then receives `Authorization: Bearer -` and naturally rejects.
+### 2. Is the secret value actually correct?
 
-Add a temporary diagnostic step that logs the value's length + a short hash (NOT the value itself):
-
-```yaml
-- name: Diagnostic — ANTHROPIC_AUTH_TOKEN shape
-  shell: bash
-  run: |
-    if [ -z "$ANTHROPIC_AUTH_TOKEN" ]; then
-      echo "DIAG: ANTHROPIC_AUTH_TOKEN is EMPTY"
-    else
-      len=${#ANTHROPIC_AUTH_TOKEN}
-      sha=$(echo -n "$ANTHROPIC_AUTH_TOKEN" | sha256sum | cut -c1-8)
-      echo "DIAG: ANTHROPIC_AUTH_TOKEN length=$len  sha8=$sha"
-    fi
-```
-
-If `length` is in single digits, the secret is truncated. Re-set via file input (avoids the `--body -` ambiguity):
-
-```bash
-printf '%s' "$YOUR_KEY" > /tmp/key
-gh secret set ZAI_API_KEY --repo owner/name < /tmp/key
-rm -f /tmp/key
-```
-
-### 3. Is the backend actually responsive?
-
-Probe the backend directly with the same env var the action receives. If the curl succeeds with HTTP 200, the env propagation is fine and the issue is inside Claude Code; if curl also returns 401, the secret is wrong:
+Length and shape can be fine while the value itself is stale or wrong. Probe the backend directly with the same env var the action receives — if the curl succeeds with HTTP 200, the env propagation is fine and the issue is inside Claude Code; if the curl also returns 401, the secret is wrong:
 
 ```yaml
 - name: Diagnostic — direct backend probe
@@ -169,7 +144,17 @@ Probe the backend directly with the same env var the action receives. If the cur
     head -c 200 /tmp/probe.json
 ```
 
-If the probe returns 200 but the action still gets 401, check whether Claude Code's bundled client has its own auth-config precedence (some versions may prefer cached OAuth credentials over env vars). A startup guard for this class of failure is on the roadmap.
+If you need to re-set a secret, prefer file input (avoids the `--body -` stdin ambiguity that the startup check now catches):
+
+```bash
+printf '%s' "$YOUR_KEY" > /tmp/key
+gh secret set ZAI_API_KEY --repo owner/name < /tmp/key
+rm -f /tmp/key
+```
+
+### 3. Claude Code's bundled client auth precedence
+
+If the direct probe returns 200 but the action still gets 401, check whether Claude Code's bundled client has its own auth-config precedence (some versions may prefer cached OAuth credentials over env vars).
 
 
 ## Related
