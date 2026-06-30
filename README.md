@@ -21,12 +21,24 @@ A GitHub Action that picks the next arXiv paper most implementable in your codeb
 
 ```bash
 pip install remyxai
+```
+
+Install Outrider on a repo (engine-driven via the Remyx GitHub App — writes the workflow, sets the repo secrets, opens a bot-authored setup PR):
+
+```bash
 remyxai outrider init --repo owner/name --auto-interest
 ```
 
-The [`remyxai` CLI](https://github.com/remyxai/remyxai-cli) installs Outrider on a target repo via the Remyx GitHub App: writes the workflow, sets the repo secrets, and opens a bot-authored setup PR. Your local git isn't touched.
+From then on, the scheduled cron handles it — a draft PR or Issue appears each cycle. Trigger an ad-hoc run on a specific paper without waiting:
 
-Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Settings) and an Anthropic key (`--anthropic-key` or `ANTHROPIC_API_KEY`).
+```bash
+remyxai outrider trigger --repo owner/name --pin-method 2410.20305v2
+remyxai outrider trigger --repo owner/name --pin-method "knowledge distillation"
+```
+
+(Free-text method query or a literal arxiv id; pinning bypasses the candidate-selection pass.)
+
+Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Settings) and an Anthropic key (`--anthropic-key` or `ANTHROPIC_API_KEY`). See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install, per-dispatch routing flags, and secret management.
 
 <details>
 <summary><b>Manual install (5 minutes)</b></summary>
@@ -85,14 +97,14 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 
 ## Costs
 
-~$5–6 in Claude spend per full PR-route run (recommend + inline refinement chain); ~$1–2 for recommend-only with `chain: false`. With the default cadence guard, expect ~$2–4/mo at typical engagement patterns. You bring `ANTHROPIC_API_KEY`; Remyx API usage is covered by your engine.remyx.ai subscription.
+~$2–3 per full PR-route run on Anthropic Opus (recommend + chain); ~$0.50–1 with `chain: false`. Cost varies by provider and model — see [`docs/backends.md`](docs/backends.md). With the default cadence guard, expect ~$1–2/mo at typical engagement. You bring `ANTHROPIC_API_KEY`; Remyx API usage is covered by your engine.remyx.ai subscription.
 
 
 ## Examples
 
 - **[smellslikeml/OpenRLHF PR #6](https://github.com/smellslikeml/OpenRLHF/pull/6)** — CFPO cross-modal grounding regularizer ([arXiv:2606.23206](https://arxiv.org/abs/2606.23206)). Full inline chain ran; canonical-first body shape; landed as ready-for-review.
-- **[smellslikeml/atropos PR #8](https://github.com/smellslikeml/atropos/pull/8)** — RiVER rank-calibrated reward shaping ([arXiv:2606.27369v1](https://arxiv.org/abs/2606.27369v1)). +462 LOC across 4 files: new reward-function module, paper-grounded unit tests (covering RiVER's two failure modes), module registration, directory README. Routed via z.ai's GLM endpoint while Anthropic's self-review chose to ship the same paper as an Issue — see the gist below for the divergence analysis.
-- **[Paired-run analysis: Opus vs GLM-5.2](https://gist.github.com/smellslikeml/36bf4939d76f0f84d113e2ddde5e6d3c)** — controlled A/B across 10 repository forks running the same paper-implementation pipeline with two model providers. Headline finding: identical inputs can produce different artifact verdicts (PR vs Issue) depending on the model's self-review strictness, with one provider ~9× cheaper at ~1.9× slower wall-clock.
+- **[smellslikeml/atropos PR #8](https://github.com/smellslikeml/atropos/pull/8)** — RiVER rank-calibrated reward shaping ([arXiv:2606.27369v1](https://arxiv.org/abs/2606.27369v1)). +462 LOC across 4 files: new reward-function module, paper-grounded unit tests covering RiVER's two failure modes, module registration, directory README.
+- **[Paired-run analysis](https://gist.github.com/smellslikeml/36bf4939d76f0f84d113e2ddde5e6d3c)** — controlled A/B across 10 forks running the same paper-implementation pipeline. Same paper, same chain, different models; surfaces how identical inputs can produce different artifact verdicts (PR vs Issue) depending on the agent's self-review strictness.
 
 
 ## Documentation
