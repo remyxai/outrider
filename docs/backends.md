@@ -34,25 +34,29 @@ Different backends expect different auth headers. Claude Code uses two distinct 
 
 > **Mutual exclusion.** Setting **both** env vars in the runner environment makes Claude Code prefer `ANTHROPIC_API_KEY` (the `x-api-key` path) — which non-Anthropic backends like z.ai reject. The two env vars are not additive; they're mutually exclusive, and the workflow must choose one per dispatch.
 
-The job-level conditional `${{ inputs.backend == 'glm' && '' || secrets.ANTHROPIC_API_KEY }}` does NOT evaluate to `''` when the condition is true — GitHub Actions's `&& ''` short-circuits as falsy and `||` falls through to the third operand. The reliable way to set "one or the other, never both" is a step that writes to `$GITHUB_ENV` (which DOES support empty values cleanly). See the template below.
+The job-level conditional `${{ inputs.provider == 'zai' && '' || secrets.ANTHROPIC_API_KEY }}` does NOT evaluate to `''` when the condition is true — GitHub Actions's `&& ''` short-circuits as falsy and `||` falls through to the third operand. The reliable way to set "one or the other, never both" is a step that writes to `$GITHUB_ENV` (which DOES support empty values cleanly). See the template below.
 
 
-## Workflow template — per-dispatch backend switching
+## Workflow template — per-dispatch provider + model switching
 
-The canonical pattern for A/B-comparing Anthropic vs a non-default backend on the same repo:
+The canonical pattern for A/B-comparing Anthropic vs a non-default backend on the same repo. This matches what `remyxai outrider setup-local` (CLI v0.4.3+) generates:
 
 ```yaml
 on:
   workflow_dispatch:
     inputs:
-      backend:
-        description: 'Which model backend to route Claude Code at.'
+      provider:
+        description: 'Which model provider to route Claude Code at.'
         type: choice
         required: false
         default: 'anthropic'
         options:
           - anthropic
-          - glm
+          - zai
+      model:
+        description: 'Specific model name (e.g. claude-opus-4-7, glm-5.2, glm-4.6). Empty = provider default.'
+        required: false
+        default: ''
       pin-method:
         description: 'Optional arxiv_id or method query.'
         required: false
@@ -63,32 +67,40 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
-      # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN are set in the
-      # 'Configure backend auth' step below (one or the other, never both).
+      # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL
+      # are set in the 'Configure provider auth' step below
+      # (auth env vars are mutually exclusive; ANTHROPIC_MODEL is
+      # optional and only set when the workflow_dispatch input is
+      # non-empty).
     steps:
-      - name: Configure backend auth
+      - name: Configure provider auth
         shell: bash
         env:
           ANTHROPIC_API_KEY_SECRET: ${{ secrets.ANTHROPIC_API_KEY }}
           ZAI_API_KEY_SECRET: ${{ secrets.ZAI_API_KEY }}
+          MODEL_INPUT: ${{ inputs.model }}
         run: |
-          if [ "${{ inputs.backend }}" = "glm" ]; then
+          if [ "${{ inputs.provider }}" = "zai" ]; then
             echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY_SECRET" >> "$GITHUB_ENV"
           else
             echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_SECRET" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$MODEL_INPUT" ]; then
+            echo "ANTHROPIC_MODEL=$MODEL_INPUT" >> "$GITHUB_ENV"
           fi
       - uses: remyxai/outrider@v1
         with:
           interest-id: <uuid>
           pin-method: ${{ inputs.pin-method }}
-          model-base-url: ${{ inputs.backend == 'glm' && 'https://api.z.ai/api/anthropic' || '' }}
+          model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '' }}
 ```
 
 Key properties:
 
-- Default behavior unchanged: `backend=anthropic` (the default) sets `ANTHROPIC_API_KEY` and leaves `model-base-url` empty, so existing customers see no change
-- Single source of auth truth: the `Configure backend auth` step writes one and only one env var; subsequent steps inherit it
-- Per-dispatch switchable: dispatch with `backend=glm` to route through z.ai for that one run; default cron runs stay on Anthropic
+- Default behavior unchanged: `provider=anthropic` (the default) sets `ANTHROPIC_API_KEY` and leaves `model-base-url` empty, so existing customers see no change
+- Single source of auth truth: the `Configure provider auth` step writes one and only one auth env var; subsequent steps inherit it
+- Per-dispatch switchable: dispatch with `provider=zai` to route through z.ai for that one run; default cron runs stay on Anthropic
+- Model selection independent of provider: `--model glm-5.2` and `--model glm-4.6` both work with `--provider zai`; `--model claude-opus-4-7` and `--model claude-sonnet-4-6` both work with `--provider anthropic`
 - Adding a new backend later (Bedrock, Vertex) is a per-elif branch in the Configure step plus a `model-base-url` mapping
 
 
