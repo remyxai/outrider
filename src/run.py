@@ -5179,6 +5179,12 @@ def self_review_diff(
     Never raises and never blocks: a failure here just means the PR
     won't get the self-review section. The integration / stub-density
     checks are the load-bearing gates.
+
+    ``timeout_s`` defaults to 180 for direct callers (kept for backwards
+    compatibility with tests and ad-hoc invocations); the production call
+    site in ``process_target`` passes ``target.claude_timeout_s`` so a
+    customer who bumped ``claude-timeout`` (large monorepo / slower
+    backend) gets the same headroom on self-review as on implementation.
     """
     try:
         diff_proc = subprocess.run(
@@ -7468,7 +7474,11 @@ def process_target(target: Target) -> dict:
         # new code is an orphan (unreachable from any production path), it
         # routes to Issue. This is a REACHABILITY check, not a triviality
         # one — stub density (§3) already covers "the code is too thin".
-        review = self_review_diff(workdir)
+        # Shares the implementation call's ceiling (same rationale as
+        # preflight above): a customer who bumped claude-timeout for a
+        # large monorepo or a slower non-Anthropic backend should get the
+        # same headroom on review without learning about a separate knob.
+        review = self_review_diff(workdir, timeout_s=target.claude_timeout_s)
         result["self_review"] = review or {}
         if review and review.get("is_orphan") is True:
             log.warning(
