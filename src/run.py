@@ -4427,6 +4427,12 @@ def preflight_routing(
     the orchestrator falls through to the regular implementation flow,
     so a failed pre-flight never blocks a PR — it just doesn't save the
     Claude budget.
+
+    ``timeout_s`` defaults to 180 for direct callers (kept for backwards
+    compatibility with tests and ad-hoc invocations); the production call
+    site in ``process_target`` passes ``target.claude_timeout_s`` so a
+    customer who bumped ``claude-timeout`` (large monorepo / slower
+    backend) gets the same headroom on preflight as on implementation.
     """
     spec_path = workdir / BUNDLE_DIR_NAME / "SPEC.md"
     if not spec_path.exists():
@@ -7147,7 +7153,13 @@ def process_target(target: Target) -> dict:
         # 5.5. Pre-flight Issue routing (§6). Cheap Claude pass that
         # decides PR vs Issue before we spend the implementation budget.
         # Failures here fall through — they don't block the PR path.
-        preflight = preflight_routing(workdir, package)
+        # Shares the implementation call's ceiling so a customer who
+        # bumped claude-timeout for a large monorepo (or a slower
+        # non-Anthropic backend) gets the same headroom on preflight
+        # without having to know about a separate knob.
+        preflight = preflight_routing(
+            workdir, package, timeout_s=target.claude_timeout_s,
+        )
         result["preflight_decision"] = (
             preflight.get("decision") if preflight else "(skipped)"
         )

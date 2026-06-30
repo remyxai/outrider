@@ -191,9 +191,11 @@ inputs:
     default: '25'
   claude-timeout:
     description: |
-      Wall-clock seconds for the Claude Code implementation step. Large
-      repos can exceed the old 600s; default is 900. Bump it for very large
-      codebases, lower it to cap cost.
+      Wall-clock seconds for the Claude Code agent calls (preflight
+      routing + implementation). Large repos can exceed the old 600s;
+      default is 900. Bump it for very large codebases or slower non-
+      default backends; lower it to cap cost. Both stages share the
+      same ceiling so a single knob covers per-dispatch budget tuning.
     required: false
     default: '900'
   pin-arxiv:
