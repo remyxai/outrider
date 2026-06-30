@@ -1,7 +1,10 @@
 ---
-type: architecture_overview
+type: Architecture Overview
+title: Architecture
 description: Selection taxonomy, gating logic, and the full Outrider pipeline.
+resource: https://github.com/remyxai/outrider/blob/main/docs/architecture.md
 tags: [outrider, architecture, selection-pass, refinement-chain]
+timestamp: 2026-06-30T03:57:23Z
 ---
 
 # Architecture

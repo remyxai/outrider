@@ -1,7 +1,10 @@
 ---
-type: customization_guide
-description: How to route Outrider's Claude Code agent at any Anthropic-Messages-compatible model backend — z.ai's GLM Coding Plan, AWS Bedrock, GCP Vertex, on-prem proxies — including the auth-header gotchas, the workflow template, cost telemetry behavior, and a 401-debug checklist.
-tags: [outrider, customization, model-backend, glm, bedrock, vertex, configuration]
+type: Customization Guide
+title: Model backends
+description: Route Outrider's agent at non-default model backends (z.ai GLM, Bedrock, Vertex, on-prem) — auth, workflow template, cost telemetry, debug.
+resource: https://github.com/remyxai/outrider/blob/main/docs/backends.md
+tags: [outrider, customization, model-backends, glm, bedrock, vertex]
+timestamp: 2026-06-30T03:57:23Z
 ---
 
 # Model backends

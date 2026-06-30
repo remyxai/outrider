@@ -1,7 +1,10 @@
 ---
-type: weekly_summary_guide
+type: Weekly Summary Guide
+title: Weekly Discussion summary (opt-in)
 description: Opt-in weekly-summary mode setup — post a rolling digest of Outrider's work as a Discussion comment.
+resource: https://github.com/remyxai/outrider/blob/main/docs/weekly-summary.md
 tags: [outrider, weekly-summary, opt-in]
+timestamp: 2026-06-30T03:57:23Z
 ---
 
 # Weekly Discussion summary (opt-in)

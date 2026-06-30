@@ -1,3 +1,12 @@
+---
+type: Calibration Log
+title: Diff Risk Score calibration runs
+description: Per-branch Diff Risk Score values across the portfolio with weight recalibration notes.
+resource: https://github.com/remyxai/outrider/blob/main/docs/diff_risk_calibration_runs.md
+tags: [outrider, diff-risk, calibration, internal-notes]
+timestamp: 2026-06-30T03:57:23Z
+---
+
 # Diff Risk Score calibration runs
 
 Each row is a `remyx-recommendation/*` branch scored against its merge-base with `origin/main`. Sorted by score descending so disputed-band candidates surface first.

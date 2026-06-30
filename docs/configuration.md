@@ -1,7 +1,10 @@
 ---
-type: configuration_reference
+type: Configuration Reference
+title: Configuration reference
 description: Inputs, outputs, and status codes for the Outrider action.
+resource: https://github.com/remyxai/outrider/blob/main/docs/configuration.md
 tags: [outrider, configuration, reference]
+timestamp: 2026-06-30T03:57:23Z
 ---
 
 # Configuration reference

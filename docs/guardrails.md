@@ -1,7 +1,10 @@
 ---
-type: guardrails_spec
+type: Guardrails Spec
+title: Guardrails
 description: Path allowlist, block list, and edit-size caps the Outrider agent operates under.
+resource: https://github.com/remyxai/outrider/blob/main/docs/guardrails.md
 tags: [outrider, guardrails, security]
+timestamp: 2026-06-30T03:57:23Z
 ---
 
 # Guardrails

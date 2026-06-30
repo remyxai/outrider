@@ -1,7 +1,10 @@
 ---
-type: customization_guide
+type: Customization Guide
+title: Customization
 description: How to tailor what Outrider does on your repo — the knobs you control and the signals it reads.
+resource: https://github.com/remyxai/outrider/blob/main/docs/customization.md
 tags: [outrider, customization, configuration]
+timestamp: 2026-06-30T03:57:23Z
 ---
 
 # Customization

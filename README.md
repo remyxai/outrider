@@ -49,6 +49,15 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
      schedule:
        - cron: '0 14 * * 1'  # Mondays 14:00 UTC; pick any cadence
      workflow_dispatch:
+       inputs:
+         pin-method:
+           description: 'Optional arxiv_id or method query to implement directly.'
+           required: false
+           default: ''
+         claude-timeout:
+           description: 'Wall-clock seconds for Claude Code (preflight + implementation).'
+           required: false
+           default: '900'
    jobs:
      recommend:
        runs-on: ubuntu-latest
@@ -63,7 +72,11 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
          - uses: remyxai/outrider@v1
            with:
              interest-id: 'YOUR-INTEREST-UUID-HERE'
+             pin-method: ${{ inputs.pin-method }}
+             claude-timeout: ${{ inputs.claude-timeout }}
    ```
+
+   For multi-provider routing (route this run at z.ai's GLM endpoint vs Anthropic per dispatch), see [`docs/backends.md`](docs/backends.md) — adds a `provider` workflow_dispatch input + a `Configure provider auth` step. `outrider setup-local` (v0.4.3+) generates that shape by default.
 
 6. **First run**: *Actions tab → Outrider → Run workflow*. Takes 4–6 minutes. A draft PR or Issue appears when complete.
 
@@ -78,7 +91,8 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 ## Examples
 
 - **[smellslikeml/OpenRLHF PR #6](https://github.com/smellslikeml/OpenRLHF/pull/6)** — CFPO cross-modal grounding regularizer ([arXiv:2606.23206](https://arxiv.org/abs/2606.23206)). Full inline chain ran; canonical-first body shape; landed as ready-for-review.
-- **[smellslikeml/NeMo-Curator Issue #5](https://github.com/smellslikeml/NeMo-Curator/issues/5)** — FinerWeb-10BT line-level filtering ([arXiv:2501.07314](https://arxiv.org/abs/2501.07314)). Paper-anchored fidelity audit (no public reference impl); self-review correctly routed to Issue.
+- **[smellslikeml/atropos PR #8](https://github.com/smellslikeml/atropos/pull/8)** — RiVER rank-calibrated reward shaping ([arXiv:2606.27369v1](https://arxiv.org/abs/2606.27369v1)). +462 LOC across 4 files: new reward-function module, paper-grounded unit tests (covering RiVER's two failure modes), module registration, directory README. Routed via z.ai's GLM endpoint while Anthropic's self-review chose to ship the same paper as an Issue — see the gist below for the divergence analysis.
+- **[Paired-run analysis: Opus vs GLM-5.2](https://gist.github.com/smellslikeml/36bf4939d76f0f84d113e2ddde5e6d3c)** — controlled A/B across 10 repository forks running the same paper-implementation pipeline with two model providers. Headline finding: identical inputs can produce different artifact verdicts (PR vs Issue) depending on the model's self-review strictness, with one provider ~9× cheaper at ~1.9× slower wall-clock.
 
 
 ## Documentation
@@ -87,6 +101,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 - **[Customization](docs/customization.md)** — how to tailor Outrider to your repo + signals it reads
 - **[Architecture](docs/architecture.md)** — selection taxonomy, pipeline, refinement chain
 - **[Guardrails](docs/guardrails.md)** — what the agent can and can't modify
+- **[Model backends](docs/backends.md)** — route at any Anthropic-Messages-compatible backend (z.ai's GLM, Bedrock, Vertex, on-prem); auth-header matrix; per-dispatch backend-switching workflow template
 - **[Weekly summary mode](docs/weekly-summary.md)** — opt-in rolling digest comments
 
 
