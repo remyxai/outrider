@@ -3876,6 +3876,102 @@ _BACKEND_RATES: dict[str, tuple[float, float, float]] = {
 }
 
 
+def _validate_claude_auth_env() -> tuple[bool, list[str]]:
+    """Pre-flight check on the Claude Code subprocess auth env.
+
+    Catches the common misconfigurations that otherwise surface as
+    opaque HTTP 401s from the agent CLI, costing the operator a full
+    run's worth of debugging:
+
+    - Missing auth env var for the configured backend.
+    - Truncated / placeholder secret values: literal ``"-"`` (the
+      ``gh secret set --body -`` stdin-disconnect ambiguity), empty,
+      length below 8 chars (any plausible API key is longer).
+    - Leading / trailing whitespace from copy-paste — warns and uses
+      the stripped value rather than failing.
+    - Both ``ANTHROPIC_API_KEY`` and ``ANTHROPIC_AUTH_TOKEN`` set
+      non-empty when a non-default backend is configured. Claude Code
+      prefers the ``x-api-key`` (API_KEY) path; non-Anthropic backends
+      usually reject it. Warns rather than fails — the configured
+      AUTH_TOKEN may still be the intended one, but the customer
+      almost always has a workflow bug if both are set.
+
+    Returns ``(ok, warnings)`` — ``ok=False`` is a hard fail and the
+    caller should exit non-zero; warnings are logged but non-fatal.
+    Values are never echoed in any returned message or log line; the
+    diagnostic carries length + an 8-char SHA-256 prefix only.
+    """
+    import hashlib
+
+    def _shape(name: str, val: str) -> str:
+        if not val:
+            return f"{name}=(empty)"
+        sha8 = hashlib.sha256(val.encode()).hexdigest()[:8]
+        return f"{name} length={len(val)} sha8={sha8}"
+
+    warnings: list[str] = []
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+
+    non_default = bool(base_url) and "api.anthropic.com" not in base_url
+    if non_default:
+        primary_name = "ANTHROPIC_AUTH_TOKEN"
+        primary_val = auth_token
+        if api_key and auth_token:
+            warnings.append(
+                "Both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set "
+                "while a non-default backend is configured. Claude Code "
+                "will prefer ANTHROPIC_API_KEY (x-api-key), which "
+                "non-Anthropic backends typically reject with HTTP 401. "
+                "Set only ANTHROPIC_AUTH_TOKEN for non-default backends."
+            )
+    else:
+        primary_name = "ANTHROPIC_API_KEY"
+        primary_val = api_key
+
+    if not primary_val:
+        log.error(
+            "  ✗ auth check: %s is not set — agent calls will fail with "
+            "HTTP 401. Set the secret on your repo and dispatch again.",
+            primary_name,
+        )
+        return False, warnings
+
+    if primary_val == "-":
+        log.error(
+            "  ✗ auth check: %s value is the literal '-'. Usually means "
+            "`gh secret set --body -` was called with disconnected stdin. "
+            "Re-set via file input: "
+            "`printf '%%s' \"$KEY\" > /tmp/k && gh secret set %s "
+            "--repo owner/name < /tmp/k`.",
+            primary_name, primary_name,
+        )
+        return False, warnings
+
+    if len(primary_val) < 8:
+        log.error(
+            "  ✗ auth check: %s is suspiciously short — likely truncated. %s",
+            primary_name, _shape(primary_name, primary_val),
+        )
+        return False, warnings
+
+    stripped = primary_val.strip()
+    if stripped != primary_val:
+        warnings.append(
+            f"{primary_name} has leading/trailing whitespace; using "
+            f"stripped value. Original {_shape(primary_name, primary_val)}; "
+            f"stripped length {len(stripped)}."
+        )
+        os.environ[primary_name] = stripped
+
+    log.debug(
+        "  auth check: %s OK (%s)",
+        primary_name, _shape(primary_name, os.environ.get(primary_name, "")),
+    )
+    return True, warnings
+
+
 def _detect_backend(base_url: str) -> tuple[str, tuple[float, float, float] | None]:
     """Identify the Anthropic-Messages-compat backend behind ANTHROPIC_BASE_URL.
 
@@ -12216,6 +12312,16 @@ def main():
                          f"(no rate table for {backend_name})")
         log.info(f"  routing Claude Code via {target.model_base_url} "
                  f"({cost_note})")
+    # Validate the auth env shape before any agent call. Catches the
+    # common misconfigurations (missing var, literal '-' from
+    # gh-secret-set ambiguity, whitespace, mutual-exclusion on non-
+    # default backends) that otherwise surface as opaque 401s after a
+    # full run's worth of clone + spec-bundle work.
+    auth_ok, auth_warnings = _validate_claude_auth_env()
+    for w in auth_warnings:
+        log.warning("  ⚠ auth check: %s", w)
+    if not auth_ok:
+        sys.exit(2)
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
     if mode == "weekly-summary":

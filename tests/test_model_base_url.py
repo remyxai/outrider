@@ -100,6 +100,11 @@ def _set_minimum_main_env(monkeypatch):
     monkeypatch.setenv(
         "INPUT_INTEREST_ID", "00000000-0000-0000-0000-000000000000"
     )
+    # Startup auth check requires either ANTHROPIC_API_KEY (default
+    # backend) or ANTHROPIC_AUTH_TOKEN (non-default). Default path is
+    # what these tests exercise unless they override ANTHROPIC_BASE_URL.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fakebutlongenough")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "zai-test-fakebutlongenough")
 
 
 def test_main_exports_anthropic_base_url_when_set(monkeypatch):

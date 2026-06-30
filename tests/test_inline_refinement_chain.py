@@ -36,6 +36,10 @@ def _base_env(monkeypatch, **overrides):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TARGET_REPO", "owner/repo")
     monkeypatch.setenv("INPUT_INTEREST_ID", "11111111-1111-1111-1111-111111111111")
+    # Real customer workflows always set an API key; the startup auth
+    # check would hard-fail otherwise. Tests that want to exercise the
+    # auth-check failure path do so explicitly elsewhere.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fakebutlongenough")
     for var, value in overrides.items():
         monkeypatch.setenv(var, value)
 
