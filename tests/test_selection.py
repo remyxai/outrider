@@ -294,3 +294,60 @@ def test_spec_bundle_neutral_note_on_fallback(tmp_path):
     )
     spec = (tmp_path / ".remyx-recommendation" / "SPEC.md").read_text()
     assert "no separate selection rationale" in spec
+
+
+# ─── selection timeout inherits target.claude_timeout_s ────────────────
+
+
+def test_selection_timeout_defaults_to_target_claude_timeout_s(tmp_path, monkeypatch):
+    """When REMYX_SELECTION_TIMEOUT_S is unset and no explicit timeout_s
+    is passed, selection uses target.claude_timeout_s — so a customer
+    who bumped `claude-timeout` for a slower backend gets the same
+    headroom on the agentic selection pass. Same pattern as preflight
+    (v1.6.28) and audit (v1.6.29)."""
+    monkeypatch.delenv("REMYX_SELECTION_TIMEOUT_S", raising=False)
+    geo, count = _make_candidates()
+    captured = {}
+
+    def fake_streaming(wd, prompt, timeout_s, max_turns=None):
+        captured["timeout_s"] = timeout_s
+        return (True, '{"chosen_index": 0, "reasoning": "r"}', [])
+
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_streaming)
+    target = Target(repo="example/repo", interest_id="iid", claude_timeout_s=1500)
+    run.select_recommendation(tmp_path, "pkg", [geo, count], target=target)
+    assert captured["timeout_s"] == 1500
+
+
+def test_selection_timeout_env_var_overrides_target(tmp_path, monkeypatch):
+    """REMYX_SELECTION_TIMEOUT_S, if set, takes precedence — escape
+    hatch for CI scenarios that want a tighter selection ceiling while
+    leaving implementation timeout large."""
+    monkeypatch.setenv("REMYX_SELECTION_TIMEOUT_S", "300")
+    geo, count = _make_candidates()
+    captured = {}
+
+    def fake_streaming(wd, prompt, timeout_s, max_turns=None):
+        captured["timeout_s"] = timeout_s
+        return (True, '{"chosen_index": 0, "reasoning": "r"}', [])
+
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_streaming)
+    target = Target(repo="example/repo", interest_id="iid", claude_timeout_s=1500)
+    run.select_recommendation(tmp_path, "pkg", [geo, count], target=target)
+    assert captured["timeout_s"] == 300
+
+
+def test_selection_timeout_falls_back_to_480_without_target(tmp_path, monkeypatch):
+    """Test/ad-hoc callers that don't pass a target keep the legacy
+    480s default — preserves backwards compatibility for direct callers."""
+    monkeypatch.delenv("REMYX_SELECTION_TIMEOUT_S", raising=False)
+    geo, count = _make_candidates()
+    captured = {}
+
+    def fake_streaming(wd, prompt, timeout_s, max_turns=None):
+        captured["timeout_s"] = timeout_s
+        return (True, '{"chosen_index": 0, "reasoning": "r"}', [])
+
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_streaming)
+    run.select_recommendation(tmp_path, "pkg", [geo, count])  # no target
+    assert captured["timeout_s"] == 480

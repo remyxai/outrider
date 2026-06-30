@@ -4929,7 +4929,17 @@ def select_recommendation(
     # prompt size; further bumps should track new feature land that
     # extends the agent's per-candidate verification cost.
     if timeout_s is None:
-        timeout_s = int(os.environ.get("REMYX_SELECTION_TIMEOUT_S", "480"))
+        # Selection inherits the run's claude-timeout budget by default —
+        # same pattern as preflight (v1.6.28) and audit (v1.6.29). On
+        # slower non-default backends the legacy 480s default was tight
+        # enough to time out agentic selection passes and fall back to
+        # the top-ranked candidate, silently losing the verification
+        # signal. REMYX_SELECTION_TIMEOUT_S stays as an env-var escape
+        # hatch for CI scenarios that want a tighter ceiling.
+        timeout_s = int(
+            os.environ.get("REMYX_SELECTION_TIMEOUT_S", "")
+            or (target.claude_timeout_s if target is not None else 480)
+        )
     log.info(
         f"  → agentic selection over {len(candidates)} candidates "
         f"(max-turns={max_turns}, timeout={timeout_s}s)"
