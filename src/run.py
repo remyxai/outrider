@@ -2636,7 +2636,16 @@ def audit_and_refine_pool(
         .replace("__BROAD_N__", str(len(broad_candidates)))
         .replace("__BROAD_BRIEF__", _render_broad_brief(broad_candidates))
     )
-    timeout_s = int(os.environ.get("REMYX_AUDIT_TIMEOUT_S", "120"))
+    # Audit timeout inherits the run's claude-timeout budget by default so
+    # a customer who bumped `claude-timeout` for a slower backend (e.g.
+    # GLM on a large monorepo) gets the same headroom on the audit
+    # pass — same pattern as the preflight call. REMYX_AUDIT_TIMEOUT_S
+    # is kept as an env-var escape hatch for cases that need a tighter
+    # ceiling specifically on the audit (e.g. CI budget bounds).
+    timeout_s = int(
+        os.environ.get("REMYX_AUDIT_TIMEOUT_S", "")
+        or target.claude_timeout_s
+    )
     audit_max_turns = int(os.environ.get("REMYX_AUDIT_MAX_TURNS", "5"))
     log.info(
         f"  → audit pass over {len(broad_candidates)} broad candidates "

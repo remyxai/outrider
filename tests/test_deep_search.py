@@ -416,3 +416,56 @@ def test_fetch_repo_readme_returns_empty_on_failure(monkeypatch):
         raise RuntimeError("404")
     monkeypatch.setattr(run, "gh_api", fake)
     assert run._fetch_repo_readme("r/x") == ""
+
+
+# ─── audit timeout inherits target.claude_timeout_s ────────────────────
+
+
+def test_audit_timeout_defaults_to_target_claude_timeout_s(monkeypatch):
+    """When REMYX_AUDIT_TIMEOUT_S is unset, the audit pass uses
+    target.claude_timeout_s — so a customer who bumped `claude-timeout`
+    for a slower backend (e.g. GLM on a large monorepo) gets the same
+    headroom on the audit pass without needing to know about a separate
+    env knob. Same pattern as preflight in v1.6.28."""
+    monkeypatch.delenv("REMYX_AUDIT_TIMEOUT_S", raising=False)
+    broad = _make_broad(["2601.00001v1"])
+    captured = {}
+
+    def fake_oneshot(workdir, prompt, timeout_s, max_turns=None):
+        captured["timeout_s"] = timeout_s
+        return (True, _audit_json([]))
+
+    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_fetch_repo_readme", lambda *a, **k: "")
+    monkeypatch.setattr(run, "_recent_outrider_issue_titles", lambda *a, **k: [])
+
+    target = Target(repo="example/repo", interest_id="iid", claude_timeout_s=1500)
+    run.audit_and_refine_pool(
+        target, broad,
+        interest_name="X", interest_context="ctx", experiment_history="",
+    )
+    assert captured["timeout_s"] == 1500
+
+
+def test_audit_timeout_env_var_overrides_target(monkeypatch):
+    """REMYX_AUDIT_TIMEOUT_S, if set, takes precedence — kept as an
+    escape hatch for CI scenarios that want a tighter audit ceiling
+    while leaving the implementation timeout large."""
+    monkeypatch.setenv("REMYX_AUDIT_TIMEOUT_S", "300")
+    broad = _make_broad(["2601.00001v1"])
+    captured = {}
+
+    def fake_oneshot(workdir, prompt, timeout_s, max_turns=None):
+        captured["timeout_s"] = timeout_s
+        return (True, _audit_json([]))
+
+    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    monkeypatch.setattr(run, "_fetch_repo_readme", lambda *a, **k: "")
+    monkeypatch.setattr(run, "_recent_outrider_issue_titles", lambda *a, **k: [])
+
+    target = Target(repo="example/repo", interest_id="iid", claude_timeout_s=1500)
+    run.audit_and_refine_pool(
+        target, broad,
+        interest_name="X", interest_context="ctx", experiment_history="",
+    )
+    assert captured["timeout_s"] == 300
