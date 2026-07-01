@@ -544,6 +544,32 @@ behavior, prefer rewriting the surface expression to avoid the lint
 warning rather than adding ``# noqa`` — explicit suppression should be
 rare and signaled, not the cleanup path.
 
+# Auto-format scope
+
+When you invoke an auto-formatter (``ruff format``, ``black``, ``isort``,
+``prettier``, etc.), it will reformat every line in scope — not just the
+lines you semantically modified. The resulting diff carries cosmetic
+whitespace / line-join / blank-line changes on lines you never touched,
+which dilutes the semantic change and makes review harder.
+
+Prefer **diff-scoped formatting**. For Python, that means ``darker``
+(pipx-installable, wraps ``black``/``ruff format``/``isort`` and only
+applies formatting to lines that differ from HEAD)::
+
+    pipx install darker
+    darker --revision HEAD <files-you-modified>
+
+For other languages the tooling is uneven — ``prettier`` and ``rustfmt``
+don't have native line-range flags. In those cases, prefer *no
+auto-format* over full-file reformat: small formatting drift in a diff
+is fine; format churn on unrelated lines is not.
+
+If you can't scope the formatter to your changes, skip auto-format
+entirely and hand-format only the lines you modified. A diff that shows
+the semantic change without cosmetic noise is more takeover-friendly
+than one that's uniformly formatted at the cost of a much larger review
+surface.
+
 # Honesty rules
 
 - If the public surface of your new module is dominated by `TODO`,
