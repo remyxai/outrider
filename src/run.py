@@ -713,7 +713,7 @@ iteratively. For your most promising candidate(s):
     extends (`gh issue list --repo <repo> --state open --search "..."`
     or `gh issue view <n> --repo <repo>` for specific Issues).
 
-**Four legitimate integration shapes — classify each candidate you
+__ENVIRONMENT_HINT__**Four legitimate integration shapes — classify each candidate you
 consider.** A candidate that does NOT fit one of these four shapes is
 a structural mismatch and should be rejected.
 
@@ -3827,6 +3827,7 @@ def _load_environments_md(workdir: Path, max_bytes: int = 4096) -> str:
 def write_spec_bundle(
     workdir: Path, target: Target, rec: Recommendation, package: str,
     selection_note: str = "",
+    env_body: str | None = None,
 ) -> None:
     """Write the .remyx-recommendation/ bundle that Claude Code reads as its brief.
 
@@ -3894,7 +3895,10 @@ def write_spec_bundle(
     # servers, or other agent-usable tooling attached to this run.
     # Only written when non-empty; the invocation's file list refs it
     # only when it's present.
-    environment_body = _load_environments_md(workdir)
+    # Accept a pre-loaded env_body when the caller has already loaded it —
+    # the selection pass injects the same body upstream, so avoid a second
+    # load. None means "not pre-loaded, load now."
+    environment_body = env_body if env_body is not None else _load_environments_md(workdir)
     environment_file_ref = ""
     if environment_body:
         (bundle / "ENVIRONMENT.md").write_text(_ENVIRONMENT_MD_TEMPLATE.format(
@@ -4990,11 +4994,31 @@ def _fallback_candidate(viable: list[Recommendation]) -> Recommendation:
     return max(viable, key=lambda c: (c.relevance_score, c.license_compat))
 
 
+def _render_environment_hint(env_body: str) -> str:
+    """Render the workflow-attached tooling hint block for the selection prompt.
+
+    Injecting ENVIRONMENTS.md at selection time means the selection agent
+    can leverage workflow-authored tools (AST search skills, MCP servers,
+    custom search) while VERIFYING candidates — the load-bearing grounding
+    stage. Empty env_body yields empty string so behavior is unchanged for
+    runs without an ENVIRONMENTS.md.
+    """
+    if not env_body.strip():
+        return ""
+    return (
+        "**Workflow-attached tooling available for verification** "
+        "(from ENVIRONMENTS.md; prefer these over generic search when the "
+        "described tool fits the task):\n\n"
+        f"{env_body}\n\n"
+    )
+
+
 def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
     target: "Target | None" = None,
     timeout_s: int | None = None,
     discharged_issues: list[dict] | None = None,
+    env_body: str = "",
 ) -> dict | None:
     """Claude pass that picks the most implementable candidate from the
     lookback pool, given the target repo's module layout.
@@ -5030,6 +5054,7 @@ def select_recommendation(
             _render_candidate_brief(candidates, discharged=discharged_index),
         )
         .replace("__LAYOUT__", layout)
+        .replace("__ENVIRONMENT_HINT__", _render_environment_hint(env_body))
     )
     # Bound the agentic flow — selection is verification, not a full
     # implementation session. 25 turns covers a few `gh code-search` +
@@ -6992,6 +7017,11 @@ def process_target(target: Target) -> dict:
     try:
         package = detect_package_name(workdir)
         default_branch = detect_default_branch(workdir)
+        # Load ENVIRONMENTS.md once, early, so the selection pass sees
+        # workflow-attached tooling before it verifies candidates. Thread
+        # the body through to both selection and write_spec_bundle to
+        # avoid a second load.
+        env_body = _load_environments_md(workdir)
         log.info(f"  detected package: {package}  default branch: {default_branch}")
 
         pinned_idx = None
@@ -7022,6 +7052,7 @@ def process_target(target: Target) -> dict:
             selection = select_recommendation(
                 workdir, package, viable, target=target,
                 discharged_issues=open_issues,
+                env_body=env_body,
             )
             # Attach exploration-coverage telemetry once, before the branch
             # handling — every downstream path returns this same `result`, so
@@ -7225,14 +7256,13 @@ def process_target(target: Target) -> dict:
                 result["selection_rejected"] = _enrich_selection_rejected(
                     selection.get("rejected") or [], viable
                 )
-                # REMYX-172 experiment: the categorical substitution guard
-                # (`shape in ("replacement", "simplification") → auto-Issue`)
-                # used to fire here. Removed on this branch so replacement /
-                # simplification runs proceed to implementation; the
-                # downstream check_integration validator catches diffs that
-                # actually touch dep files or otherwise violate PR guardrails,
-                # using MEASURED dep-file churn instead of the selection's
-                # shape label as the input.
+                # The former substitution guard fired here on
+                # `shape in ("replacement", "simplification")` and short-
+                # circuited to Issue. Removed: the workflow's path allowlist
+                # (`DEFAULT_ALLOWLIST_GLOBS`) already blocks dep files, and
+                # `check_integration()` measures oversized existing-file
+                # edits and orphan additions on the actual diff — replacing
+                # the shape label with measured evidence.
                 shape = (selection.get("integration_shape") or "addition").lower().strip()
                 result["selection_integration_shape"] = shape
                 result["selection_contract_match"] = (
@@ -7264,6 +7294,7 @@ def process_target(target: Target) -> dict:
         write_spec_bundle(
             workdir, target, rec, package,
             selection_note=result.get("selection_reasoning", ""),
+            env_body=env_body,
         )
 
         # 5.5. Pre-flight Issue routing (§6). Cheap Claude pass that
