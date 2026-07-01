@@ -93,6 +93,8 @@ Workflow step (see [`cocoindex-code`](https://github.com/cocoindex-io/cocoindex-
 
 The agent's brief will now include a section describing the skill, so it knows to reach for `ccc` when the task calls for it.
 
+See [`examples/workflows/with-cocoindex.yml`](../examples/workflows/with-cocoindex.yml) for the full copy-pasteable workflow.
+
 ## What Outrider does with the file
 
 1. Reads it from the first location found in the search order

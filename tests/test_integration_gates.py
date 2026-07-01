@@ -169,6 +169,89 @@ def test_pure_edit_with_no_new_callable_is_not_gated():
     assert ok
 
 
+# ── 2b. surgical wrapper + spillover to a new module ──────────────────────
+#
+# The "small wrapper edit at an existing file + bulk implementation in a
+# new module" pattern is the surgical shape we want to encourage. Without
+# the spillover-aware limit, an additive wrapper edit that exceeds 50
+# lines would flip a legitimately good diff to Issue. But rewrites of
+# existing files (deleted > 0) should still trip the tighter cap — that's
+# the case the threshold exists for.
+
+
+def _oversize_wrapper_edit(bp: Path, n_lines: int) -> None:
+    """Append n_lines of purely-additive wrapper code to an existing file."""
+    body = "".join(
+        f"    def wrapper_fn_{i}(self, x):\n        return x\n"
+        for i in range(n_lines // 2)
+    )
+    bp.write_text(bp.read_text() + body)
+
+
+def test_additive_wrapper_with_spillover_passes_higher_cap():
+    """+55/-0 to an existing file + a substantial new module = allowed."""
+    wd = _base_repo()
+    bp = wd / "vqasynth" / "benchmarks.py"
+    # 55 additive lines — over the 50-line base cap.
+    bp.write_text(
+        bp.read_text()
+        + "    def calibrated_score(self, x):\n        from vqasynth.newcap import compute\n"
+        + "        return compute(x)\n"
+        + "".join(f"    # padding line {i}\n" for i in range(52))
+    )
+    # Substantial new module (>MIN_SPILLOVER_LINES = 100) — the actual logic.
+    (wd / "vqasynth" / "newcap.py").write_text(
+        "def compute(x):\n    return x\n"
+        + "".join(f"# implementation detail {i}\n" for i in range(120))
+    )
+    (wd / "tests" / "test_new.py").write_text(
+        "from vqasynth.benchmarks import BenchmarkRunner\n"
+        "def test_c():\n    BenchmarkRunner().calibrated_score(1)\n"
+    )
+    ok, violations = run.check_integration(wd, TGT, "vqasynth")
+    assert ok, f"expected pass, got violations: {violations}"
+
+
+def test_inplace_oversized_edit_still_blocked_even_with_spillover():
+    """An in-place rewrite (deleted > 0) gets the tight cap even with spillover."""
+    wd = _base_repo()
+    bp = wd / "vqasynth" / "benchmarks.py"
+    # Replace the existing "return x" body with a longer implementation.
+    # git diff will report deleted > 0 because "return x" line is gone.
+    bp.write_text(
+        "class BenchmarkRunner:\n"
+        "    def score(self, x):\n"
+        + "".join(f"        line_{i} = {i}\n" for i in range(55))
+        + "        return sum([line_0, line_1, line_2])\n"
+    )
+    # Add a large new module too — but spillover only helps additive edits.
+    (wd / "vqasynth" / "newcap.py").write_text(
+        "def compute(x):\n    return x\n"
+        + "".join(f"# line {i}\n" for i in range(120))
+    )
+    (wd / "tests" / "test_x.py").write_text(
+        "from vqasynth.newcap import compute\ndef test_c():\n    compute(1)\n"
+    )
+    ok, violations = run.check_integration(wd, TGT, "vqasynth")
+    # An in-place rewrite ignores the spillover bonus.
+    assert not ok
+    assert any("oversized edit to existing file" in v for v in violations)
+
+
+def test_additive_edit_without_spillover_still_capped():
+    """+55/-0 with no substantial new module = still gets the tight cap."""
+    wd = _base_repo()
+    bp = wd / "vqasynth" / "benchmarks.py"
+    bp.write_text(
+        bp.read_text()
+        + "    def added(self, x):\n        return x\n"
+        + "".join(f"    # padding {i}\n" for i in range(55))
+    )
+    ok, violations = run.check_integration(wd, TGT, "vqasynth")
+    assert not ok
+    assert any("oversized edit to existing file" in v for v in violations)
+
+
 # ── 3. changed_files sees files in brand-new directories ───────────────────
 
 def test_changed_files_expands_new_directory():

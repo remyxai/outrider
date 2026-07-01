@@ -1,0 +1,75 @@
+name: Outrider (with cocoindex-code AST search)
+
+# Copy-pasteable workflow that installs cocoindex-code as a Claude Code
+# skill and describes its availability via ENVIRONMENTS.md so the Outrider
+# agent knows to reach for it during selection and implementation.
+#
+# See docs/environments.md for the full ENVIRONMENTS.md convention.
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'  # Mondays 14:00 UTC; pick any cadence
+  workflow_dispatch:
+    inputs:
+      pin-method:
+        description: 'Optional arxiv_id or method query to implement directly.'
+        required: false
+        default: ''
+      claude-timeout:
+        description: 'Wall-clock seconds for Claude Code (preflight + implementation).'
+        required: false
+        default: '900'
+
+jobs:
+  recommend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cocoindex-code as a Claude Code skill
+        run: |
+          git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
+          pipx install 'cocoindex-code[full]'
+          mkdir -p ~/.claude/skills/
+          ln -sfn /tmp/cocoindex-code ~/.claude/skills/cocoindex-code
+
+      - name: Describe environment to Outrider (ENVIRONMENTS.md)
+        run: |
+          cat > "$GITHUB_WORKSPACE/ENVIRONMENTS.md" <<'EOF'
+          ---
+          type: Workflow Environment
+          title: cocoindex-code AST search available
+          description: cocoindex-code AST-based semantic code search is pre-installed as a Claude Code skill.
+          resource: https://github.com/cocoindex-io/cocoindex-code
+          tags: [outrider, environment, cocoindex-code, ast-search]
+          timestamp: 2026-07-01T00:00:00Z
+          ---
+
+          # Environment: cocoindex-code AST search
+
+          ## Available tools
+
+          - **`ccc` CLI** (AST-based semantic code search across the cloned repo).
+            Prefer over reading entire large files when locating functions,
+            classes, or specific code patterns. Multi-language via tree-sitter.
+
+          ## Suggested use during implementation
+
+          - For "find the function that does X" queries, invoke the semantic-search
+            skill rather than Read/Grep on speculation.
+          - For files > 500 LOC where you only need one function, prefer AST search
+            + targeted Read over reading the whole file.
+          EOF
+
+      - uses: remyxai/outrider@v1
+        with:
+          interest-id: 'YOUR-INTEREST-UUID-HERE'
+          pin-method: ${{ inputs.pin-method }}
+          claude-timeout: ${{ inputs.claude-timeout }}
