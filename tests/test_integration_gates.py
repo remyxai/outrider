@@ -306,9 +306,29 @@ def test_self_review_renders_value_first():
     assert "Delivers (from the paper)" in md
     assert "Intentionally out of scope" in md
     assert "Stubbed" not in md and "left out" not in md
+    # Orphan flag should not appear when is_orphan is absent or false.
+    assert "orphan-shaped" not in md
     # Legacy keys still render via the fallback.
     md2 = run._render_self_review_section({"implemented": ["x"], "stubbed": ["y"]})
     assert "- x" in md2 and "- y" in md2
+
+
+def test_self_review_surfaces_orphan_flag_when_set():
+    """When is_orphan is true the PR body carries a prominent warning so
+    the maintainer sees the verdict without the pipeline downgrading the
+    PR to an Issue on a boolean flag."""
+    md = run._render_self_review_section({
+        "delivered": ["EncoderHallucinationDetector metric"],
+        "scoped_out": ["training and eval sweep"],
+        "call_site": "opik.evaluation.metrics",
+        "is_orphan": True,
+        "honest_summary": "Library API addition — external callers only.",
+    })
+    assert "orphan-shaped" in md
+    assert "review before merging" in md
+    # Still shows the value-first sections above the warning.
+    assert "What this PR delivers" in md
+    assert "EncoderHallucinationDetector" in md
 
 
 def test_detect_default_branch():

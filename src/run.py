@@ -5530,6 +5530,7 @@ def _render_self_review_section(review: dict) -> str:
     scoped_out = review.get("scoped_out") or review.get("stubbed") or []
     call_site = review.get("call_site") or "(unspecified)"
     summary = (review.get("honest_summary") or "").strip()
+    is_orphan = review.get("is_orphan") is True
 
     def _bullets(items: list) -> str:
         if not items:
@@ -5547,6 +5548,16 @@ def _render_self_review_section(review: dict) -> str:
         "**Intentionally out of scope** (not needed for this contribution):",
         _bullets(scoped_out),
     ]
+    if is_orphan:
+        parts += [
+            "",
+            "> ⚠ **Self-review flagged this as orphan-shaped.** The coding "
+            "agent concluded that no pre-existing entry point invokes the "
+            "new code (at most its own tests). If this is a library API "
+            "addition meant to be imported by external callers, that's by "
+            "design; if this is application code, the wiring may be "
+            "incomplete — review before merging.",
+        ]
     if summary:
         parts += ["", f"_{summary}_"]
     parts.append("")
@@ -7614,46 +7625,20 @@ def process_target(target: Target) -> dict:
         review = self_review_diff(workdir, timeout_s=target.claude_timeout_s)
         result["self_review"] = review or {}
         if review and review.get("is_orphan") is True:
+            # Surface the classification but don't veto the PR here — the
+            # measurement-based gates upstream (path allowlist,
+            # check_integration invocation check, tests-touch-existing-
+            # modules) already caught orphan scaffolding on real diff
+            # evidence; if the run got this far, those passed. The
+            # self-review verdict rides along in the PR body so the
+            # maintainer sees the orphan framing prominently and can
+            # close a scaffold-shaped PR fast, without the pipeline
+            # single-handedly downgrading a legitimate library API
+            # addition on a boolean flag.
             log.warning(
-                "  ✗ self-review: new code is unreachable from any "
-                "production path (orphan); downgrading to Issue"
+                "  ⚠ self-review flagged is_orphan=True — surfaced in the "
+                "PR body; upstream measurement-based gates already passed"
             )
-            summary = review.get("honest_summary") or ""
-            # Promote the self-review summary out of italics into a
-            # proper sub-heading — it's the most informative part of
-            # the body and worth a glance, not a footnote.
-            detail_body = (
-                "On a second pass over the diff, the coding agent "
-                "concluded that no pre-existing entry point or module "
-                "invokes the new code — at most its own tests call it. "
-                "That's an orphan: the product never exercises it. "
-                "(This is about reachability, not whether the code is "
-                "trivial — stub density is judged separately.)\n"
-            )
-            if summary:
-                detail_body += (
-                    f"\n### Self-review summary\n\n{summary}\n"
-                )
-            issue_url, issue_number = _open_downgrade_issue(
-                target, rec,
-                reason="Self-review judged the new code an orphan (no production call path)",
-                detail=detail_body,
-                implementation_diff=_capture_implementation_diff(workdir),
-                tldr=summary[:240] if summary else "",
-                selection_note=result.get("selection_reasoning", ""),
-                selection_rejected=result.get("selection_rejected"),
-                footer_override=(
-                    f"_Opened by the [Remyx Recommendation]"
-                    f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. "
-                    f"Self-review caught that the new code is wired into "
-                    f"a flag no production caller sets — routed to Issue "
-                    f"so the team can decide whether to enable it._"
-                ),
-            )
-            result["status"] = "issue_opened_self_review"
-            result["issue_url"] = issue_url
-            result["issue_number"] = issue_number
-            return result
         review_section = _render_self_review_section(review) if review else ""
 
         # 10. Draft determination. "unvalidated" (tests couldn't run in CI,
