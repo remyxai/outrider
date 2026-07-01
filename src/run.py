@@ -7225,11 +7225,14 @@ def process_target(target: Target) -> dict:
                 result["selection_rejected"] = _enrich_selection_rejected(
                     selection.get("rejected") or [], viable
                 )
-                # Substitution routing — replacement / simplification
-                # recommendations need dep changes the PR guardrails block
-                # (requirements.txt, factory wiring, often test fixtures).
-                # Open as an Issue with the contract analysis instead of a
-                # half-built PR.
+                # REMYX-172 experiment: the categorical substitution guard
+                # (`shape in ("replacement", "simplification") → auto-Issue`)
+                # used to fire here. Removed on this branch so replacement /
+                # simplification runs proceed to implementation; the
+                # downstream check_integration validator catches diffs that
+                # actually touch dep files or otherwise violate PR guardrails,
+                # using MEASURED dep-file churn instead of the selection's
+                # shape label as the input.
                 shape = (selection.get("integration_shape") or "addition").lower().strip()
                 result["selection_integration_shape"] = shape
                 result["selection_contract_match"] = (
@@ -7238,57 +7241,6 @@ def process_target(target: Target) -> dict:
                 result["selection_migration_cost"] = (
                     selection.get("migration_cost", "")
                 )
-                if shape in ("replacement", "simplification"):
-                    contract_match = selection.get("contract_match", "")
-                    migration_cost = selection.get("migration_cost", "")
-                    shape_label = (
-                        "drop-in replacement"
-                        if shape == "replacement"
-                        else "pipeline simplification"
-                    )
-                    # Engineering axis as its own section, adjacent to the
-                    # license section.
-                    engineering_section = _render_engineering_section(
-                        integration_shape=shape_label,
-                        contract_match=contract_match or "(none reported)",
-                        migration_cost=migration_cost or "(none reported)",
-                    )
-                    detail = (
-                        f"_Selection reasoning_: {selection.get('reasoning', '')}\n\n"
-                        f"This swap touches dependency files and existing module "
-                        f"boundaries — changes that fall outside Outrider's "
-                        f"auto-PR guardrails. Opening as an Issue so the team "
-                        f"can decide whether to merge the upgrade."
-                    )
-                    _record_verdict_fields(result, rec)
-                    issue_url, issue_number = _open_downgrade_issue(
-                        target, rec,
-                        reason=f"Selection identified a {shape_label} candidate",
-                        detail=detail,
-                        engineering_section=engineering_section,
-                        selection_note=selection.get("reasoning", ""),
-                        selection_rejected=result.get("selection_rejected"),
-                        footer_override=(
-                            f"_Opened by the [Remyx Recommendation]"
-                            f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. "
-                            f"Selection identified a {shape_label} that "
-                            f"touches dependency files / module boundaries "
-                            f"outside the PR guardrails — routed to Issue "
-                            f"so the team can decide on the swap._"
-                        ),
-                    )
-                    result.update({
-                        "paper": rec.paper_title,
-                        "arxiv": rec.arxiv_id,
-                        "tier": rec.tier,
-                        "recommendation_id": rec.recommendation_id or None,
-                        "candidates_considered": len(viable),
-                        "status": "issue_opened_substitution",
-                        "issue_url": issue_url,
-                        "issue_number": issue_number,
-                    })
-                    log.info(f"  ✓ issue_opened_substitution ({shape}): {issue_url}")
-                    return result
             else:
                 rec = _fallback_candidate(viable)
                 result["selection_reasoning"] = (
