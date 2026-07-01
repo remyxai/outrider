@@ -3835,6 +3835,88 @@ def _load_environments_md(workdir: Path, max_bytes: int = 4096) -> str:
     return ""
 
 
+# ─── selection reasoning path verification ──────────────────────────────────
+#
+# The selection agent sometimes cites paths in its reasoning that don't
+# exist in the target repo — e.g. grepping `unsloth/` on a fork that only
+# has `studio/`, then concluding "no such code exists." That's a
+# confidently-wrong reasoning failure mode that's hard to catch after the
+# fact from log inspection. Extracting cited paths from the reasoning and
+# checking each against the workdir gives an operator a concrete "0/2
+# cited paths verified" signal in the step summary before trusting the
+# verdict.
+
+_PATH_TOKEN_RE = re.compile(r"[a-zA-Z_][\w./\-]*[\w/]")
+
+_PATH_TOKEN_URL_SUBSTRINGS = (
+    "http://", "https://", "github.com/", "arxiv.org/", "huggingface.co/",
+)
+
+
+def _extract_referenced_paths(text: str) -> list[str]:
+    """Extract candidate filesystem paths mentioned in reasoning prose.
+
+    Matches tokens containing at least one slash and starting with a
+    letter/underscore — the shape of a Python source file (``foo/bar.py``)
+    or a directory reference (``foo/bar/``). Filters out:
+      - single-slash tokens without a `.py` suffix or trailing slash
+        (github-repo shapes like ``org/repo``)
+      - URLs and paper-index references (``github.com/...``,
+        ``arxiv.org/...``, ``huggingface.co/...``)
+
+    Best-effort: may miss references embedded in prose without slashes,
+    may include false positives that the workdir verification then flags
+    as ``not_found``. That's fine — this is a diagnostic signal, not a
+    gate.
+    """
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _PATH_TOKEN_RE.finditer(text):
+        path = match.group(0)
+        if "/" not in path:
+            continue
+        lower = path.lower()
+        if any(host in lower for host in _PATH_TOKEN_URL_SUBSTRINGS):
+            continue
+        # Skip github-repo shape: exactly one slash, no `.py` suffix, no
+        # trailing slash — that's `org/repo`, not a repo-internal path.
+        if path.count("/") == 1 and not path.endswith(".py") and not path.endswith("/"):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _verify_paths_in_workdir(workdir: Path, paths: list[str]) -> dict:
+    """Split cited paths into ``verified`` (exist in workdir) and
+    ``not_found``. Returns a dict with the two lists and the raw ``cited``
+    input for provenance.
+    """
+    verified: list[str] = []
+    not_found: list[str] = []
+    for path in paths:
+        candidate = workdir / path.rstrip("/")
+        if candidate.exists():
+            verified.append(path)
+        else:
+            not_found.append(path)
+    return {"cited": list(paths), "verified": verified, "not_found": not_found}
+
+
+def _check_selection_paths(workdir: Path, reasoning: str) -> dict:
+    """Extract path claims from a selection-reasoning string and verify
+    each against the workdir. Convenience wrapper around
+    ``_extract_referenced_paths`` + ``_verify_paths_in_workdir``.
+    """
+    return _verify_paths_in_workdir(
+        workdir, _extract_referenced_paths(reasoning)
+    )
+
+
 def write_spec_bundle(
     workdir: Path, target: Target, rec: Recommendation, package: str,
     selection_note: str = "",
@@ -7109,6 +7191,17 @@ def process_target(target: Target) -> dict:
                 result["selection_rejected"] = _enrich_selection_rejected(
                     selection.get("rejected") or [], viable
                 )
+                # Confabulation check: if the reasoning cites paths not
+                # present in the workdir, an operator scanning the step
+                # summary should see the mismatch prominently before
+                # trusting a "rejected all candidates" verdict.
+                path_check = _check_selection_paths(workdir, result["selection_reasoning"])
+                result["selection_reasoning_paths"] = path_check
+                if path_check["cited"] and not path_check["verified"]:
+                    log.warning(
+                        "  ⚠ selection reasoning cites %d path(s) — 0 verified in workdir; possible confabulation",
+                        len(path_check["cited"]),
+                    )
                 if selection.get("under_explored"):
                     log.info("  ✗ skipped (coverage gate: under-explored)")
                 else:
@@ -7308,6 +7401,19 @@ def process_target(target: Target) -> dict:
         })
         _record_verdict_fields(result, rec)
         log.info(f"  ✓ selected: [{rec.tier}] {rec.paper_title}")
+
+        # Confabulation check on selection reasoning (see comment in the
+        # skipped-by-verification branch). Runs while workdir is still
+        # available; step-summary renderer picks it up.
+        selection_reasoning_str = result.get("selection_reasoning") or ""
+        if selection_reasoning_str and not selection_reasoning_str.startswith("("):
+            path_check = _check_selection_paths(workdir, selection_reasoning_str)
+            result["selection_reasoning_paths"] = path_check
+            if path_check["cited"] and not path_check["verified"]:
+                log.warning(
+                    "  ⚠ selection reasoning cites %d path(s) — 0 verified in workdir; possible confabulation",
+                    len(path_check["cited"]),
+                )
 
         # 5. Spec bundle for the chosen candidate. Thread the selection
         # rationale through so pre-flight and the implementer evaluate the
@@ -12113,6 +12219,26 @@ def _write_step_summary(result: dict) -> None:
         )
         lines.append(f"\n{selection_reasoning}\n")
         lines.append("\n</details>\n")
+
+    # Confabulation signal: if selection reasoning cited paths, show which
+    # ones the workdir actually contains. A "0 of N verified" line is a
+    # concrete flag that the reasoning may be hallucinated — an operator
+    # sees it in the step-summary panel before trusting the verdict.
+    path_check = result.get("selection_reasoning_paths") or {}
+    cited = path_check.get("cited") or []
+    if cited:
+        verified = path_check.get("verified") or []
+        not_found = path_check.get("not_found") or []
+        icon = "✓" if verified and not not_found else ("⚠️" if not verified else "•")
+        lines.append(
+            f"**Paths cited in selection reasoning**: {icon} {len(verified)} of "
+            f"{len(cited)} verified in the workdir\n"
+        )
+        if verified:
+            lines.append("- verified: " + ", ".join(f"`{p}`" for p in verified))
+        if not_found:
+            lines.append("- ⚠️ not found: " + ", ".join(f"`{p}`" for p in not_found))
+        lines.append("")
 
     if reasoning:
         # Collapse long reasoning into a <details> so the cost line

@@ -121,6 +121,76 @@ def test_select_prompt_substitutes_environment_hint(tmp_path, monkeypatch):
     assert "Workflow-attached tooling" in captured_prompt["text"]
 
 
+# ─── path verification of selection reasoning (confabulation check) ───────
+
+
+def test_extract_referenced_paths_basic():
+    """Paths ending in .py or trailing slash are extracted; single-slash
+    org/repo shapes and URLs are filtered out."""
+    text = (
+        "grep of unsloth/ + unsloth_cli/ for retrieval/MCP/agent = no hits. "
+        "The reference impl at github.com/pilancilab/Riemannian_Preconditioned_LoRA "
+        "and the module at routes/inference.py:_truncate_middle_messages both matter. "
+        "The org/repo shape shouldn't match."
+    )
+    paths = run._extract_referenced_paths(text)
+    assert "unsloth/" in paths
+    assert "unsloth_cli/" in paths
+    assert "routes/inference.py" in paths
+    assert "retrieval/MCP/agent" in paths  # 2+ slashes → looks path-shaped
+    # github.com URL should be filtered
+    assert not any("github.com" in p for p in paths)
+    # single-slash org/repo shape filtered
+    assert "org/repo" not in paths
+
+
+def test_extract_referenced_paths_empty():
+    assert run._extract_referenced_paths("") == []
+    assert run._extract_referenced_paths(None) == []
+
+
+def test_verify_paths_in_workdir_splits_verified_and_not_found(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.py").write_text("")
+    (tmp_path / "existing_dir").mkdir()
+    result = run._verify_paths_in_workdir(
+        tmp_path, ["src/foo.py", "existing_dir/", "made_up/", "nowhere/bar.py"]
+    )
+    assert "src/foo.py" in result["verified"]
+    assert "existing_dir/" in result["verified"]
+    assert "made_up/" in result["not_found"]
+    assert "nowhere/bar.py" in result["not_found"]
+    assert len(result["cited"]) == 4
+
+
+def test_check_selection_paths_catches_confabulation(tmp_path):
+    """The exact reasoning shape that caused today's unsloth-retry misfire:
+    grepped nonexistent directories, concluded 'no such code exists'.
+    Path check flags 0 of 2 verified — an operator can spot this."""
+    # Workdir simulates smellslikeml/unsloth's actual shape (studio/, no unsloth/)
+    (tmp_path / "studio").mkdir()
+    (tmp_path / "studio" / "backend").mkdir()
+    reasoning = "grep of unsloth/ + unsloth_cli/ for X = no hits"
+    check = run._check_selection_paths(tmp_path, reasoning)
+    assert check["cited"] == ["unsloth/", "unsloth_cli/"]
+    assert check["verified"] == []
+    assert set(check["not_found"]) == {"unsloth/", "unsloth_cli/"}
+
+
+def test_check_selection_paths_verifies_real_paths(tmp_path):
+    """The opik-SAFARI shape: reasoning cites a real path, verification
+    finds it — an operator sees the reasoning is grounded."""
+    (tmp_path / "sdks").mkdir()
+    (tmp_path / "sdks" / "python").mkdir()
+    (tmp_path / "sdks" / "python" / "opik").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "suite_evaluators").mkdir()
+    (tmp_path / "suite_evaluators" / "agentic").mkdir()
+    reasoning = "Opik's suite_evaluators/agentic/ evaluator IS SAFARI's architecture"
+    check = run._check_selection_paths(tmp_path, reasoning)
+    assert "suite_evaluators/agentic/" in check["verified"]
+    assert not check["not_found"]
+
+
 def test_select_prompt_without_env_body_has_no_hint_block(tmp_path, monkeypatch):
     """Backwards-compat: runs with no env_body render the prompt without
     the hint section, no dangling placeholder."""
