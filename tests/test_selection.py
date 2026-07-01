@@ -166,6 +166,66 @@ def test_select_unparseable_output_falls_back(tmp_path, monkeypatch):
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
+# ─── _fallback_candidate: license_compat as tiebreaker (REMYX-169) ────────
+
+
+def _cand(title: str, relevance: float, license_compat: float) -> "run.Recommendation":
+    """Minimal Recommendation for fallback-tiebreaker tests."""
+    rec = run._paper_to_recommendation(
+        {"title": title, "resource_id": f"9999.{hash(title) & 0xFFFF:04x}v1",
+         "relevance_score": relevance},
+        fallback_interest_name="fb", interest_context="", experiment_history="",
+    )
+    rec.license_compat = license_compat
+    return rec
+
+
+def test_fallback_picks_highest_relevance():
+    """Baseline behavior: highest-relevance candidate wins regardless of
+    list order."""
+    low = _cand("Low", 0.60, license_compat=1.00)
+    high = _cand("High", 0.95, license_compat=0.30)
+    # `high` last in list — old `viable[0]` bug would pick `low`. max() picks
+    # `high` by relevance.
+    assert run._fallback_candidate([low, high]) is high
+
+
+def test_fallback_breaks_relevance_ties_by_license_compat():
+    """When two candidates share the top relevance, prefer the one with
+    higher license_compat (permissive+code-link > no-code-link)."""
+    no_code = _cand("No code link", 0.99, license_compat=0.30)
+    permissive = _cand("Apache-2.0 with gh source", 0.99, license_compat=1.00)
+    # Order the no-code-link candidate FIRST — old max() would pick it by
+    # order-of-arrival luck. With the fix, permissive wins on tiebreaker.
+    assert run._fallback_candidate([no_code, permissive]) is permissive
+    # And symmetric — order shouldn't matter.
+    assert run._fallback_candidate([permissive, no_code]) is permissive
+
+
+def test_fallback_tiebreak_does_not_override_relevance():
+    """A slightly higher relevance beats a lower relevance even if the
+    lower has better license_compat — license_compat is TIEBREAK only."""
+    lower_relevance_permissive = _cand("perm", 0.98, license_compat=1.00)
+    higher_relevance_no_code = _cand("no code", 0.99, license_compat=0.30)
+    assert (
+        run._fallback_candidate(
+            [lower_relevance_permissive, higher_relevance_no_code]
+        )
+        is higher_relevance_no_code
+    )
+
+
+def test_fallback_all_equal_falls_back_to_list_order():
+    """When both relevance and license_compat tie, list order is fine —
+    the candidates are genuinely equivalent by the ranking we care about."""
+    a = _cand("a", 0.99, license_compat=1.00)
+    b = _cand("b", 0.99, license_compat=1.00)
+    # Whichever appears first wins — that's max()'s documented behavior on
+    # ties, and we're OK with it once the license tiebreak is settled.
+    assert run._fallback_candidate([a, b]) is a
+    assert run._fallback_candidate([b, a]) is b
+
+
 def test_select_unparseable_initial_then_clean_retry(tmp_path, monkeypatch):
     """The model finishes reasoning out loud on the first attempt; the
     format-only retry then emits the JSON. Should succeed (preserving
