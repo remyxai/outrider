@@ -80,6 +80,63 @@ def test_select_single_candidate_short_circuits(tmp_path):
     assert run.select_recommendation(tmp_path, "pkg", [geo]) is None
 
 
+# ─── _render_environment_hint: selection-time ENVIRONMENTS.md injection ──
+
+
+def test_environment_hint_empty_when_no_env_body():
+    """Runs without an ENVIRONMENTS.md attached — hint block is empty so
+    the selection prompt is unchanged."""
+    assert run._render_environment_hint("") == ""
+    assert run._render_environment_hint("   \n\n  ") == ""
+
+
+def test_environment_hint_wraps_env_body_when_present():
+    """When ENVIRONMENTS.md is attached, the hint block introduces the
+    workflow-attached tooling and includes the body."""
+    body = "AST search via `ccc` is pre-installed. Prefer over Read on files >500 LOC."
+    hint = run._render_environment_hint(body)
+    assert "Workflow-attached tooling" in hint
+    assert "ENVIRONMENTS.md" in hint
+    assert "AST search via `ccc`" in hint
+
+
+def test_select_prompt_substitutes_environment_hint(tmp_path, monkeypatch):
+    """The selection prompt gets the env body substituted at the
+    __ENVIRONMENT_HINT__ placeholder, so the selection agent sees
+    workflow-attached tooling before it verifies candidates."""
+    geo, count = _make_candidates()
+    captured_prompt = {}
+
+    def _fake_stream(wd, prompt, t, **kw):
+        captured_prompt["text"] = prompt
+        return (True, '{"chosen_index": 0, "reasoning": "x", "rejected": []}', [])
+
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", _fake_stream)
+    run.select_recommendation(
+        tmp_path, "pkg", [geo, count],
+        env_body="AST search via `ccc` is pre-installed.",
+    )
+    assert "__ENVIRONMENT_HINT__" not in captured_prompt["text"], "placeholder not substituted"
+    assert "AST search via `ccc`" in captured_prompt["text"]
+    assert "Workflow-attached tooling" in captured_prompt["text"]
+
+
+def test_select_prompt_without_env_body_has_no_hint_block(tmp_path, monkeypatch):
+    """Backwards-compat: runs with no env_body render the prompt without
+    the hint section, no dangling placeholder."""
+    geo, count = _make_candidates()
+    captured_prompt = {}
+
+    def _fake_stream(wd, prompt, t, **kw):
+        captured_prompt["text"] = prompt
+        return (True, '{"chosen_index": 0, "reasoning": "x", "rejected": []}', [])
+
+    monkeypatch.setattr(run, "_run_claude_oneshot_streaming", _fake_stream)
+    run.select_recommendation(tmp_path, "pkg", [geo, count])
+    assert "__ENVIRONMENT_HINT__" not in captured_prompt["text"]
+    assert "Workflow-attached tooling" not in captured_prompt["text"]
+
+
 def test_select_parses_chosen_index(tmp_path, monkeypatch):
     geo, count = _make_candidates()
     # The selection pass runs in streaming mode so it can parse the tool
