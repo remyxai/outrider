@@ -95,6 +95,17 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 </details>
 
 
+## Recommended: attach AST-based code search via ENVIRONMENTS.md
+
+The selection, preflight, and implementation agents ground their reasoning better when they have access to AST-based code search over the target repo — grounding call-site claims on real paths instead of speculating from paper metadata. The pattern is negligible-cost:
+
+- ~60-90s of runner time per run for the pipx install
+- ~500 tokens of additional selection-prompt context
+- No impact on runs that don't attach a workflow-tooling file
+
+Two additional workflow steps and a `ENVIRONMENTS.md` alongside your Outrider workflow give the agent [`cocoindex-code`](https://github.com/cocoindex-io/cocoindex-code) as a first-class tool. See [`examples/workflows/with-cocoindex.yml`](examples/workflows/with-cocoindex.yml) for the full copy-paste template and [`docs/environments.md`](docs/environments.md) for the ENVIRONMENTS.md convention (Claude Code skills, MCP servers, custom code-search — any workflow-attached tool the agent should know exists).
+
+
 ## Costs
 
 ~$2–3 per full PR-route run on Anthropic Opus (recommend + chain); ~$0.50–1 with `chain: false`. Cost varies by provider and model — see [`docs/backends.md`](docs/backends.md). With the default cadence guard, expect ~$1–2/mo at typical engagement. You bring `ANTHROPIC_API_KEY`; Remyx API usage is covered by your engine.remyx.ai subscription.

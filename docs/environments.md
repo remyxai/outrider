@@ -13,6 +13,12 @@ Attach a `ENVIRONMENTS.md` file at your workflow's workspace root (or repo root)
 
 Outrider reads it, strips the OKF/YAML frontmatter, and injects the body into the agent's brief alongside SPEC.md / PAPER.md / GUARDRAILS.md. If no file is present, behavior is unchanged.
 
+## Recommended default: attach cocoindex-code
+
+The reference pattern most Outrider deployments benefit from is attaching [`cocoindex-code`](https://github.com/cocoindex-io/cocoindex-code) — AST-based semantic code search that lets the selection agent ground-truth call-site claims on real paths instead of speculating from paper metadata. Marginal cost is minimal (~60-90s runner time for the one-time pipx install, ~500 tokens of prompt context per selection call). Copy-pasteable workflow: [`examples/workflows/with-cocoindex.yml`](../examples/workflows/with-cocoindex.yml).
+
+Runs without an `ENVIRONMENTS.md` still work — the pattern is opt-in.
+
 ## Motivation
 
 Outrider spawns Claude Code with a small set of default tools (Read, Grep, Glob, Bash, edit_file). Workflow authors often want to attach *more*:
