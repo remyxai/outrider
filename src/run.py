@@ -1068,10 +1068,21 @@ Markdown fences, no prose before or after. Schema:
                      deliberate boundaries, not as what you 'failed' to do.>"
 }
 
-Be ruthless about reachability. If the only thing that calls your new code
-is a test you added (or nothing at all), set is_orphan=true — the product
-never exercises it. If a pre-existing entry point (a pipeline/stage driver,
-a CLI, an existing module) now invokes your new code, set is_orphan=false.
+Be ruthless about reachability, but distinguish LIBRARY-shape API additions
+from APPLICATION-shape orphan scaffolding. In a library — one that ships a
+Python package for external users to import — a new public class/function
+exported from a package `__init__.py` IS the API surface; external callers,
+not internal library code, are the consumers. That is NOT orphan (set
+is_orphan=false and note the library-API framing in honest_summary). In an
+application repo (a CLI / service / pipeline), an addition that no pre-
+existing entry point invokes is a real orphan (is_orphan=true).
+
+Use the available tools to verify repo shape before deciding — signals of
+library-shape include `pyproject.toml` with `[project]` + `packages`,
+`setup.py` with `packages=`, or a `src/<pkg>/` layout; signals of application-
+shape include a top-level `cli.py` / `main.py` / `server.py` without a
+package declaration. When in doubt, quote the specific file evidence in
+honest_summary so a reviewer can audit the reasoning.
 Separately, list under scoped_out the parts of the paper you deliberately
 left for later (e.g. a trainer/model the repo can't host) — you are not
 required to reproduce the paper's full method, only to deliver its result.
