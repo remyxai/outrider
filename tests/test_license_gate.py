@@ -213,6 +213,11 @@ def test_enrich_candidates_populates_fields_and_compat(monkeypatch):
     monkeypatch.setattr(
         run, "_fetch_arxiv_abstract_page_urls", lambda arxiv_id: ([], []),
     )
+    # Block the arxiv HTML retry (fires on unfavorable buckets) so it
+    # doesn't hit the network during a unit test either.
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls", lambda arxiv_id: [],
+    )
 
     target = Target(repo="example/target-repo", interest_id="iid")
     candidates = [
@@ -259,6 +264,166 @@ def test_enrich_candidates_populates_fields_and_compat(monkeypatch):
 
     # Target license was fetched exactly once (cached).
     assert calls.count("/repos/example/target-repo/license") == 1
+
+
+# ─── arxiv HTML retry (license fallback discovery) ────────────────────────
+
+
+def test_rank_slugs_by_title_overlap_picks_paper_repo():
+    """Given multiple github refs, the one whose repo name substrings
+    match the paper title ranks first — that's the paper's own repo,
+    not a citation to a competitor."""
+    slugs = ["cloneofsimo/lora", "pilancilab/Riemannian_Preconditioned_LoRA"]
+    ranked = run._rank_slugs_by_title_overlap(
+        slugs, "Riemannian Preconditioned LoRA for Fine-Tuning Foundation Models"
+    )
+    assert ranked[0] == "pilancilab/Riemannian_Preconditioned_LoRA"
+
+
+def test_rank_slugs_by_title_overlap_handles_compound_repo_names():
+    """Compound repo names like `EntityBindingFailures` (no separators)
+    still match via substring against title words."""
+    slugs = ["arxiv/html_feedback", "R-Suresh/EntityBindingFailures"]
+    ranked = run._rank_slugs_by_title_overlap(
+        slugs, "Entity Binding Failures in Tool-Augmented Agents"
+    )
+    assert ranked[0] == "R-Suresh/EntityBindingFailures"
+
+
+def test_retry_via_arxiv_html_skips_favorable_buckets(monkeypatch):
+    """When license_class is already `permissive` (or any non-unfavorable),
+    the retry never runs — never overrides successful classification."""
+    called = {"n": 0}
+    def fake_fetch_urls(arxiv_id):
+        called["n"] += 1
+        return ["should/not/matter"]
+    monkeypatch.setattr(run, "_fetch_arxiv_html_urls", fake_fetch_urls)
+
+    c = Recommendation(
+        paper_title="Foo", arxiv_id="2410.12345", tier="high",
+        z_score=0.0, spec_md="", paper_abstract="", domain_summary="",
+        raw_paper_md="",
+    )
+    c.license_class = "permissive"
+    c.license_compat = 1.0
+    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
+    assert result is False
+    assert called["n"] == 0
+    # Fields unchanged.
+    assert c.license_class == "permissive"
+    assert c.license_compat == 1.0
+
+
+def test_retry_via_arxiv_html_recovers_discovery_gap(monkeypatch):
+    """Candidate with `license_class=no-code-link` gets recovered when
+    arxiv HTML discovers a github URL that returns MIT — exactly the
+    LettuceDetect / EntityBindingFailures failure shape."""
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: ["KRLabsOrg/LettuceDetect"],
+    )
+    monkeypatch.setattr(
+        run, "_fetch_repo_license", lambda slug: "MIT",
+    )
+
+    c = Recommendation(
+        paper_title="LettuceDetect: A Hallucination Detection Framework for RAG",
+        arxiv_id="2502.17125v1", tier="high", z_score=0.0, spec_md="",
+        paper_abstract="", domain_summary="", raw_paper_md="",
+    )
+    c.license_class = "no-code-link"
+    c.license_compat = 0.3
+
+    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
+    assert result is True
+    assert c.paper_license == "MIT"
+    assert c.paper_github_url == "https://github.com/KRLabsOrg/LettuceDetect"
+    assert c.license_class == "permissive"
+    assert c.license_compat == 1.0
+    assert c.license_source == "arxiv_html_retry"
+
+
+def test_retry_via_arxiv_html_recovers_timing_gap(monkeypatch):
+    """Candidate with `license_class=unknown` (URL was known but classifier
+    returned NOASSERTION or similar) gets recovered on retry — the
+    Riemannian LoRA / LightMem2 failure shape."""
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: ["pilancilab/Riemannian_Preconditioned_LoRA"],
+    )
+    monkeypatch.setattr(
+        run, "_fetch_repo_license", lambda slug: "MIT",
+    )
+
+    c = Recommendation(
+        paper_title="Riemannian Preconditioned LoRA for Fine-Tuning Foundation Models",
+        arxiv_id="2402.02347v3", tier="high", z_score=0.0, spec_md="",
+        paper_abstract="", domain_summary="", raw_paper_md="",
+        paper_github_url="https://github.com/pilancilab/Riemannian_Preconditioned_LoRA",
+    )
+    c.paper_license = "NOASSERTION"  # what the primary path landed on
+    c.license_class = "unknown"
+    c.license_compat = 0.0
+
+    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
+    assert result is True
+    assert c.paper_license == "MIT"
+    assert c.license_class == "permissive"
+    # The URL was already set — retry doesn't clobber it.
+    assert c.paper_github_url == "https://github.com/pilancilab/Riemannian_Preconditioned_LoRA"
+
+
+def test_retry_via_arxiv_html_skips_noassertion_from_retry(monkeypatch):
+    """If the retry also finds a URL but that URL's license fetch returns
+    NOASSERTION (GitHub classifier still lagging), keep the original
+    unfavorable class rather than falsely upgrading."""
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: ["some/repo"],
+    )
+    monkeypatch.setattr(
+        run, "_fetch_repo_license", lambda slug: "NOASSERTION",
+    )
+
+    c = Recommendation(
+        paper_title="Foo", arxiv_id="2410.12345", tier="high",
+        z_score=0.0, spec_md="", paper_abstract="", domain_summary="",
+        raw_paper_md="",
+    )
+    c.license_class = "unknown"
+    c.license_compat = 0.0
+
+    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
+    assert result is False
+    assert c.license_class == "unknown"
+
+
+def test_retry_via_arxiv_html_tries_multiple_urls_until_match(monkeypatch):
+    """When ranked URLs are tried in order, the first one that returns a
+    real SPDX wins; NOASSERTION responses skip to the next candidate."""
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: ["some/citation", "real/paper_repo"],
+    )
+    responses = {"some/citation": "NOASSERTION", "real/paper_repo": "MIT"}
+    monkeypatch.setattr(
+        run, "_fetch_repo_license", lambda slug: responses[slug],
+    )
+
+    c = Recommendation(
+        paper_title="paper repo", arxiv_id="2410.12345", tier="high",
+        z_score=0.0, spec_md="", paper_abstract="", domain_summary="",
+        raw_paper_md="",
+    )
+    c.license_class = "no-code-link"
+    c.license_compat = 0.3
+
+    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
+    assert result is True
+    assert c.paper_license == "MIT"
+    # Title-overlap ranking put real/paper_repo first (title "paper repo"
+    # substring-matches "paper_repo" in slug name).
+    assert c.paper_github_url == "https://github.com/real/paper_repo"
 
 
 def test_fetch_repo_license_caches(monkeypatch):

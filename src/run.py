@@ -1941,6 +1941,106 @@ def _fetch_arxiv_abstract_page_urls(arxiv_id: str) -> tuple[list[str], list[str]
     return gh, hf
 
 
+# arxiv.org/html/<id> is a newer rendered-HTML surface for papers that
+# includes URLs mentioned in the paper body — which the abstract page
+# almost never does. Every rendered page also carries footer refs to
+# `github.com/arXiv/html_feedback` + `github.com/brucemiller/LaTeXML`;
+# these are filtered out as boilerplate.
+_ARXIV_HTML_CACHE: dict[str, list[str]] = {}
+_ARXIV_HTML_NOISE = ("arxiv/html_feedback", "brucemiller/latexml")
+
+
+def _fetch_arxiv_html_urls(arxiv_id: str) -> list[str]:
+    """Fetch ``https://arxiv.org/html/<arxiv_id>`` and return github slugs
+    from the paper body, filtering the standard arxiv footer refs.
+
+    Used as a fallback source for license detection when the primary
+    path (Remyx envelope + abstract-page scrape + GitHub `/license`)
+    doesn't surface a usable SPDX. Never raises.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return []
+    if arxiv_id in _ARXIV_HTML_CACHE:
+        return _ARXIV_HTML_CACHE[arxiv_id]
+    try:
+        req = urllib.request.Request(
+            f"https://arxiv.org/html/{arxiv_id}",
+            headers={
+                "User-Agent": "feature-finder-orchestrator",
+                "Accept": "text/html",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"  arxiv HTML fetch for {arxiv_id} failed: {e}")
+        _ARXIV_HTML_CACHE[arxiv_id] = []
+        return []
+    slugs = [
+        s for s in _extract_github_urls(html)
+        if s.lower() not in _ARXIV_HTML_NOISE
+    ]
+    _ARXIV_HTML_CACHE[arxiv_id] = slugs
+    return slugs
+
+
+def _rank_slugs_by_title_overlap(slugs: list[str], title: str) -> list[str]:
+    """Rank github slugs so the one whose repo name shares the most
+    substrings with the paper title comes first. Handles compound repo
+    names like ``EntityBindingFailures`` where token-splitting fails but
+    substring matching against title words succeeds.
+    """
+    words = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", title)]
+    def _score(slug: str) -> int:
+        name = slug.split("/")[-1].lower()
+        return sum(1 for w in words if w in name)
+    return sorted(slugs, key=lambda s: -_score(s))
+
+
+def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str) -> bool:
+    """When the primary license path left ``license_class`` unfavorable
+    (``no-code-link`` / ``unknown`` / ``missing``), try discovering fresh
+    github URLs from arxiv's HTML surface and re-classifying. Returns
+    ``True`` when the retry produced a bucketable result and updated the
+    candidate in place, ``False`` otherwise. Never raises.
+
+    The retry addresses two observed failure modes:
+      - Discovery gaps: the paper's github URL never surfaced from the
+        Remyx envelope or the abstract page, so classification never got
+        a chance to run.
+      - Timing gaps: GitHub's async license classifier hadn't caught up
+        when the primary path ran, returning ``NOASSERTION``. A fresh
+        fetch after some delay usually returns the real SPDX.
+    """
+    unfavorable = ("no-code-link", "unknown", "missing")
+    if candidate.license_class not in unfavorable:
+        return False
+    slugs = _fetch_arxiv_html_urls(candidate.arxiv_id)
+    if not slugs:
+        return False
+    ranked = _rank_slugs_by_title_overlap(slugs, candidate.paper_title or "")
+    for slug in ranked:
+        fresh_spdx = _fetch_repo_license(slug)
+        if not fresh_spdx or fresh_spdx.upper() == "NOASSERTION":
+            continue
+        fresh_class = _classify_license(fresh_spdx)
+        if fresh_class in ("unknown", "missing"):
+            continue
+        candidate.paper_license = fresh_spdx
+        if not candidate.paper_github_url:
+            candidate.paper_github_url = f"https://github.com/{slug}"
+        candidate.license_source = "arxiv_html_retry"
+        candidate.license_class = fresh_class
+        candidate.license_compat = _license_compat_score(fresh_class, target_class)
+        log.info(
+            "  ↻ license retry via arxiv HTML on %s…: %s (%s)",
+            (candidate.paper_title or "")[:50], fresh_spdx, fresh_class,
+        )
+        return True
+    return False
+
+
 # Cached extracted text (title + abstract) per arxiv id. Populated by
 # ``_fetch_arxiv_abstract_text`` for paper-anchored fidelity audits (the
 # Phase A degraded mode used when a paper has no public reference impl).
@@ -3070,6 +3170,10 @@ def _enrich_candidate_licenses(
         else:
             c.license_class = _classify_license(c.paper_license)
         c.license_compat = _license_compat_score(c.license_class, target_class)
+        # Step 6: retry via arxiv HTML when the primary path landed on an
+        # unfavorable bucket. Fires only when the primary path already
+        # ran and gave up — never overrides a successful classification.
+        _retry_license_via_arxiv_html(c, target_class)
 
 
 def query_remyx_recommendation(target: Target) -> Recommendation:
