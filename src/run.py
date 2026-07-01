@@ -4972,6 +4972,24 @@ def _apply_coverage_gate(
     return data
 
 
+def _fallback_candidate(viable: list[Recommendation]) -> Recommendation:
+    """Pick the fallback candidate when agentic selection is unavailable.
+
+    Called when the selection call 429s, times out, or returns unparseable
+    output. The broad pool from `/papers/recommended` isn't guaranteed to
+    be in descending-relevance order at index 0 — the engine occasionally
+    seeds the list with diversity picks — so `viable[0]` blindly on
+    fallback can land the *lowest*-relevance candidate.
+
+    Highest relevance wins; ties broken by `license_compat`. A permissive
+    candidate with a code link (compat=1.00) should beat a no-code-link
+    candidate (compat=0.30) when both are equally relevant. Without the
+    tiebreaker the winner is order-of-arrival luck (max() returns the
+    first element at the max value).
+    """
+    return max(viable, key=lambda c: (c.relevance_score, c.license_compat))
+
+
 def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
     target: "Target | None" = None,
@@ -7272,14 +7290,7 @@ def process_target(target: Target) -> dict:
                     log.info(f"  ✓ issue_opened_substitution ({shape}): {issue_url}")
                     return result
             else:
-                # The broad pool from `/papers/recommended` isn't guaranteed
-                # to be in descending-relevance order at index 0 — the
-                # engine occasionally seeds the list with diversity picks.
-                # Selecting `viable[0]` blindly on fallback can land the
-                # *lowest*-relevance candidate in the pool. Pick the actual
-                # highest-relevance candidate so a fallback at least gives
-                # the maintainer the engine's strongest signal.
-                rec = max(viable, key=lambda c: c.relevance_score)
+                rec = _fallback_candidate(viable)
                 result["selection_reasoning"] = (
                     "(selection pass unavailable — used highest-relevance "
                     "candidate as fallback)"
