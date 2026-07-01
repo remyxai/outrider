@@ -114,6 +114,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 - **[Architecture](docs/architecture.md)** — selection taxonomy, pipeline, refinement chain
 - **[Guardrails](docs/guardrails.md)** — what the agent can and can't modify
 - **[Model backends](docs/backends.md)** — route at any Anthropic-Messages-compatible backend (z.ai's GLM, Bedrock, Vertex, on-prem); auth-header matrix; per-dispatch backend-switching workflow template
+- **[Environments](docs/environments.md)** — describe workflow-attached tooling (Claude Code skills, MCP servers, custom search) via `ENVIRONMENTS.md` so the agent knows to reach for it
 - **[Weekly summary mode](docs/weekly-summary.md)** — opt-in rolling digest comments
 
 
