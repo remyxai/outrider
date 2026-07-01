@@ -337,6 +337,9 @@ def test_enrichment_no_url_anywhere_lands_no_code_link(monkeypatch):
     monkeypatch.setattr(
         run, "_fetch_arxiv_abstract_page_urls", lambda a: ([], []),
     )
+    # Block the arxiv HTML retry (fires on no-code-link) so it doesn't
+    # hit the network during a unit test.
+    monkeypatch.setattr(run, "_fetch_arxiv_html_urls", lambda a: [])
 
     target = Target(repo="example/perm", interest_id="iid")
     rec = Recommendation(
