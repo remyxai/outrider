@@ -135,6 +135,19 @@ DEFAULT_ALLOWLIST_GLOBS = [
 # module under the cover of "integration".
 MAX_LINES_PER_EXISTING_FILE = 50
 
+# Higher cap that applies to purely-additive edits (deleted == 0) when the
+# run also creates a substantial new module. The shape being unblocked is
+# "small wrapper edit at the existing API surface + bulk implementation in
+# a new module" — the surgical pattern we want to encourage. The `deleted
+# == 0` gate ensures rewrites of existing modules still hit the tighter
+# cap (that's the case the original threshold exists to catch).
+MAX_LINES_PER_EXISTING_FILE_WITH_SPILLOVER = 100
+
+# Minimum size of the concurrent new-module spillover that unlocks the
+# higher cap. Trivial new files (a two-line stub next to a 90-line edit to
+# an existing file) don't count as real spillover.
+MIN_SPILLOVER_LINES = 100
+
 # Cap on number of newly-created .py files in the target package. A
 # real integration adds one module, sometimes two; anything beyond
 # that is scaffold-shaped.
@@ -5722,6 +5735,21 @@ def check_integration(
         if p.startswith(pkg_prefix) and p.endswith(".py") and _file_is_new(workdir, p)
     ]
 
+    # Total lines added across new package modules. A concurrent new module
+    # of meaningful size signals that any edit to an existing file is likely
+    # a wrapper/registration (imports + declaration + docstring), not the
+    # actual logic. In that case we raise the existing-file limit to
+    # unblock the "small wrapper + spillover to a new module" pattern.
+    # (New files are untracked here — git diff --numstat sees nothing for
+    # them, so read directly.)
+    def _new_file_lines(p: str) -> int:
+        try:
+            return sum(1 for _ in (workdir / p).open("r", encoding="utf-8", errors="ignore"))
+        except OSError:
+            return 0
+    new_pkg_lines = sum(_new_file_lines(p) for p in new_pkg_files)
+    has_spillover = new_pkg_lines >= MIN_SPILLOVER_LINES
+
     violations: list[str] = []
 
     if len(new_pkg_files) > MAX_NEW_PACKAGE_FILES:
@@ -5734,10 +5762,18 @@ def check_integration(
         if _file_is_new(workdir, p):
             continue
         added, deleted = _diff_line_changes(workdir, p)
-        if added + deleted > MAX_LINES_PER_EXISTING_FILE:
+        # Purely-additive edit alongside a substantial new module = the
+        # surgical wrapper pattern. Higher cap. In-place edits (deleted > 0)
+        # always stay at the tighter cap — those are the rewrites this
+        # threshold exists to catch.
+        if deleted == 0 and has_spillover:
+            limit = MAX_LINES_PER_EXISTING_FILE_WITH_SPILLOVER
+        else:
+            limit = MAX_LINES_PER_EXISTING_FILE
+        if added + deleted > limit:
             violations.append(
                 f"oversized edit to existing file {p}: +{added}/-{deleted} "
-                f"> {MAX_LINES_PER_EXISTING_FILE}"
+                f"> {limit}"
             )
 
     # Invocation check. Every newly-added callable, keyed by the file that
