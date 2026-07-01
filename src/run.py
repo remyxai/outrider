@@ -257,6 +257,31 @@ arxiv: https://arxiv.org/abs/{arxiv_id}
 {paper_abstract}
 """
 
+_ENVIRONMENT_MD_TEMPLATE = """\
+---
+type: workflow_environment
+description: Workflow-provided tooling available in this environment.
+---
+
+# Tooling available in this environment
+
+The following capabilities were attached to this run by the workflow
+author (via an ENVIRONMENTS.md or ENVIRONMENT.md at the workflow
+workspace or repo root). Prefer these over generic Read / Grep / Glob
+when the described tool fits the task better.
+
+{environment_body}
+"""
+
+
+_ENVIRONMENT_FILE_REF_TEMPLATE = """\
+  6. .remyx-recommendation/ENVIRONMENT.md  — workflow-provided tooling
+                                              hints (available tools +
+                                              suggested usage patterns
+                                              for this run's environment)
+"""
+
+
 _CONTEXT_MD_TEMPLATE = """\
 ---
 type: team_history
@@ -370,6 +395,7 @@ Read these files in order:
                                               + tests near the planned call
                                               site. Use these patterns
                                               without re-exploring them.
+{environment_file_ref}
 
 SPEC.md names a PROPOSED CALL SITE under "How this maps onto your repo"
 (the file + function the selection pass judged most implementable). Start
@@ -3734,6 +3760,57 @@ def _collect_repo_orientation(workdir: Path, target: Target, package: str) -> st
     return _ORIENTATION_MD_TEMPLATE.format(**blocks)
 
 
+def _load_environments_md(workdir: Path, max_bytes: int = 4096) -> str:
+    """Load a workflow-authored ENVIRONMENTS.md (or ENVIRONMENT.md), strip
+    OKF/YAML frontmatter, cap size. Returns the markdown body or "" if no
+    such file is present.
+
+    Search order (first hit wins):
+      1. $GITHUB_WORKSPACE/ENVIRONMENTS.md
+      2. $GITHUB_WORKSPACE/ENVIRONMENT.md
+      3. <workdir>/ENVIRONMENTS.md
+      4. <workdir>/ENVIRONMENT.md
+
+    The file is a workflow-authored surface: the workflow author writes it
+    to describe what tooling they attached to this run (skills, MCP
+    servers, custom search, private lint plugins, etc.). Outrider strips
+    the YAML frontmatter (the agent only needs the body) and caps size
+    to avoid a runaway prompt injection.
+    """
+    import re
+    candidates: list[Path] = []
+    ws = os.environ.get("GITHUB_WORKSPACE", "")
+    if ws:
+        candidates.append(Path(ws) / "ENVIRONMENTS.md")
+        candidates.append(Path(ws) / "ENVIRONMENT.md")
+    candidates.append(workdir / "ENVIRONMENTS.md")
+    candidates.append(workdir / "ENVIRONMENT.md")
+
+    for p in candidates:
+        try:
+            if not p.is_file():
+                continue
+            raw = p.read_text(errors="replace")
+        except OSError:
+            continue
+        m = re.match(r"^---\r?\n.*?\r?\n---\r?\n(.*)$", raw, flags=re.DOTALL)
+        body = (m.group(1) if m else raw).strip()
+        if not body:
+            continue
+        encoded = body.encode("utf-8")
+        truncated = False
+        if len(encoded) > max_bytes:
+            body = encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
+            body += "\n\n... (truncated at {} bytes)".format(max_bytes)
+            truncated = True
+        log.info(
+            "  ✓ workflow environment loaded: %s (%d bytes%s)",
+            p, len(body.encode("utf-8")), " truncated" if truncated else "",
+        )
+        return body
+    return ""
+
+
 def write_spec_bundle(
     workdir: Path, target: Target, rec: Recommendation, package: str,
     selection_note: str = "",
@@ -3798,10 +3875,25 @@ def write_spec_bundle(
         blocked="\n".join(ALWAYS_BLOCKED),
     ))
 
+    # ENVIRONMENT.md — workflow-authored tooling hints picked up from
+    # $GITHUB_WORKSPACE (or workdir) if the workflow author left an
+    # ENVIRONMENTS.md / ENVIRONMENT.md file describing skills, MCP
+    # servers, or other agent-usable tooling attached to this run.
+    # Only written when non-empty; the invocation's file list refs it
+    # only when it's present.
+    environment_body = _load_environments_md(workdir)
+    environment_file_ref = ""
+    if environment_body:
+        (bundle / "ENVIRONMENT.md").write_text(_ENVIRONMENT_MD_TEMPLATE.format(
+            environment_body=environment_body,
+        ))
+        environment_file_ref = _ENVIRONMENT_FILE_REF_TEMPLATE
+
     (bundle / "INVOCATION.md").write_text(_INVOCATION_MD_TEMPLATE.format(
         package=package,
         attribution_url=CANONICAL_ATTRIBUTION_URL,
         issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
+        environment_file_ref=environment_file_ref,
     ))
 
     # ORIENTATION.md — target repo's contributor guides, PR template, recent
