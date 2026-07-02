@@ -174,8 +174,8 @@ def test_preflight_and_routing_fields(monkeypatch):
     res = _result(
         preflight_decision="ISSUE",
         audit_anchor="reference",
-        pin_method="2606.27369v1",
-        pin_method_resolution="2606.27369v1",
+        search_method="2606.27369v1",
+        search_method_resolution="2606.27369v1",
         selection_proposed_call_site="src/foo.py:12",
         selection_team_direction_signal="rfc_issue",
         selection_contract_match=True,
@@ -188,8 +188,8 @@ def test_preflight_and_routing_fields(monkeypatch):
     body = calls[0][1]
     assert body["preflight_decision"] == "ISSUE"
     assert body["audit_anchor"] == "reference"
-    assert body["pin_method"] == "2606.27369v1"
-    assert body["pin_method_resolution"] == "2606.27369v1"
+    assert body["search_method"] == "2606.27369v1"
+    assert body["search_method_resolution"] == "2606.27369v1"
     assert body["selection_proposed_call_site"] == "src/foo.py:12"
     assert body["selection_team_direction_signal"] == "rfc_issue"
     assert body["selection_contract_match"] is True
@@ -359,7 +359,7 @@ def test_new_fields_default_to_null_on_skipped_run(monkeypatch):
     null_fields = [
         "agent", "model_backend", "cost_basis",
         "envelopes_without_usage", "num_turns", "cache_read_input_tokens",
-        "preflight_decision", "audit_anchor", "pin_method",
+        "preflight_decision", "audit_anchor", "search_method",
         "selection_proposed_call_site", "selection_external_arxiv_id",
         "chain", "self_review", "draft_dropped", "test_integration_gate",
         "stub_density", "integration_violations", "diff_risk_band",

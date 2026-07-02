@@ -205,13 +205,15 @@ inputs:
       use it for reproducible eval re-runs. Empty = normal selection.
     required: false
     default: ''
-  pin-method:
+  search-method:
     description: |
-      Optional method/technique query (e.g. "knowledge distillation", "MoE
-      expert routing"). When set, Outrider runs the engine's search to find
-      the top arxiv paper for the query and implements it — bypassing the
-      selection pass and the interest's candidate pool entirely. Empty =
-      normal selection. Mutually exclusive with pin-arxiv.
+      Free-text method/technique query (e.g. "riemannian preconditioning
+      LoRA optimizer"). When set, Outrider runs the engine's search to
+      find the top-hit arxiv paper matching the query and implements it —
+      overriding the interest's ranked pool. Use for exploratory dispatches
+      when you know the method family but not the specific arxiv id. For
+      reproducible re-runs of a known paper, use pin-arxiv instead. Empty
+      = normal selection. Mutually exclusive with pin-arxiv.
     required: false
     default: ''
   model-base-url:
@@ -400,7 +402,7 @@ runs:
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
-        INPUT_PIN_METHOD: ${{ inputs.pin-method }}
+        INPUT_SEARCH_METHOD: ${{ inputs.search-method }}
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).
