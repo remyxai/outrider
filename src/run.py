@@ -8502,10 +8502,26 @@ def process_target(target: Target) -> dict:
             if patched:
                 # Append the patch as a second commit on the existing
                 # branch. Can't reuse `commit_and_push` — its safety
-                # guard requires HEAD == origin/main, which no longer
-                # holds after the first commit_and_push moved HEAD to
-                # the feature branch. Direct git ops here.
+                # guard requires HEAD == origin/main.
+                #
+                # Extra step: the first commit_and_push re-authored the
+                # remote branch head via the GitHub API (produces a
+                # bot-verified commit with same tree, different author
+                # metadata). Local HEAD is still at the pre-reauth
+                # commit — a plain push of a local descendant would be
+                # non-fast-forward. `fetch + reset --soft` aligns local
+                # HEAD to the remote's API commit without touching the
+                # working tree (patch changes stay uncommitted); the
+                # subsequent commit is a clean fast-forward.
                 try:
+                    subprocess.run(
+                        ["git", "fetch", "origin", branch],
+                        cwd=workdir, check=True, capture_output=True, text=True,
+                    )
+                    subprocess.run(
+                        ["git", "reset", "--soft", f"origin/{branch}"],
+                        cwd=workdir, check=True, capture_output=True, text=True,
+                    )
                     subprocess.run(
                         ["git", "commit", "-am", "Fidelity remediation"],
                         cwd=workdir, check=True, capture_output=True, text=True,
