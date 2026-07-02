@@ -322,6 +322,11 @@ def test_retry_via_arxiv_html_recovers_discovery_gap(monkeypatch):
         run, "_fetch_arxiv_html_urls",
         lambda arxiv_id: ["KRLabsOrg/LettuceDetect"],
     )
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    monkeypatch.setattr(
+        run, "_verify_repo_matches_paper",
+        lambda slug, title, arxiv_id: True,
+    )
     monkeypatch.setattr(
         run, "_fetch_repo_license", lambda slug: "MIT",
     )
@@ -351,6 +356,11 @@ def test_retry_via_arxiv_html_recovers_timing_gap(monkeypatch):
         run, "_fetch_arxiv_html_urls",
         lambda arxiv_id: ["pilancilab/Riemannian_Preconditioned_LoRA"],
     )
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    monkeypatch.setattr(
+        run, "_verify_repo_matches_paper",
+        lambda slug, title, arxiv_id: True,
+    )
     monkeypatch.setattr(
         run, "_fetch_repo_license", lambda slug: "MIT",
     )
@@ -377,16 +387,22 @@ def test_retry_via_arxiv_html_skips_noassertion_from_retry(monkeypatch):
     """If the retry also finds a URL but that URL's license fetch returns
     NOASSERTION (GitHub classifier still lagging), keep the original
     unfavorable class rather than falsely upgrading."""
+    # Slug "foo" scores 1 against title "Foo methods" (title word 'foo' in 'foo')
     monkeypatch.setattr(
         run, "_fetch_arxiv_html_urls",
-        lambda arxiv_id: ["some/repo"],
+        lambda arxiv_id: ["some/foo"],
+    )
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    monkeypatch.setattr(
+        run, "_verify_repo_matches_paper",
+        lambda slug, title, arxiv_id: True,
     )
     monkeypatch.setattr(
         run, "_fetch_repo_license", lambda slug: "NOASSERTION",
     )
 
     c = Recommendation(
-        paper_title="Foo", arxiv_id="2410.12345", tier="high",
+        paper_title="Foo methods", arxiv_id="2410.12345", tier="high",
         z_score=0.0, spec_md="", paper_abstract="", domain_summary="",
         raw_paper_md="",
     )
@@ -403,15 +419,20 @@ def test_retry_via_arxiv_html_tries_multiple_urls_until_match(monkeypatch):
     real SPDX wins; NOASSERTION responses skip to the next candidate."""
     monkeypatch.setattr(
         run, "_fetch_arxiv_html_urls",
-        lambda arxiv_id: ["some/citation", "real/paper_repo"],
+        lambda arxiv_id: ["some/paperfoo", "real/paperfoo_repo"],
     )
-    responses = {"some/citation": "NOASSERTION", "real/paper_repo": "MIT"}
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    monkeypatch.setattr(
+        run, "_verify_repo_matches_paper",
+        lambda slug, title, arxiv_id: True,
+    )
+    responses = {"some/paperfoo": "NOASSERTION", "real/paperfoo_repo": "MIT"}
     monkeypatch.setattr(
         run, "_fetch_repo_license", lambda slug: responses[slug],
     )
 
     c = Recommendation(
-        paper_title="paper repo", arxiv_id="2410.12345", tier="high",
+        paper_title="paperfoo repo", arxiv_id="2410.12345", tier="high",
         z_score=0.0, spec_md="", paper_abstract="", domain_summary="",
         raw_paper_md="",
     )
@@ -421,9 +442,154 @@ def test_retry_via_arxiv_html_tries_multiple_urls_until_match(monkeypatch):
     result = run._retry_license_via_arxiv_html(c, target_class="permissive")
     assert result is True
     assert c.paper_license == "MIT"
-    # Title-overlap ranking put real/paper_repo first (title "paper repo"
-    # substring-matches "paper_repo" in slug name).
-    assert c.paper_github_url == "https://github.com/real/paper_repo"
+    # Both slugs score >0 (both contain "paperfoo"); ranking put
+    # real/paperfoo_repo first (also contains "repo") — but the NOASSERTION
+    # from some/paperfoo would come first in file-order; the retry iterates
+    # until MIT wins.
+    assert c.paper_github_url == "https://github.com/real/paperfoo_repo"
+
+
+# ─── new v1.7.3 gates: zero-overlap threshold + README verification ───────
+
+
+def test_retry_skips_zero_overlap_urls(monkeypatch):
+    """Zero-overlap URLs (a github URL from arxiv HTML that has no
+    title-word substring in its repo name) get filtered out before
+    attribution — no misattribution of cited-prior-work as paper repo.
+    HyperQuant → Lightricks/LTX-Video failure shape."""
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: ["Lightricks/LTX-Video"],  # 0 overlap with HyperQuant title
+    )
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    # Should not even reach README verification or license fetch.
+    verify_calls = {"n": 0}
+    def counting_verify(slug, title, arxiv_id):
+        verify_calls["n"] += 1
+        return True
+    monkeypatch.setattr(run, "_verify_repo_matches_paper", counting_verify)
+    monkeypatch.setattr(run, "_fetch_repo_license", lambda slug: "MIT")
+
+    c = Recommendation(
+        paper_title="HyperQuant: A Rate-Distortion-Optimal Quantization Pipeline",
+        arxiv_id="2606.23406v1", tier="high", z_score=0.0, spec_md="",
+        paper_abstract="", domain_summary="", raw_paper_md="",
+    )
+    c.license_class = "no-code-link"
+    c.license_compat = 0.3
+
+    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
+    assert result is False
+    assert verify_calls["n"] == 0  # Zero-overlap filter fires before verify
+    assert c.license_class == "no-code-link"
+
+
+def test_retry_skips_when_readme_does_not_match(monkeypatch):
+    """A slug with positive title-overlap but whose README doesn't mention
+    the paper title / arxiv id → skip. Catches the case where a repo name
+    coincidentally matches a title token but isn't actually the paper's
+    project (e.g. multiple unrelated repos share a common word)."""
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: ["some/lora_thing"],  # 'lora' overlap with paper title
+    )
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    monkeypatch.setattr(
+        run, "_verify_repo_matches_paper",
+        lambda slug, title, arxiv_id: False,  # README doesn't mention the paper
+    )
+    # Should not reach license fetch either.
+    license_calls = {"n": 0}
+    def counting_license(slug):
+        license_calls["n"] += 1
+        return "MIT"
+    monkeypatch.setattr(run, "_fetch_repo_license", counting_license)
+
+    c = Recommendation(
+        paper_title="LoRA-Adjacent-Method: Something Else",
+        arxiv_id="2410.99999v1", tier="high", z_score=0.0, spec_md="",
+        paper_abstract="", domain_summary="", raw_paper_md="",
+    )
+    c.license_class = "no-code-link"
+    c.license_compat = 0.3
+
+    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
+    assert result is False
+    assert license_calls["n"] == 0  # README rejection is upstream of license fetch
+
+
+def test_gather_candidates_from_project_page_one_hop(monkeypatch):
+    """When the arxiv HTML doesn't contain the paper's github URL but
+    does link a project page whose path contains a title-word, one-hop
+    fetching that page harvests the paper's actual repo URL — the
+    HyperQuant → moonmath.ai/hyperquant/ → moonmath-ai/HyperQuant path."""
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: [],  # arxiv HTML has no github URLs
+    )
+    def fake_fetch(url, timeout_s=10):
+        if "arxiv.org/html" in url:
+            # Simulate arxiv HTML containing a project-page URL only
+            return '<a href="https://moonmath.ai/hyperquant/">Project page</a>'
+        if "moonmath.ai/hyperquant" in url:
+            return '<a href="https://github.com/moonmath-ai/HyperQuant">Code</a>'
+        return ""
+    monkeypatch.setattr(run, "_fetch_url_html", fake_fetch)
+
+    slugs = run._gather_arxiv_html_candidate_slugs(
+        "2606.23406v1",
+        "HyperQuant: A Rate-Distortion-Optimal Quantization Pipeline",
+    )
+    assert "moonmath-ai/HyperQuant" in slugs
+
+
+# ─── helper units: scoring + verification primitives ──────────────────────
+
+
+def test_score_slug_title_overlap_zero_on_unrelated_slug():
+    assert run._score_slug_title_overlap(
+        "Lightricks/LTX-Video",
+        "HyperQuant: A Rate-Distortion-Optimal Quantization Pipeline",
+    ) == 0
+
+
+def test_score_slug_title_overlap_positive_on_related_slug():
+    score = run._score_slug_title_overlap(
+        "moonmath-ai/HyperQuant",
+        "HyperQuant: A Rate-Distortion-Optimal Quantization Pipeline",
+    )
+    assert score >= 1  # 'hyperquant' substring hits
+
+
+def test_verify_repo_matches_paper_accepts_arxiv_id_in_readme(monkeypatch):
+    monkeypatch.setattr(
+        run, "_fetch_repo_readme",
+        lambda slug: "See our paper on arxiv 2606.23406 for details.",
+    )
+    assert run._verify_repo_matches_paper(
+        "any/repo", "HyperQuant: X", "2606.23406",
+    ) is True
+
+
+def test_verify_repo_matches_paper_accepts_title_word_matches(monkeypatch):
+    monkeypatch.setattr(
+        run, "_fetch_repo_readme",
+        lambda slug: "This is the hyperquant implementation for quantization of models.",
+    )
+    # 2 title words hit ("hyperquant", "quantization") — plus "models" — accept
+    assert run._verify_repo_matches_paper(
+        "any/repo", "HyperQuant: A Quantization Pipeline for Models", "9999.99",
+    ) is True
+
+
+def test_verify_repo_matches_paper_rejects_when_no_matches(monkeypatch):
+    monkeypatch.setattr(
+        run, "_fetch_repo_readme",
+        lambda slug: "Unrelated project for making sandwiches.",
+    )
+    assert run._verify_repo_matches_paper(
+        "any/repo", "HyperQuant: A Quantization Pipeline", "9999.99",
+    ) is False
 
 
 def test_fetch_repo_license_caches(monkeypatch):
