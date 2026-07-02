@@ -2152,6 +2152,130 @@ def _verify_repo_matches_paper(
     return hits >= 2
 
 
+_ARCHITECTURE_ADD_PATTERNS = (
+    r"\bnew\s+\w*\s*(?:transformer|model|backbone|architecture)\b",
+    r"\b(?:attention|linear-attention|gla)\s+processor\b",
+    r"\bnew\s+\w*\s*(?:tuner|adapter)\b",
+    r"\bmodel\s+class\s+with\s+no\s+weights\b",
+    r"\bmodel/pipeline/scheduler\s+description\b",
+    r"\barchitectural\s+sibling\b",
+    r"\bregister\w*\s+.*(?:model|processor)\b",
+)
+
+
+def _is_architecture_add_shape(body: str) -> bool:
+    """Return True when the Issue body reads as an architecture-add artifact.
+
+    Architecture-add shape means the paper proposes a new model class,
+    backbone, attention processor, or tuner that would require multi-file
+    registration and — if intended as a runnable capability — a pretrained
+    checkpoint. These are the Issues where "does a checkpoint exist?" is a
+    load-bearing question the reader wants answered.
+    """
+    if not body:
+        return False
+    for pat in _ARCHITECTURE_ADD_PATTERNS:
+        if re.search(pat, body, re.IGNORECASE):
+            return True
+    return False
+
+
+_HF_PAPER_CACHE: dict[str, dict] = {}
+
+
+def _fetch_hf_paper_linkage(arxiv_id: str, timeout_s: int = 5) -> dict | None:
+    """Fetch a paper's canonical HF Hub linkage envelope, or ``None``.
+
+    Uses ``GET /api/papers/{arxiv_id}`` — HF Hub's paper index endpoint,
+    which returns ``linkedModels`` / ``linkedDatasets`` / ``linkedSpaces``
+    populated by HF's own crawler + model-card frontmatter (`arxiv:` tag)
+    + manual paper-page curation. This is the authoritative "does this
+    paper have a public checkpoint" answer — no author heuristics, no
+    substring matching.
+
+    Returns:
+    - ``{"title": str, "linked_models": [...], "linked_datasets": [...],
+       "linked_spaces": [...]}`` when the paper is indexed on HF
+      (regardless of whether it has any linked artifacts).
+    - ``None`` when the paper is not indexed on HF (title comes back
+      null) or on any network failure. Caller should treat ``None`` as
+      "no signal" — don't confuse it with "definitely no checkpoint".
+
+    Never raises. Cached per arxiv_id within a run.
+    """
+    if not arxiv_id:
+        return None
+    key = arxiv_id.strip().lower().replace("v", " ").split()[0]
+    if key in _HF_PAPER_CACHE:
+        return _HF_PAPER_CACHE[key]
+
+    url = f"https://huggingface.co/api/papers/{key}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "outrider-hf-paper-linkage",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        log.debug(f"  HF paper linkage for {key!r} failed: {e}")
+        _HF_PAPER_CACHE[key] = None
+        return None
+
+    if not isinstance(data, dict) or not data.get("title"):
+        # HF returned an envelope but this arxiv id isn't indexed on
+        # huggingface.co/papers — no signal, not "no checkpoint".
+        _HF_PAPER_CACHE[key] = None
+        return None
+
+    parsed = {
+        "title": data.get("title", ""),
+        "linked_models": data.get("linkedModels") or [],
+        "linked_datasets": data.get("linkedDatasets") or [],
+        "linked_spaces": data.get("linkedSpaces") or [],
+    }
+    _HF_PAPER_CACHE[key] = parsed
+    return parsed
+
+
+def _format_hf_checkpoint_section(linkage: dict | None) -> str:
+    """Render an Issue-body block reporting HF Hub checkpoint availability.
+
+    Called only for architecture-add-shaped Issues. Consumes the output
+    of ``_fetch_hf_paper_linkage``:
+
+    - ``None`` → paper is not indexed on huggingface.co/papers, so we
+      have no authoritative signal. Return an empty string (no section).
+      Better to omit than to hallucinate a false "not found" claim.
+    - ``linkage`` with populated ``linked_models`` → list them (green).
+    - ``linkage`` with empty ``linked_models`` → paper IS indexed and
+      genuinely has no linked checkpoint (yellow).
+    """
+    if linkage is None:
+        return ""
+    models = linkage.get("linked_models", [])
+    if models:
+        items = "\n".join(
+            f"- [`{m.get('id', '')}`](https://huggingface.co/{m.get('id', '')})"
+            for m in models if isinstance(m, dict) and m.get("id")
+        )
+        return (
+            "\n**Hub checkpoint availability** 🟢 "
+            f"{len(models)} public checkpoint(s) linked to this paper on "
+            "Hugging Face Hub (checked via `/api/papers/{arxiv_id}` at run "
+            f"time):\n\n{items}\n"
+        )
+    return (
+        "\n**Hub checkpoint availability** 🟡 "
+        "This paper is indexed on huggingface.co/papers but has no linked "
+        "checkpoint. If a checkpoint is later published and linked to the "
+        "paper page, reopen this Issue to have Outrider revisit.\n"
+    )
+
+
 def _gather_arxiv_html_candidate_slugs(arxiv_id: str, paper_title: str) -> list[str]:
     """Collect github repo slugs from arxiv HTML + one-hop project pages.
 
@@ -7779,6 +7903,13 @@ def process_target(target: Target) -> dict:
                 f"{preflight.get('reasoning', '(no reasoning provided)')}\n\n"
                 f"{issue_body_inner}"
             )
+            # REMYX-178: architecture-add Issues gain an HF Hub checkpoint
+            # availability block, replacing "Is a checkpoint forthcoming?" as
+            # an open question with a run-time-checked fact — sourced from
+            # HF's canonical arxiv-paper linkage index, not a heuristic.
+            if _is_architecture_add_shape(issue_body_inner):
+                linkage = _fetch_hf_paper_linkage(rec.arxiv_id)
+                preflight_detail += _format_hf_checkpoint_section(linkage)
             issue_url, issue_number = _open_downgrade_issue(
                 target, rec,
                 reason="Pre-flight routed to Issue before implementation",
@@ -7834,6 +7965,13 @@ def process_target(target: Target) -> dict:
                      f"({ISSUE_FALLBACK_FILENAME} present); opening Issue")
             issue_title_inner, issue_body_inner = parse_issue_fallback_file(issue_file)
             issue_title = f"{PR_TITLE_PREFIX} {issue_title_inner}"
+            # REMYX-178: architecture-add Issues gain a checkpoint-availability
+            # block sourced from HF's arxiv-paper linkage index, replacing the
+            # "Is a checkpoint forthcoming?" question with a resolved fact.
+            checkpoint_block = ""
+            if _is_architecture_add_shape(issue_body_inner):
+                linkage = _fetch_hf_paper_linkage(rec.arxiv_id)
+                checkpoint_block = _format_hf_checkpoint_section(linkage)
             issue_body = (
                 f"**Recommended paper**: "
                 f"[{rec.paper_title}](https://arxiv.org/abs/{rec.arxiv_id})\n"
@@ -7841,6 +7979,7 @@ def process_target(target: Target) -> dict:
                 f"(Remyx relevance {rec.relevance_score:.2f})\n"
                 f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
                 f"{_render_license_section(rec)}"
+                f"{checkpoint_block}"
                 f"\n---\n\n"
                 f"{issue_body_inner}"
             )
