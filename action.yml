@@ -336,7 +336,11 @@ runs:
           git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
           ln -sfn /tmp/cocoindex-code ~/.claude/skills/cocoindex-code
         fi
-        ccc --version || true
+        # Sanity check that ccc is on PATH. `ccc --version` would need a
+        # dedicated version flag that the typer app doesn't expose (raises
+        # a red "No such option" error box that scares readers even when
+        # suppressed). `command -v` is quiet and definitive.
+        command -v ccc >/dev/null 2>&1 && echo "ccc installed: $(command -v ccc)" || echo "warning: ccc not on PATH after install"
 
     - name: Write ENVIRONMENTS.md so the selection agent knows ccc is available
       if: ${{ inputs.enable-cocoindex == 'true' }}
