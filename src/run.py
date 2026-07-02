@@ -7767,8 +7767,46 @@ def process_target(target: Target) -> dict:
                 None,
             )
             if pinned_idx is None:
-                log.warning(f"  pin-arxiv {target.pin_arxiv!r} not in viable "
-                            f"pool; falling back to the selection pass")
+                # Pool didn't contain the paper — the ranker's interest-
+                # scoped top-N missed it. But pin-arxiv is an explicit "use
+                # THIS paper" directive; honor the intent by fetching the
+                # paper directly from Remyx's asset endpoint and injecting
+                # it as the sole candidate. Downstream preflight still
+                # validates fit against the codebase (a legitimately
+                # off-domain pin still routes to Issue). REMYX-183.
+                log.info(
+                    f"  pin-arxiv {target.pin_arxiv!r} not in ranker pool "
+                    f"(top-{len(viable)}); fetching directly from Remyx "
+                    f"assets to override the candidate list"
+                )
+                asset = _remyx_get_asset(target.pin_arxiv)
+                if asset is None:
+                    log.error(
+                        f"  ✗ pin-arxiv {target.pin_arxiv!r}: asset lookup "
+                        f"failed (paper not in Remyx catalog); skipping"
+                    )
+                    result["status"] = "skipped_pin_arxiv_not_found"
+                    result["pin_arxiv_requested"] = target.pin_arxiv
+                    return result
+                # Carry the interest metadata from an existing viable candidate
+                # if the pool has one — otherwise empty strings work (the
+                # asset-to-rec mapping degrades gracefully).
+                iname = viable[0].interest_name if viable else ""
+                ictx = viable[0].interest_context if viable else ""
+                ihist = viable[0].experiment_history if viable else ""
+                pinned_rec = _asset_to_recommendation(
+                    asset,
+                    refine_query=f"pin-arxiv override ({target.pin_arxiv})",
+                    fallback_interest_name=iname,
+                    interest_context=ictx,
+                    experiment_history=ihist,
+                )
+                viable = [pinned_rec]
+                pinned_idx = 0
+                log.info(
+                    f"  ✓ pin-arxiv override: injected "
+                    f"{pinned_rec.paper_title[:60]!r} from asset lookup"
+                )
         if pinned_idx is not None:
             rec = viable[pinned_idx]
             # pin-method reduces to pin-arxiv internally (see §2); surface
@@ -10390,7 +10428,11 @@ Fix them by editing the branch's files to match the reference.
 Read the reference codebase (already cloned as `./reference/`) as needed.
 Apply the fixes; changes are staged by the caller.
 """
-    brief_path = workdir / ".remyx-recommendation" / "FIDELITY_REMEDIATION.md"
+    # Write the patch brief to INVOCATION.md — the file `invoke_claude_code`
+    # reads at startup. The original INVOCATION.md was consumed by the earlier
+    # implementation session; overwriting it here is safe because no downstream
+    # reader in the pre-PR flow needs the original content.
+    brief_path = workdir / ".remyx-recommendation" / "INVOCATION.md"
     brief_path.parent.mkdir(exist_ok=True)
     brief_path.write_text(patch_brief)
 

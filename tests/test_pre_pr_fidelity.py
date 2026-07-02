@@ -239,4 +239,7 @@ def test_patch_returns_true_when_files_touched(tmp_path):
             tmp_path, matrix, "https://github.com/x/y",
         )
     assert got is True
-    assert (tmp_path / ".remyx-recommendation" / "FIDELITY_REMEDIATION.md").exists()
+    # Brief is written to INVOCATION.md (what invoke_claude_code reads at startup).
+    invoc = tmp_path / ".remyx-recommendation" / "INVOCATION.md"
+    assert invoc.exists()
+    assert "Fidelity remediation brief" in invoc.read_text()
