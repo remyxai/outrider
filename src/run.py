@@ -7684,6 +7684,17 @@ def process_target(target: Target) -> dict:
         target.pin_arxiv = rec.arxiv_id
     else:
         candidates = query_remyx_candidates(target)
+    # License + github/HF enrichment parity between the pool path and the
+    # pin-arxiv / search-method fast-paths. `query_remyx_candidates` already
+    # applies `_enrich_candidate_licenses` internally; the fast-paths bypass
+    # that call and would otherwise send unenriched candidates through
+    # preflight (empty paper_github_url → fidelity falls back to
+    # paper-anchored mode; license_class stays "" → downstream renderers
+    # show unknown license verdict). Idempotent — no-op when the candidate
+    # already has license/URL fields populated by the pool path.
+    if (target.pin_arxiv or target.search_method) and candidates:
+        if os.environ.get("REMYX_LICENSE_GATE", "1") != "0":
+            _enrich_candidate_licenses(candidates, target)
     result["candidates_returned"] = len(candidates)
     # Pool-composition + license-distribution telemetry.
     # Post-dedup counts (query_remyx_candidates coalesces families before
