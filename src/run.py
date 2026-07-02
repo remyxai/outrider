@@ -8438,6 +8438,65 @@ def process_target(target: Target) -> dict:
         commit_and_push(
             workdir, branch, pr_title, repo=target.repo, base_branch=default_branch
         )
+
+        # REMYX-186: Pre-PR fidelity gate.
+        # Run fidelity on the local branch BEFORE opening the PR. If
+        # substantive deviations from the reference are found, either
+        # patch the branch (REMYX-185, scoped-down single-attempt) or
+        # skip publication entirely. Fabricated artifacts never become
+        # public.
+        prepub_verdict = _run_pre_pr_fidelity_check(
+            rec, target, workdir, pr_title, pr_body, base_branch=default_branch,
+        )
+        result["prepub_fidelity"] = {
+            "status": prepub_verdict.get("status"),
+            "items_count": prepub_verdict.get("items_count", 0),
+            "needs_judgment": prepub_verdict.get("needs_judgment", False),
+        }
+        if prepub_verdict.get("coverage_section"):
+            _append_to_step_summary(prepub_verdict["coverage_section"])
+
+        if prepub_verdict.get("needs_judgment"):
+            log.info("  → pre-PR fidelity flagged fabrication; attempting one patch")
+            patched = _attempt_pre_pr_fidelity_patch(
+                workdir,
+                prepub_verdict["matrix"],
+                prepub_verdict.get("reference_url", ""),
+                timeout_s=target.claude_timeout_s,
+            )
+            if patched:
+                # Re-commit + push the patched branch, then re-run fidelity
+                commit_and_push(
+                    workdir, branch, pr_title, repo=target.repo,
+                    base_branch=default_branch,
+                )
+                revised_verdict = _run_pre_pr_fidelity_check(
+                    rec, target, workdir, pr_title, pr_body,
+                    base_branch=default_branch,
+                )
+                result["prepub_fidelity_after_patch"] = {
+                    "status": revised_verdict.get("status"),
+                    "items_count": revised_verdict.get("items_count", 0),
+                    "needs_judgment": revised_verdict.get("needs_judgment", False),
+                }
+                if revised_verdict.get("coverage_section"):
+                    _append_to_step_summary(revised_verdict["coverage_section"])
+                if revised_verdict.get("needs_judgment"):
+                    result["status"] = "skipped_fidelity_fabrication_after_patch"
+                    log.info(
+                        f"  ✗ {result['status']}: fidelity still flags "
+                        f"{revised_verdict['items_count']} items after patch"
+                    )
+                    return result
+                log.info("  ✓ patch resolved fidelity findings — continuing to PR")
+            else:
+                result["status"] = "skipped_fidelity_fabrication"
+                log.info(
+                    f"  ✗ {result['status']}: patch attempt failed or no edits; "
+                    "no PR opened"
+                )
+                return result
+
         pr_url, pr_number = open_pr(
             target, branch, pr_title, pr_body, draft=draft, base=default_branch
         )
@@ -10165,6 +10224,201 @@ Return ONLY a valid JSON object (no prose before or after):
   ]
 }}
 """
+
+
+def _local_git_diff(workdir: "Path", base_branch: str = "main") -> str:
+    """Return the diff of committed changes on the current branch vs base.
+
+    Called pre-PR-publication so fidelity can audit local branch changes
+    without fetching from GitHub. ``workdir`` is the clone that
+    ``commit_and_push`` just built on. Returns ``""`` on any git failure —
+    caller decides how to degrade.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--no-color", f"{base_branch}..HEAD"],
+            cwd=str(workdir), capture_output=True, text=True, timeout=30,
+        )
+        return result.stdout if result.returncode == 0 else ""
+    except (subprocess.SubprocessError, OSError) as e:
+        log.debug(f"  local git diff failed: {e}")
+        return ""
+
+
+def _run_pre_pr_fidelity_check(
+    rec: "Recommendation",
+    target: "Target",
+    workdir: "Path",
+    pr_title: str,
+    pr_body: str,
+    base_branch: str = "main",
+) -> dict:
+    """Run the fidelity audit on the local branch, before opening a PR.
+
+    Mirrors ``run_fidelity_mode`` but takes local inputs (title/body/diff
+    from what's about to be posted) instead of fetching from a PR that
+    doesn't exist yet. Returns a verdict dict with ``needs_judgment``,
+    ``items_count``, ``coverage_section``, ``status``, ``matrix``.
+
+    Only reference-anchored mode is supported here — the paper-anchored
+    degraded mode adds complexity that isn't needed for the primary
+    (fidelity-catches-fabrication) use case. When no reference URL is
+    available, returns ``needs_judgment=False`` and lets the flow
+    proceed (equivalent to the old post-PR skip behavior).
+    """
+    verdict = {
+        "needs_judgment": False,
+        "items_count": 0,
+        "coverage_section": "",
+        "status": "pre_pr_fidelity_skipped_no_reference",
+        "matrix": None,
+    }
+    _, reference_url = _extract_reference_url_from_pr_body(pr_body, target.repo)
+    if not reference_url:
+        log.info("  → pre-PR fidelity: no reference URL, skipping")
+        return verdict
+    verdict["reference_url"] = reference_url
+
+    fid_workdir = Path(tempfile.mkdtemp(prefix="outrider-prepub-fidelity-"))
+    log.info(f"  → pre-PR fidelity workdir: {fid_workdir}")
+    ok, ref_dir, err = _clone_reference_repo(reference_url, fid_workdir)
+    if not ok:
+        verdict["status"] = "pre_pr_fidelity_failed_clone"
+        verdict["error"] = err
+        log.warning(f"  ⚠ pre-PR fidelity clone failed: {err}")
+        return verdict
+
+    diff = _local_git_diff(workdir, base_branch)
+    if not diff:
+        verdict["status"] = "pre_pr_fidelity_failed_no_diff"
+        log.warning("  ⚠ pre-PR fidelity: local git diff empty; skipping")
+        return verdict
+
+    prompt = _build_fidelity_audit_prompt(
+        pr_title=pr_title,
+        pr_body=pr_body,
+        pr_diff=diff,
+        arxiv_id=rec.arxiv_id,
+        reference_url=reference_url,
+        reference_root=ref_dir,
+    )
+    log.info(f"  → pre-PR fidelity Claude one-shot (timeout={target.claude_timeout_s}s)")
+    ok, raw = _run_claude_oneshot(
+        fid_workdir, prompt, target.claude_timeout_s, max_turns=20,
+    )
+    if not ok:
+        verdict["status"] = "pre_pr_fidelity_failed_claude"
+        verdict["error"] = f"Claude non-zero: {raw[-500:]}"
+        log.warning(f"  ⚠ pre-PR fidelity Claude failed")
+        return verdict
+
+    matrix = _extract_json_object(raw)
+    if not matrix or "items" not in matrix:
+        verdict["status"] = "pre_pr_fidelity_failed_claude"
+        verdict["error"] = f"unparseable JSON: {raw[-500:]}"
+        log.warning("  ⚠ pre-PR fidelity: unparseable JSON")
+        return verdict
+
+    coverage_section = _render_coverage_matrix(matrix, audit_anchor="reference")
+    needs_judgment = bool(matrix.get("needs_judgment", False))
+
+    verdict.update({
+        "needs_judgment": needs_judgment,
+        "items_count": len(matrix.get("items", [])),
+        "coverage_section": coverage_section,
+        "matrix": matrix,
+        "status": (
+            "pre_pr_fidelity_needs_judgment" if needs_judgment
+            else "pre_pr_fidelity_clean"
+        ),
+    })
+    log.info(
+        f"  ✓ pre-PR fidelity: {verdict['items_count']} items, "
+        f"needs_judgment={needs_judgment}"
+    )
+    return verdict
+
+
+def _attempt_pre_pr_fidelity_patch(
+    workdir: "Path",
+    coverage_matrix: dict,
+    reference_url: str,
+    timeout_s: int = 900,
+) -> bool:
+    """Invoke Claude Code with fidelity findings to patch the local branch.
+
+    Bounded single-attempt remediation: Claude gets the coverage matrix
+    of flagged deviations + the reference-repo URL as context and edits
+    the branch's files to resolve them. Caller re-runs fidelity after.
+
+    Returns ``True`` if Claude exited cleanly AND touched files in the
+    workdir (so re-fidelity is worth running). ``False`` on Claude
+    failure or no edits — caller should skip publication.
+    """
+    if not coverage_matrix or not coverage_matrix.get("items"):
+        return False
+    flagged = [
+        it for it in coverage_matrix["items"]
+        if isinstance(it, dict) and "deviation" in str(it.get("status", "")).lower()
+    ]
+    if not flagged:
+        return False
+
+    # Compose a Claude Code prompt file that Claude reads on startup.
+    findings_md = "\n".join(
+        f"- **{it.get('name', '(unnamed)')}** ({it.get('status', '')}): "
+        f"{it.get('rationale', '')[:400]}"
+        for it in flagged
+    )
+    patch_brief = f"""# Fidelity remediation brief
+
+Fidelity audit against the reference implementation ({reference_url})
+flagged {len(flagged)} substantive deviations in the current branch.
+Fix them by editing the branch's files to match the reference.
+
+**Constraints**:
+- Match the reference's algorithm, defaults, and mechanism — do not invent
+- If the paper claim in the PR body is wrong, correct it — reference is
+  ground truth
+- Do not add new scope (no unrelated features, no drive-by refactors)
+- Keep the diff surface small — the goal is to resolve these findings,
+  not rewrite the module
+
+**Flagged items**:
+{findings_md}
+
+Read the reference codebase (already cloned as `./reference/`) as needed.
+Apply the fixes; changes are staged by the caller.
+"""
+    brief_path = workdir / ".remyx-recommendation" / "FIDELITY_REMEDIATION.md"
+    brief_path.parent.mkdir(exist_ok=True)
+    brief_path.write_text(patch_brief)
+
+    # Record file mtimes to detect edits
+    before = {
+        p: p.stat().st_mtime
+        for p in workdir.rglob("*.py")
+        if ".git" not in p.parts and ".remyx-recommendation" not in p.parts
+    }
+
+    log.info(f"  → pre-PR fidelity patch attempt ({len(flagged)} deviations, timeout={timeout_s}s)")
+    ok, log_tail = invoke_claude_code(workdir, timeout_s=timeout_s)
+    if not ok:
+        log.warning(f"  ⚠ patch attempt failed: {log_tail[-300:]}")
+        return False
+
+    # Did anything actually change?
+    after = {
+        p: p.stat().st_mtime
+        for p in workdir.rglob("*.py")
+        if ".git" not in p.parts and ".remyx-recommendation" not in p.parts
+    }
+    touched = any(after.get(p, 0) > before.get(p, 0) for p in after)
+    if not touched:
+        log.warning("  ⚠ patch attempt: no .py files touched")
+        return False
+    log.info(f"  ✓ patch attempt applied edits — re-running fidelity")
+    return True
 
 
 def _build_fidelity_audit_prompt_paper_anchored(
