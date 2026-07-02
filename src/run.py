@@ -2353,7 +2353,7 @@ def _enumerate_definitions(
     identifier: str, workdir: "Path", max_results: int = 3,
 ) -> list[dict]:
     """Return the top-``max_results`` class definitions in ``workdir``
-    structurally similar to ``identifier`` — REMYX-179.
+    structurally similar to ``identifier``.
 
     Silent no-op when cocoindex-code isn't attached (``ccc`` not on PATH),
     or when the workdir has no class definitions to enumerate. Kept as
@@ -2407,7 +2407,7 @@ def _enrich_body_with_convention_precedents(
     """Append a convention-precedents block to ``body`` when any sibling
     claims resolve via cocoindex AST enumeration.
 
-    REMYX-179 — converts agent-inferred sibling claims ("sits alongside
+    Converts agent-inferred sibling claims ("sits alongside
     `X`") into reader-verifiable, similarity-ranked precedents backed by
     ``ccc grep 'class \\NAME:'``. Silent no-op when cocoindex isn't
     attached, no sibling claims are detected, or no precedents pass the
@@ -8089,14 +8089,14 @@ def process_target(target: Target) -> dict:
                 f"{preflight.get('reasoning', '(no reasoning provided)')}\n\n"
                 f"{issue_body_inner}"
             )
-            # REMYX-178: architecture-add Issues gain an HF Hub checkpoint
+            # Architecture-add Issues gain an HF Hub checkpoint
             # availability block, replacing "Is a checkpoint forthcoming?" as
             # an open question with a run-time-checked fact — sourced from
             # HF's canonical arxiv-paper linkage index, not a heuristic.
             if _is_architecture_add_shape(issue_body_inner):
                 linkage = _fetch_hf_paper_linkage(rec.arxiv_id)
                 preflight_detail += _format_hf_checkpoint_section(linkage)
-            # REMYX-179: convert agent-inferred sibling claims ("sits alongside
+            # Convert agent-inferred sibling claims ("sits alongside
             # `X`") into reader-verifiable enumerations by grepping the
             # workdir for definitions sharing X's distinctive suffix.
             preflight_detail = _enrich_body_with_convention_precedents(
@@ -8157,7 +8157,7 @@ def process_target(target: Target) -> dict:
                      f"({ISSUE_FALLBACK_FILENAME} present); opening Issue")
             issue_title_inner, issue_body_inner = parse_issue_fallback_file(issue_file)
             issue_title = f"{PR_TITLE_PREFIX} {issue_title_inner}"
-            # REMYX-178: architecture-add Issues gain a checkpoint-availability
+            # Architecture-add Issues gain a checkpoint-availability
             # block sourced from HF's arxiv-paper linkage index, replacing the
             # "Is a checkpoint forthcoming?" question with a resolved fact.
             checkpoint_block = ""
@@ -8175,7 +8175,7 @@ def process_target(target: Target) -> dict:
                 f"\n---\n\n"
                 f"{issue_body_inner}"
             )
-            # REMYX-179: enrich with verified in-repo convention precedents
+            # Enrich with verified in-repo convention precedents
             # for any sibling claims the agent cited in its Issue body.
             issue_body = _enrich_body_with_convention_precedents(
                 issue_body, workdir,

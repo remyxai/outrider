@@ -227,6 +227,20 @@ inputs:
       bill. Token counts remain accurate.
     required: false
     default: ''
+  enable-cocoindex:
+    description: |
+      Install cocoindex-code as a Claude Code skill on the runner so the
+      selection + implementation agent has AST-based semantic code search
+      available (grounds call-site claims on real paths instead of
+      speculating). Adds ~60-90s to the run's install phase and ~1 GB of
+      torch/transformers deps to the runner. Set to 'false' to skip.
+
+      Also gates the "Convention precedents (via cocoindex AST search)"
+      enrichment on Issue bodies — the post-drafting convention-
+      verification section requires ccc on PATH to fire, so turning this
+      off silently drops that enrichment too.
+    required: false
+    default: 'true'
 
 outputs:
   status:
@@ -299,6 +313,54 @@ runs:
       run: |
         install -m 0755 "${{ github.action_path }}/src/gh_graph.py" /usr/local/bin/gh-graph
         gh-graph --selftest
+
+    - name: Install cocoindex-code as Claude Code skill
+      if: ${{ inputs.enable-cocoindex == 'true' }}
+      shell: bash
+      # Attach cocoindex-code as a Claude Code skill so the Outrider agent
+      # can perform AST-based semantic code search during selection and
+      # implementation, and so the convention-precedents enrichment on
+      # Issue bodies has ccc on PATH to enumerate structural precedents
+      # for sibling claims. Costs ~60-90s runner time on install; free
+      # thereafter. Set enable-cocoindex=false to skip.
+      #
+      # Idempotent — if the workflow already installed cocoindex (older
+      # setup-local flow from v0.4.4), the `command -v` guard skips the
+      # duplicate install.
+      run: |
+        if ! command -v ccc >/dev/null 2>&1; then
+          pipx install 'cocoindex-code[full]'
+        fi
+        mkdir -p ~/.claude/skills
+        if [ ! -e ~/.claude/skills/cocoindex-code ]; then
+          git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
+          ln -sfn /tmp/cocoindex-code ~/.claude/skills/cocoindex-code
+        fi
+        ccc --version || true
+
+    - name: Write ENVIRONMENTS.md so the selection agent knows ccc is available
+      if: ${{ inputs.enable-cocoindex == 'true' }}
+      shell: bash
+      # ENVIRONMENTS.md is read by the selection pass in run.py to surface
+      # workflow-attached tooling to the agent. Written to CWD (the target
+      # repo checkout) so the selection agent picks it up during the same
+      # run. Not committed — this is a runtime file only.
+      #
+      # Only writes when no ENVIRONMENTS.md exists — respects a
+      # user-customized file listing additional workflow-attached tools.
+      run: |
+        if [ ! -f ENVIRONMENTS.md ]; then
+          cat > ENVIRONMENTS.md <<'EOF'
+        - title: cocoindex-code AST search available
+          description: cocoindex-code AST-based semantic code search is pre-installed as a Claude Code skill.
+          resource: https://github.com/cocoindex-io/cocoindex-code
+          tags: [outrider, environment, cocoindex-code, ast-search]
+          surface: |
+            # Environment: cocoindex-code AST search
+            - Available as a Claude Code skill for grounding call-site claims on real AST paths.
+            - Invocable via /ccc slash command or ambient use during selection/implementation.
+        EOF
+        fi
 
     - name: Configure git identity
       shell: bash
