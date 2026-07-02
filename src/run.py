@@ -7625,7 +7625,34 @@ def process_target(target: Target) -> dict:
     #    candidate — bypassing both the interest's recommendation pool
     #    and the LLM selection pass. The downstream pin_arxiv check at
     #    §4 then picks this candidate naturally (no extra plumbing).
-    if target.pin_method:
+    if target.pin_arxiv:
+        # Short-circuit: fetch the pinned paper directly, skip the ranker
+        # pool entirely (bypasses /papers/recommended, refine queries, and
+        # per-candidate license enrichment on the full pool). Explicit
+        # "use THIS paper" intent doesn't need the ranker's opinion.
+        asset = _remyx_get_asset(target.pin_arxiv)
+        if asset is None:
+            log.info(f"  ✗ skipped_pin_arxiv_not_found: pin-arxiv "
+                     f"{target.pin_arxiv!r} not found in Remyx catalog")
+            result["status"] = "skipped_pin_arxiv_not_found"
+            result["pin_arxiv_requested"] = target.pin_arxiv
+            return result
+        rec = _asset_to_recommendation(
+            asset, refine_query=f"pin-arxiv:{target.pin_arxiv}",
+            fallback_interest_name="(pin-arxiv)",
+            interest_context="",
+            experiment_history="",
+        )
+        log.info(
+            f"  → pin-arxiv {target.pin_arxiv!r} resolved to "
+            f"{rec.paper_title[:60]}… (skipped ranker pool)"
+        )
+        candidates = [rec]
+        result["pin_arxiv_resolution"] = {
+            "arxiv_id": rec.arxiv_id,
+            "title": rec.paper_title,
+        }
+    elif target.pin_method:
         asset = _resolve_pin_method(target.pin_method)
         if asset is None:
             log.info(f"  ✗ skipped_no_method_match: pin-method "
@@ -7767,46 +7794,16 @@ def process_target(target: Target) -> dict:
                 None,
             )
             if pinned_idx is None:
-                # Pool didn't contain the paper — the ranker's interest-
-                # scoped top-N missed it. But pin-arxiv is an explicit "use
-                # THIS paper" directive; honor the intent by fetching the
-                # paper directly from Remyx's asset endpoint and injecting
-                # it as the sole candidate. Downstream preflight still
-                # validates fit against the codebase (a legitimately
-                # off-domain pin still routes to Issue). REMYX-183.
-                log.info(
-                    f"  pin-arxiv {target.pin_arxiv!r} not in ranker pool "
-                    f"(top-{len(viable)}); fetching directly from Remyx "
-                    f"assets to override the candidate list"
+                # Defensive: the pin-arxiv fast-path at §2 injects the
+                # pinned paper directly, so this branch is effectively
+                # unreachable. Log + skip if it ever fires.
+                log.error(
+                    f"  ✗ pin-arxiv {target.pin_arxiv!r} unexpectedly "
+                    f"absent from viable pool (fast-path bug?); skipping"
                 )
-                asset = _remyx_get_asset(target.pin_arxiv)
-                if asset is None:
-                    log.error(
-                        f"  ✗ pin-arxiv {target.pin_arxiv!r}: asset lookup "
-                        f"failed (paper not in Remyx catalog); skipping"
-                    )
-                    result["status"] = "skipped_pin_arxiv_not_found"
-                    result["pin_arxiv_requested"] = target.pin_arxiv
-                    return result
-                # Carry the interest metadata from an existing viable candidate
-                # if the pool has one — otherwise empty strings work (the
-                # asset-to-rec mapping degrades gracefully).
-                iname = viable[0].interest_name if viable else ""
-                ictx = viable[0].interest_context if viable else ""
-                ihist = viable[0].experiment_history if viable else ""
-                pinned_rec = _asset_to_recommendation(
-                    asset,
-                    refine_query=f"pin-arxiv override ({target.pin_arxiv})",
-                    fallback_interest_name=iname,
-                    interest_context=ictx,
-                    experiment_history=ihist,
-                )
-                viable = [pinned_rec]
-                pinned_idx = 0
-                log.info(
-                    f"  ✓ pin-arxiv override: injected "
-                    f"{pinned_rec.paper_title[:60]!r} from asset lookup"
-                )
+                result["status"] = "skipped_pin_arxiv_not_found"
+                result["pin_arxiv_requested"] = target.pin_arxiv
+                return result
         if pinned_idx is not None:
             rec = viable[pinned_idx]
             # pin-method reduces to pin-arxiv internally (see §2); surface

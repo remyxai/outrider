@@ -32,11 +32,11 @@ remyxai outrider init --repo owner/name --auto-interest
 From then on, the scheduled cron handles it — a draft PR or Issue appears each cycle. Trigger an ad-hoc run on a specific paper without waiting:
 
 ```bash
-remyxai outrider trigger --repo owner/name --pin-method 2410.20305v2
-remyxai outrider trigger --repo owner/name --pin-method "knowledge distillation"
+remyxai outrider trigger --repo owner/name --pin-arxiv 2410.20305v2
+remyxai outrider trigger --repo owner/name --pin-method "riemannian preconditioning LoRA optimizer"
 ```
 
-(Free-text method query or a literal arxiv id; pinning bypasses the candidate-selection pass.)
+`--pin-arxiv` implements the exact arxiv id (bypasses selection). `--pin-method` runs an engine search and implements the top hit — use it for exploratory dispatches when you know the method family but not the specific arxiv id, not for reproducible re-runs.
 
 Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Settings) and an Anthropic key (`--anthropic-key` or `ANTHROPIC_API_KEY`). See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install, per-dispatch routing flags, and secret management.
 
