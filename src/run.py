@@ -2241,6 +2241,192 @@ def _fetch_hf_paper_linkage(arxiv_id: str, timeout_s: int = 5) -> dict | None:
     return parsed
 
 
+_SIBLING_CLAIM_RE = re.compile(
+    r"(?:next\s+to|alongside|sibling(?:s)?\s+(?:of|to)|mirror(?:s|ing)?)\s+"
+    r"`([A-Za-z_][A-Za-z0-9_.]*)`",
+    re.IGNORECASE,
+)
+
+
+def _extract_sibling_claims(body: str) -> list[str]:
+    """Extract identifiers cited as siblings in an Issue/PR body.
+
+    Matches phrases like ``sits next to `X```, ``alongside `X```,
+    ``sibling of `X```, ``mirrors `X```. Returns the unique list of
+    identifiers preserving first-appearance order. Empty body → [].
+    """
+    if not body:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _SIBLING_CLAIM_RE.finditer(body):
+        ident = m.group(1)
+        if ident not in seen:
+            seen.add(ident)
+            out.append(ident)
+    return out
+
+
+def _query_ccc_class_defs(workdir: "Path", timeout_s: int = 20) -> list[dict]:
+    """Return all Python class definitions in ``workdir`` via ``ccc grep``.
+
+    Uses cocoindex-code's structural grep (``ccc grep 'class \\NAME:'``) —
+    AST-based, not text-regex. Requires ``ccc`` on ``PATH`` (installed by
+    the ENVIRONMENTS.md workflow step) but not a built index or running
+    daemon, so it works reliably even on the first run.
+
+    Returns ``[]`` when cocoindex isn't attached, when the workdir is
+    invalid, or when the subprocess fails for any reason. Never raises.
+    """
+    if not workdir or not workdir.exists():
+        return []
+    if not shutil.which("ccc"):
+        return []
+    try:
+        result = subprocess.run(
+            ["ccc", "grep", r"class \NAME:", ".",
+             "--lang", "python", "--no-color"],
+            cwd=str(workdir), capture_output=True, text=True, timeout=timeout_s,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        log.debug(f"  ccc grep failed: {e}")
+        return []
+    return _parse_ccc_grep_output(result.stdout)
+
+
+def _parse_ccc_grep_output(output: str) -> list[dict]:
+    """Parse ``ccc grep --no-color`` output into ``{kind, name, file, line}``.
+
+    Format from ``cocoindex_code.grep.render_file``:
+    - file path on its own line (no gutter)
+    - match lines: ``  <n>| <source line>`` (line-number gutter)
+    - ``---`` separator between multi-match files (skipped)
+    """
+    lines = output.split("\n")
+    results: list[dict] = []
+    current_file: str | None = None
+    gutter_line = re.compile(r"^\s*(\d+)\|\s*(.*)$")
+    def_shape = re.compile(r"^\s*(class|def)\s+(\w+)")
+    for raw in lines:
+        if not raw.strip() or raw.strip() == "---":
+            continue
+        gm = gutter_line.match(raw)
+        if gm and current_file:
+            body = gm.group(2)
+            dm = def_shape.match(body)
+            if dm:
+                results.append({
+                    "kind": dm.group(1),
+                    "name": dm.group(2),
+                    "file": current_file,
+                    "line": int(gm.group(1)),
+                })
+            continue
+        current_file = raw.strip()
+    return results
+
+
+def _rank_by_name_similarity(
+    identifier: str, candidates: list[dict],
+    min_ratio: float = 0.5, top_k: int = 3,
+) -> list[dict]:
+    """Rank candidate class definitions by name similarity to ``identifier``.
+
+    Uses ``difflib.SequenceMatcher.ratio`` — stdlib, deterministic, no
+    embedding-model dep. Drops self-matches and anything below
+    ``min_ratio``. Returns at most ``top_k``, each annotated with the
+    computed ``similarity``.
+    """
+    from difflib import SequenceMatcher
+    scored: list[tuple[float, dict]] = []
+    for c in candidates:
+        if c.get("name") == identifier:
+            continue
+        ratio = SequenceMatcher(None, c["name"], identifier).ratio()
+        if ratio >= min_ratio:
+            scored.append((ratio, c))
+    scored.sort(key=lambda p: -p[0])
+    return [dict(c, similarity=round(r, 3)) for r, c in scored[:top_k]]
+
+
+def _enumerate_definitions(
+    identifier: str, workdir: "Path", max_results: int = 3,
+) -> list[dict]:
+    """Return the top-``max_results`` class definitions in ``workdir``
+    structurally similar to ``identifier`` — REMYX-179.
+
+    Silent no-op when cocoindex-code isn't attached (``ccc`` not on PATH),
+    or when the workdir has no class definitions to enumerate. Kept as
+    a single-argument entry point so callers don't need to know about
+    the class-def enumeration step.
+    """
+    if not identifier or not workdir or not workdir.exists():
+        return []
+    candidates = _query_ccc_class_defs(workdir)
+    if not candidates:
+        return []
+    return _rank_by_name_similarity(identifier, candidates, top_k=max_results)
+
+
+def _format_convention_precedents_section(
+    claims_to_precedents: dict[str, list[dict]],
+) -> str:
+    """Render the convention-precedents section for an Issue body.
+
+    Only emits a section when at least one claim has non-empty
+    precedents — silence beats a spurious "no matches found" block when
+    cocoindex wasn't attached or the workdir had no class definitions.
+    """
+    if not any(claims_to_precedents.values()):
+        return ""
+    lines = [
+        "",
+        "**Convention precedents (via cocoindex AST search)**",
+        "",
+    ]
+    for claim, precedents in claims_to_precedents.items():
+        if not precedents:
+            continue
+        lines.append(
+            f"_Structurally similar to `{claim}` — top {len(precedents)}:_"
+        )
+        for p in precedents:
+            sim = p.get("similarity")
+            sim_str = f" (similarity: {sim:.2f})" if sim is not None else ""
+            lines.append(
+                f"- `{p['name']}` ({p['kind']}){sim_str} — "
+                f"`{p['file']}:{p['line']}`"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _enrich_body_with_convention_precedents(
+    body: str, workdir: "Path",
+) -> str:
+    """Append a convention-precedents block to ``body`` when any sibling
+    claims resolve via cocoindex AST enumeration.
+
+    REMYX-179 — converts agent-inferred sibling claims ("sits alongside
+    `X`") into reader-verifiable, similarity-ranked precedents backed by
+    ``ccc grep 'class \\NAME:'``. Silent no-op when cocoindex isn't
+    attached, no sibling claims are detected, or no precedents pass the
+    similarity threshold.
+    """
+    if not body:
+        return body
+    claims = _extract_sibling_claims(body)
+    if not claims:
+        return body
+    resolutions: dict[str, list[dict]] = {}
+    for claim in claims:
+        resolutions[claim] = _enumerate_definitions(claim, workdir)
+    section = _format_convention_precedents_section(resolutions)
+    if not section:
+        return body
+    return body + "\n" + section
+
+
 def _format_hf_checkpoint_section(linkage: dict | None) -> str:
     """Render an Issue-body block reporting HF Hub checkpoint availability.
 
@@ -7910,6 +8096,12 @@ def process_target(target: Target) -> dict:
             if _is_architecture_add_shape(issue_body_inner):
                 linkage = _fetch_hf_paper_linkage(rec.arxiv_id)
                 preflight_detail += _format_hf_checkpoint_section(linkage)
+            # REMYX-179: convert agent-inferred sibling claims ("sits alongside
+            # `X`") into reader-verifiable enumerations by grepping the
+            # workdir for definitions sharing X's distinctive suffix.
+            preflight_detail = _enrich_body_with_convention_precedents(
+                preflight_detail, workdir,
+            )
             issue_url, issue_number = _open_downgrade_issue(
                 target, rec,
                 reason="Pre-flight routed to Issue before implementation",
@@ -7982,6 +8174,11 @@ def process_target(target: Target) -> dict:
                 f"{checkpoint_block}"
                 f"\n---\n\n"
                 f"{issue_body_inner}"
+            )
+            # REMYX-179: enrich with verified in-repo convention precedents
+            # for any sibling claims the agent cited in its Issue body.
+            issue_body = _enrich_body_with_convention_precedents(
+                issue_body, workdir,
             )
             issue_url, issue_number = open_issue(target, issue_title, issue_body)
             result["status"] = "issue_opened"
