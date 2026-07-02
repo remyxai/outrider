@@ -1262,7 +1262,7 @@ class Target:
     # single-item viable pool from that asset, and pins to it — bypassing
     # both the interest's candidate pool and the selection pass. Mutually
     # exclusive with pin_arxiv (validated in build_target_from_env).
-    pin_method: str = ""
+    search_method: str = ""
     # Optional: route the Claude Code subprocess at a non-default base URL.
     # When set, becomes ``ANTHROPIC_BASE_URL`` for every Claude CLI call,
     # which is the Anthropic-Messages-compatible protocol any z.ai/GLM,
@@ -7652,34 +7652,34 @@ def process_target(target: Target) -> dict:
             "arxiv_id": rec.arxiv_id,
             "title": rec.paper_title,
         }
-    elif target.pin_method:
-        asset = _resolve_pin_method(target.pin_method)
+    elif target.search_method:
+        asset = _resolve_pin_method(target.search_method)
         if asset is None:
             log.info(f"  ✗ skipped_no_method_match: pin-method "
-                     f"{target.pin_method!r} resolved to no asset")
+                     f"{target.search_method!r} resolved to no asset")
             result["status"] = "skipped_no_method_match"
-            result["pin_method"] = target.pin_method
+            result["search_method"] = target.search_method
             return result
         rec = _asset_to_recommendation(
-            asset, refine_query=f"pin-method:{target.pin_method}",
+            asset, refine_query=f"search-method:{target.search_method}",
             fallback_interest_name="(pin-method)",
             interest_context="",
             experiment_history="",
         )
         log.info(
-            f"  → pin-method {target.pin_method!r} resolved to "
+            f"  → search-method {target.search_method!r} resolved to "
             f"{rec.arxiv_id} ({rec.paper_title[:60]}…)"
         )
         candidates = [rec]
-        result["pin_method"] = target.pin_method
-        result["pin_method_resolution"] = {
-            "query": target.pin_method,
+        result["search_method"] = target.search_method
+        result["search_method_resolution"] = {
+            "query": target.search_method,
             "arxiv_id": rec.arxiv_id,
             "title": rec.paper_title,
         }
         # Reduce pin-method to pin_arxiv so the existing pinning logic at
         # §4 selects this candidate without a parallel code path. The
-        # original pin_method string is preserved in result["pin_method"]
+        # original search_method string is preserved in result["search_method"]
         # for the step summary.
         target.pin_arxiv = rec.arxiv_id
     else:
@@ -7725,7 +7725,7 @@ def process_target(target: Target) -> dict:
     # re-runs, demo re-takes, and "improve the prior artifact" workflows
     # would always skip with skipped_issue_exists. PR-collision check
     # below stays active — that's a real safety property.
-    pin_override = bool(target.pin_method or target.pin_arxiv)
+    pin_override = bool(target.search_method or target.pin_arxiv)
     viable: list[Recommendation] = []
     dropped_low_conf = 0
     dropped_pr_exists = 0
@@ -7809,9 +7809,9 @@ def process_target(target: Target) -> dict:
             # pin-method reduces to pin-arxiv internally (see §2); surface
             # the original user-facing source in the reasoning so step
             # summaries / telemetry are honest about which input drove the pin.
-            if target.pin_method:
+            if target.search_method:
                 result["selection_reasoning"] = (
-                    f"(pinned via pin-method={target.pin_method!r} → "
+                    f"(pinned via search-method={target.search_method!r} → "
                     f"{target.pin_arxiv})"
                 )
             else:
@@ -8762,7 +8762,7 @@ def build_target_from_env() -> Target:
         test_integration_policy=test_integration_policy,
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
-        pin_method=_optional_env("INPUT_PIN_METHOD", ""),
+        search_method=_optional_env("INPUT_SEARCH_METHOD", ""),
         model_base_url=_optional_env("INPUT_MODEL_BASE_URL", ""),
         chain_enabled=chain_enabled,
         notes="",
@@ -13391,8 +13391,8 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         # up as PR / Issue / preflight-Issue / no-integration.
         "preflight_decision": result.get("preflight_decision"),
         "audit_anchor": result.get("audit_anchor"),
-        "pin_method": result.get("pin_method"),
-        "pin_method_resolution": result.get("pin_method_resolution"),
+        "search_method": result.get("search_method"),
+        "search_method_resolution": result.get("search_method_resolution"),
         "selection_proposed_call_site": (
             (result.get("selection_proposed_call_site") or "")[:512] or None
         ),
@@ -13541,7 +13541,7 @@ def main():
         sys.exit(2)
 
     target = build_target_from_env()
-    if target.pin_arxiv and target.pin_method:
+    if target.pin_arxiv and target.search_method:
         log.error(
             "pin-arxiv and pin-method are mutually exclusive; set one or "
             "the other, not both."

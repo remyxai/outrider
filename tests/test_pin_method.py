@@ -116,9 +116,9 @@ def test_pin_method_empty_query_returns_none(monkeypatch):
 def test_target_picks_up_pin_method_env(monkeypatch):
     monkeypatch.setenv("TARGET_REPO", "owner/name")
     monkeypatch.setenv("INPUT_INTEREST_ID", "00000000-0000-0000-0000-000000000000")
-    monkeypatch.setenv("INPUT_PIN_METHOD", "knowledge distillation")
+    monkeypatch.setenv("INPUT_SEARCH_METHOD", "knowledge distillation")
     target = run.build_target_from_env()
-    assert target.pin_method == "knowledge distillation"
+    assert target.search_method == "knowledge distillation"
     assert target.pin_arxiv == ""
 
 
@@ -126,7 +126,7 @@ def test_target_pin_arxiv_and_pin_method_both_default_empty(monkeypatch):
     monkeypatch.setenv("TARGET_REPO", "owner/name")
     monkeypatch.setenv("INPUT_INTEREST_ID", "00000000-0000-0000-0000-000000000000")
     target = run.build_target_from_env()
-    assert target.pin_method == ""
+    assert target.search_method == ""
     assert target.pin_arxiv == ""
 
 
@@ -137,7 +137,7 @@ def test_main_exits_when_both_pin_inputs_set(monkeypatch):
     monkeypatch.setenv("TARGET_REPO", "owner/name")
     monkeypatch.setenv("INPUT_INTEREST_ID", "00000000-0000-0000-0000-000000000000")
     monkeypatch.setenv("INPUT_PIN_ARXIV", "2410.20305v2")
-    monkeypatch.setenv("INPUT_PIN_METHOD", "knowledge distillation")
+    monkeypatch.setenv("INPUT_SEARCH_METHOD", "knowledge distillation")
     with pytest.raises(SystemExit) as exc:
         run.main()
     assert exc.value.code == 2
@@ -155,7 +155,7 @@ def test_pin_method_bypasses_discharge_filter(monkeypatch):
     monkeypatch.setenv(
         "INPUT_INTEREST_ID", "00000000-0000-0000-0000-000000000000"
     )
-    monkeypatch.setenv("INPUT_PIN_METHOD", "2410.20305v2")
+    monkeypatch.setenv("INPUT_SEARCH_METHOD", "2410.20305v2")
 
     # Resolve the pin to a synthetic asset
     asset = {
