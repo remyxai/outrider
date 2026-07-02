@@ -8500,11 +8500,27 @@ def process_target(target: Target) -> dict:
                 timeout_s=target.claude_timeout_s,
             )
             if patched:
-                # Re-commit + push the patched branch, then re-run fidelity
-                commit_and_push(
-                    workdir, branch, pr_title, repo=target.repo,
-                    base_branch=default_branch,
-                )
+                # Append the patch as a second commit on the existing
+                # branch. Can't reuse `commit_and_push` — its safety
+                # guard requires HEAD == origin/main, which no longer
+                # holds after the first commit_and_push moved HEAD to
+                # the feature branch. Direct git ops here.
+                try:
+                    subprocess.run(
+                        ["git", "commit", "-am", "Fidelity remediation"],
+                        cwd=workdir, check=True, capture_output=True, text=True,
+                    )
+                    subprocess.run(
+                        ["git", "push", "origin", branch],
+                        cwd=workdir, check=True, capture_output=True, text=True,
+                    )
+                    log.info(f"  ✓ pushed patch commit on {branch}")
+                except subprocess.CalledProcessError as e:
+                    stderr = (e.stderr or "").strip()
+                    log.warning(f"  ⚠ patch commit/push failed: {stderr[-300:]}")
+                    result["status"] = "skipped_fidelity_fabrication"
+                    result["error"] = f"patch commit failed: {stderr[-200:]}"
+                    return result
                 revised_verdict = _run_pre_pr_fidelity_check(
                     rec, target, workdir, pr_title, pr_body,
                     base_branch=default_branch,
