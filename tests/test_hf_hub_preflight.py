@@ -1,4 +1,4 @@
-"""Tests for the HF Hub checkpoint-availability preflight (REMYX-178).
+"""Tests for the HF Hub checkpoint-availability preflight.
 
 The preflight uses HF Hub's canonical arxiv-paper linkage API
 (``GET /api/papers/{arxiv_id}``) rather than heuristic author/name

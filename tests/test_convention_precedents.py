@@ -1,4 +1,4 @@
-"""Tests for the convention-precedents body enrichment (REMYX-179).
+"""Tests for the convention-precedents body enrichment.
 
 Converts agent-inferred sibling claims ("sits alongside `X`") into
 reader-verifiable, similarity-ranked precedents backed by

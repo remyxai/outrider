@@ -293,7 +293,7 @@ def test_select_unparseable_output_falls_back(tmp_path, monkeypatch):
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
 
 
-# ─── _fallback_candidate: license_compat as tiebreaker (REMYX-169) ────────
+# ─── _fallback_candidate: license_compat as tiebreaker ────────
 
 
 def _cand(title: str, relevance: float, license_compat: float) -> "run.Recommendation":
