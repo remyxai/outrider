@@ -2011,42 +2011,234 @@ def _fetch_arxiv_html_urls(arxiv_id: str) -> list[str]:
     return slugs
 
 
+def _title_words(title: str) -> list[str]:
+    """Words >= 4 chars from the paper title, lowercased. Used as the
+    substring corpus for repo-name overlap scoring."""
+    return [w.lower() for w in re.findall(r"[A-Za-z]{4,}", title)]
+
+
+def _score_slug_title_overlap(slug: str, title: str) -> int:
+    """Count how many title words appear as substrings in the repo name
+    (the last path segment of ``slug``, lowercased). Zero means no
+    lexical evidence the repo is the paper's own — a signal to refuse
+    attribution rather than pick a citation URL by default.
+    """
+    name = slug.split("/")[-1].lower()
+    return sum(1 for w in _title_words(title) if w in name)
+
+
 def _rank_slugs_by_title_overlap(slugs: list[str], title: str) -> list[str]:
     """Rank github slugs so the one whose repo name shares the most
     substrings with the paper title comes first. Handles compound repo
     names like ``EntityBindingFailures`` where token-splitting fails but
     substring matching against title words succeeds.
     """
-    words = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", title)]
-    def _score(slug: str) -> int:
-        name = slug.split("/")[-1].lower()
-        return sum(1 for w in words if w in name)
-    return sorted(slugs, key=lambda s: -_score(s))
+    return sorted(slugs, key=lambda s: -_score_slug_title_overlap(s, title))
+
+
+# Extract every ``http(s)://...`` URL from HTML (not just github). Used
+# for the project-page one-hop step in retry: an arxiv HTML page might
+# not cite the paper's github repo directly but might link to a project
+# page (``moonmath.ai/hyperquant/``) whose HTML in turn cites the repo.
+_ANY_URL_RE = re.compile(r'https?://[A-Za-z0-9./_\-~%?=&:#]+')
+
+
+def _fetch_url_html(url: str, timeout_s: int = 10) -> str:
+    """Best-effort HTTP GET returning HTML body or ``""``. Never raises."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "feature-finder-orchestrator",
+                "Accept": "text/html",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"  URL fetch for {url!r} failed: {e}")
+        return ""
+
+
+def _extract_project_page_urls(html: str, title: str) -> list[str]:
+    """Extract URLs from ``html`` that look like paper-project pages —
+    URL path contains a title-word substring. Filters out github (already
+    handled by the direct-arxiv-HTML path) and boilerplate hosts.
+    """
+    if not html:
+        return []
+    title_words = _title_words(title)
+    if not title_words:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _ANY_URL_RE.finditer(html):
+        url = match.group(0)
+        # Strip trailing punctuation the regex might have grabbed
+        url = url.rstrip(".,;:!)\"'")
+        lower = url.lower()
+        if any(host in lower for host in (
+            "github.com/", "arxiv.org/", "huggingface.co/",
+            "doi.org/", "openreview.net/",
+        )):
+            continue
+        # Path (after the host) contains at least one title-word substring?
+        try:
+            path = url.split("//", 1)[1].split("/", 1)[1].lower()
+        except IndexError:
+            continue
+        if not any(w in path for w in title_words):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+        if len(out) >= 3:  # cap the one-hop fanout
+            break
+    return out
+
+
+_README_CACHE: dict[str, str] = {}
+
+
+def _fetch_repo_readme(owner_repo: str) -> str:
+    """Fetch the repo's README raw content via GitHub API.
+
+    Uses ``GET /repos/{owner_repo}/readme`` which returns the primary
+    README (README.md / README.rst / README anywhere in root). Returns
+    the decoded content or ``""`` on any failure. Cached per-process.
+    """
+    if not owner_repo:
+        return ""
+    if owner_repo in _README_CACHE:
+        return _README_CACHE[owner_repo]
+    try:
+        resp = gh_api("GET", f"/repos/{owner_repo}/readme")
+        b64 = resp.get("content") or ""
+        content = base64.b64decode(b64).decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"  README fetch for {owner_repo!r} failed: {e}")
+        content = ""
+    _README_CACHE[owner_repo] = content
+    return content
+
+
+def _verify_repo_matches_paper(
+    slug: str, paper_title: str, arxiv_id: str,
+) -> bool:
+    """Positive verification that a candidate github repo is the paper's
+    own repo: fetch its README and check whether the paper's title (or a
+    distinctive title word) or the arxiv id appears in it.
+
+    Complements ``_score_slug_title_overlap``: repo-name matching is fast
+    but shallow (misses cases where the paper's short-name doesn't appear
+    in the repo name). README matching is fast enough to run per-candidate
+    and catches "the repo name doesn't obviously match but the README
+    clearly describes this paper" cases.
+
+    Returns ``True`` when either the arxiv id appears in the README, or
+    at least 2 distinct >=4-char title words appear. Never raises.
+    """
+    readme = _fetch_repo_readme(slug)
+    if not readme:
+        return False
+    readme_l = readme.lower()
+    if arxiv_id and arxiv_id.lower() in readme_l:
+        return True
+    title_words = _title_words(paper_title)
+    if not title_words:
+        return False
+    hits = sum(1 for w in title_words if w in readme_l)
+    return hits >= 2
+
+
+def _gather_arxiv_html_candidate_slugs(arxiv_id: str, paper_title: str) -> list[str]:
+    """Collect github repo slugs from arxiv HTML + one-hop project pages.
+
+    Papers sometimes cite prior work / dependencies as github URLs in
+    their arxiv HTML but *not* their own repo (which is instead linked
+    via a project-page URL). This gathers candidates from two sources:
+
+      1. github URLs directly in the arxiv HTML (same as v1.7.1)
+      2. project-page URLs from the arxiv HTML — a URL whose path
+         contains title-word substrings, e.g. ``moonmath.ai/hyperquant/``
+         for a paper titled "HyperQuant..." — fetched one hop, then
+         github URLs extracted from each
+
+    Returns a deduplicated list; downstream ranks and verifies each.
+    Never raises.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return []
+    # 1. Direct github URLs from arxiv HTML (existing behavior)
+    direct = _fetch_arxiv_html_urls(arxiv_id)
+    # 2. One-hop project pages — fetch the arxiv HTML raw so we can
+    # scan for project-page URLs (footer + boilerplate already stripped
+    # from `direct`'s output, so we re-fetch the HTML to get the full
+    # URL space).
+    arxiv_html = _fetch_url_html(f"https://arxiv.org/html/{arxiv_id}")
+    from_project_pages: list[str] = []
+    for project_url in _extract_project_page_urls(arxiv_html, paper_title or ""):
+        page_html = _fetch_url_html(project_url)
+        if not page_html:
+            continue
+        gh_from_page = [
+            s for s in _extract_github_urls(page_html)
+            if s.lower() not in _ARXIV_HTML_NOISE
+        ]
+        from_project_pages.extend(gh_from_page)
+    # Dedupe while preserving order (direct first, then project-page finds)
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in direct + from_project_pages:
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
 
 def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str) -> bool:
     """When the primary license path left ``license_class`` unfavorable
     (``no-code-link`` / ``unknown`` / ``missing``), try discovering fresh
-    github URLs from arxiv's HTML surface and re-classifying. Returns
-    ``True`` when the retry produced a bucketable result and updated the
-    candidate in place, ``False`` otherwise. Never raises.
+    github URLs from arxiv's HTML surface + linked project pages, and
+    re-classify against those. Returns ``True`` when the retry produced
+    a bucketable result and updated the candidate in place, ``False``
+    otherwise. Never raises.
 
-    The retry addresses two observed failure modes:
-      - Discovery gaps: the paper's github URL never surfaced from the
-        Remyx envelope or the abstract page, so classification never got
-        a chance to run.
-      - Timing gaps: GitHub's async license classifier hadn't caught up
-        when the primary path ran, returning ``NOASSERTION``. A fresh
-        fetch after some delay usually returns the real SPDX.
+    Attribution gates, applied in order to avoid mislabeling a cited-
+    prior-work repo as the paper's own:
+      - Title-overlap threshold: skip candidates whose repo name shares
+        no >=4-char substring with the paper title (zero-score URLs are
+        by default citations, not the paper's own repo).
+      - README verification: fetch each remaining candidate's README and
+        require that the arxiv id OR at least 2 distinct title words
+        appear before accepting.
+
+    Only after those gates does the retry run license classification
+    and update the candidate.
     """
     unfavorable = ("no-code-link", "unknown", "missing")
     if candidate.license_class not in unfavorable:
         return False
-    slugs = _fetch_arxiv_html_urls(candidate.arxiv_id)
+    paper_title = candidate.paper_title or ""
+    slugs = _gather_arxiv_html_candidate_slugs(candidate.arxiv_id, paper_title)
     if not slugs:
         return False
-    ranked = _rank_slugs_by_title_overlap(slugs, candidate.paper_title or "")
-    for slug in ranked:
+    # Score each slug; drop zero-overlap (Option 1)
+    scored = [(s, _score_slug_title_overlap(s, paper_title)) for s in slugs]
+    scored = [(s, score) for s, score in scored if score > 0]
+    if not scored:
+        return False
+    scored.sort(key=lambda pair: -pair[1])
+    for slug, _score in scored:
+        # README verification (Option 3): repo must show evidence of
+        # being this paper's own project before we attribute a license
+        # from it. Handles the "cited-not-own" case where title-overlap
+        # happens to be non-zero but the repo is really a citation.
+        if not _verify_repo_matches_paper(slug, paper_title, candidate.arxiv_id):
+            continue
         fresh_spdx = _fetch_repo_license(slug)
         if not fresh_spdx or fresh_spdx.upper() == "NOASSERTION":
             continue
@@ -2060,8 +2252,8 @@ def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str
         candidate.license_class = fresh_class
         candidate.license_compat = _license_compat_score(fresh_class, target_class)
         log.info(
-            "  ↻ license retry via arxiv HTML on %s…: %s (%s)",
-            (candidate.paper_title or "")[:50], fresh_spdx, fresh_class,
+            "  ↻ license retry via arxiv HTML on %s…: %s (%s) via %s",
+            paper_title[:50], fresh_spdx, fresh_class, slug,
         )
         return True
     return False
