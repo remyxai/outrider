@@ -2519,15 +2519,22 @@ def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str
 
     Attribution gates, applied in order to avoid mislabeling a cited-
     prior-work repo as the paper's own:
-      - Title-overlap threshold: skip candidates whose repo name shares
-        no >=4-char substring with the paper title (zero-score URLs are
-        by default citations, not the paper's own repo).
-      - README verification: fetch each remaining candidate's README and
+      - README verification (primary): fetch each candidate's README and
         require that the arxiv id OR at least 2 distinct title words
-        appear before accepting.
+        appear before accepting. Dispositive evidence — a repo whose
+        README references the paper is the paper's own project.
+      - Title-overlap threshold (tie-breaker): among README-verified
+        candidates, prefer those whose repo name shares a >=4-char
+        substring with the paper title. Only used to order multiple
+        surviving candidates, never as a filter.
 
-    Only after those gates does the retry run license classification
-    and update the candidate.
+    Ordering rationale: README-verify runs first because it's stronger
+    evidence than a name-overlap heuristic. The prior ordering
+    (title-overlap → README-verify) filtered out acronym-named repos
+    whose acronym isn't literally in the paper title — e.g. an arxiv
+    paper "Visually Grounded Self-Reflection ..." with a "VRRL"
+    repo would drop at zero title-overlap even though its README
+    explicitly cites the arxiv id.
     """
     unfavorable = ("no-code-link", "unknown", "missing")
     if candidate.license_class not in unfavorable:
@@ -2536,19 +2543,19 @@ def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str
     slugs = _gather_arxiv_html_candidate_slugs(candidate.arxiv_id, paper_title)
     if not slugs:
         return False
-    # Score each slug; drop zero-overlap (Option 1)
-    scored = [(s, _score_slug_title_overlap(s, paper_title)) for s in slugs]
-    scored = [(s, score) for s, score in scored if score > 0]
-    if not scored:
+    # README verification first (dispositive evidence): a repo whose
+    # README references the arxiv id or ≥2 title words is the paper's
+    # own project, regardless of whether the repo name looks acronym-y.
+    verified = [
+        s for s in slugs
+        if _verify_repo_matches_paper(s, paper_title, candidate.arxiv_id)
+    ]
+    if not verified:
         return False
-    scored.sort(key=lambda pair: -pair[1])
-    for slug, _score in scored:
-        # README verification (Option 3): repo must show evidence of
-        # being this paper's own project before we attribute a license
-        # from it. Handles the "cited-not-own" case where title-overlap
-        # happens to be non-zero but the repo is really a citation.
-        if not _verify_repo_matches_paper(slug, paper_title, candidate.arxiv_id):
-            continue
+    # Title-overlap becomes a tie-breaker across README-verified survivors:
+    # prefer the one whose repo name shares more substring with the title.
+    verified.sort(key=lambda s: -_score_slug_title_overlap(s, paper_title))
+    for slug in verified:
         fresh_spdx = _fetch_repo_license(slug)
         if not fresh_spdx or fresh_spdx.upper() == "NOASSERTION":
             continue
