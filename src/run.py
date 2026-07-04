@@ -4817,6 +4817,14 @@ def write_spec_bundle(
         if note and not note.startswith("(")
         else "(no separate selection rationale — this was the top-ranked candidate)"
     )
+    # LEAD-to-PR override: when INPUT_LEAD_CONTENT is set, replace the paper's
+    # suggested_experiment with the LEAD's verbatim scope. This turns a
+    # dispatch into a scoped-experiment implementation rather than a
+    # full-paper-integration attempt — the preflight + implementer both
+    # reason against the LEAD's scoped framing, which is exactly what the
+    # human who chose to convert this LEAD to a PR wants shipped.
+    lead_content_override = (os.environ.get("INPUT_LEAD_CONTENT") or "").strip()
+    effective_experiment = lead_content_override or (rec.suggested_experiment or "(none)")
     (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
         paper_title=rec.paper_title,
         arxiv_id=rec.arxiv_id,
@@ -4826,7 +4834,7 @@ def write_spec_bundle(
         interest_context_block=interest_block,
         reasoning=rec.reasoning or "(no reasoning provided)",
         selection_block=selection_block,
-        suggested_experiment=rec.suggested_experiment or "(none)",
+        suggested_experiment=effective_experiment,
         paper_abstract=rec.paper_abstract or "(abstract unavailable)",
     ))
 

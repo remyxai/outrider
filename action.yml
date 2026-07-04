@@ -198,6 +198,18 @@ inputs:
       same ceiling so a single knob covers per-dispatch budget tuning.
     required: false
     default: '900'
+  lead-content:
+    description: |
+      Optional scoped implementation spec (verbatim LEAD content from a
+      prior Outrider Issue's `lead_content` field). When set, replaces
+      the paper's `suggested_experiment` in SPEC.md — Claude Code's
+      implementation is driven by the LEAD's scoped experiment rather
+      than the paper's own contribution framing. Use this to convert a
+      LEAD Issue into a Draft PR without changing the paper reference
+      (dispatch with pin-arxiv=<paper> + lead-content=<LEAD's scoped
+      experiment>). Empty = normal paper-driven implementation.
+    required: false
+    default: ''
   pin-arxiv:
     description: |
       Optional arxiv_id. When set and present in the candidate pool, the
@@ -428,6 +440,7 @@ runs:
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         INPUT_SEARCH_METHOD: ${{ inputs.search-method }}
         INPUT_PUBLISH: ${{ inputs.publish }}
+        INPUT_LEAD_CONTENT: ${{ inputs.lead-content }}
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).
