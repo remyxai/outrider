@@ -1221,6 +1221,34 @@ class LeadCapturedInBranchMode(RuntimeError):
         self.body = body
 
 
+class BranchPushedFromDowngrade(RuntimeError):
+    """Signals that publish=branch is in effect at a post-coding-agent
+    downgrade point, and the branch has been pushed to the fork in lieu
+    of opening a downgrade Issue.
+
+    Under normal publish=pr mode, when a downstream check (integration
+    validator, stub-density, diff-risk, self-review orphan, etc.) fires
+    after the coding agent produced code, the flow calls open_downgrade
+    which files an Issue with the diff attached. Under publish=branch,
+    the whole point of the mode is *user reviews what the agent produced*
+    — dropping the code because a rule fired defeats that purpose.
+
+    This sentinel is raised after commit_and_push has pushed the branch,
+    carrying the downgrade context (reason + detail) so process_target
+    can surface why-would-have-been-blocked as informational content in
+    the step summary. Team reviews the branch + reasoning, decides whether
+    to promote to PR or discard.
+    """
+    def __init__(self, branch: str, branch_url: str, reason: str, detail: str) -> None:
+        super().__init__(
+            f"Downgrade suppressed under publish=branch: {reason}"
+        )
+        self.branch = branch
+        self.branch_url = branch_url
+        self.reason = reason
+        self.detail = detail
+
+
 class IssuesDisabledError(RuntimeError):
     """The target repo has its Issues tab disabled and the run's token
     can't re-enable it.
@@ -6535,8 +6563,6 @@ def check_integration(
 
     Pass criteria — ALL of:
       * Number of new .py files under {package}/ ≤ MAX_NEW_PACKAGE_FILES.
-      * Each modified existing file's net change ≤
-        MAX_LINES_PER_EXISTING_FILE lines.
       * If the diff adds any new public function / method / class, at least
         one of them must be INVOKED from a different changed file. This
         proves the new code is wired into a call site rather than merely
@@ -6551,6 +6577,14 @@ def check_integration(
     code at least runs; whether a *production* path reaches it is the
     self-review reachability pass's job (§4).
 
+    Historical note: a per-file line-count cap on edits to existing files
+    was removed after observation that it produced false-negatives on
+    legitimate paper implementations (large-but-focused rewrites of
+    trainer loss functions, big test additions matching the paper's
+    property-test surface). Scope discipline is now enforced downstream
+    by the convention pass, which uses graded signal against the repo's
+    own PR history rather than a hardcoded line ceiling.
+
     Returns (passed, [violations]).
     """
     paths = changed_files(workdir)
@@ -6561,21 +6595,6 @@ def check_integration(
         if p.startswith(pkg_prefix) and p.endswith(".py") and _file_is_new(workdir, p)
     ]
 
-    # Total lines added across new package modules. A concurrent new module
-    # of meaningful size signals that any edit to an existing file is likely
-    # a wrapper/registration (imports + declaration + docstring), not the
-    # actual logic. In that case we raise the existing-file limit to
-    # unblock the "small wrapper + spillover to a new module" pattern.
-    # (New files are untracked here — git diff --numstat sees nothing for
-    # them, so read directly.)
-    def _new_file_lines(p: str) -> int:
-        try:
-            return sum(1 for _ in (workdir / p).open("r", encoding="utf-8", errors="ignore"))
-        except OSError:
-            return 0
-    new_pkg_lines = sum(_new_file_lines(p) for p in new_pkg_files)
-    has_spillover = new_pkg_lines >= MIN_SPILLOVER_LINES
-
     violations: list[str] = []
 
     if len(new_pkg_files) > MAX_NEW_PACKAGE_FILES:
@@ -6583,24 +6602,6 @@ def check_integration(
             f"too many new files in {package}/: {len(new_pkg_files)} > "
             f"{MAX_NEW_PACKAGE_FILES}"
         )
-
-    for p in paths:
-        if _file_is_new(workdir, p):
-            continue
-        added, deleted = _diff_line_changes(workdir, p)
-        # Purely-additive edit alongside a substantial new module = the
-        # surgical wrapper pattern. Higher cap. In-place edits (deleted > 0)
-        # always stay at the tighter cap — those are the rewrites this
-        # threshold exists to catch.
-        if deleted == 0 and has_spillover:
-            limit = MAX_LINES_PER_EXISTING_FILE_WITH_SPILLOVER
-        else:
-            limit = MAX_LINES_PER_EXISTING_FILE
-        if added + deleted > limit:
-            violations.append(
-                f"oversized edit to existing file {p}: +{added}/-{deleted} "
-                f"> {limit}"
-            )
 
     # Invocation check. Every newly-added callable, keyed by the file that
     # defines it, must be called from some OTHER changed file.
@@ -7297,6 +7298,16 @@ def _open_downgrade_issue(
     suppress_suggested_experiment: bool = False,
     replacement_experiment: str = "",
     footer_override: str = "",
+    # publish=branch preservation: when the downgrade fires AFTER the
+    # coding agent produced code (integration / stub-density / diff-risk
+    # / test-integration / self-review-orphan), callers pass workdir +
+    # branch + base_branch so branch-mode can commit_and_push the agent's
+    # work and raise BranchPushedFromDowngrade instead of filing an Issue.
+    # Pre-coding callers (selection-time / preflight) omit these — the
+    # sentinel path via open_issue (LeadCapturedInBranchMode) handles them.
+    workdir: Optional[Path] = None,
+    branch: str = "",
+    base_branch: str = "main",
 ) -> tuple[str, int]:
     """Open an Issue when an automated gate downgrades a PR-candidate.
 
@@ -7333,6 +7344,25 @@ def _open_downgrade_issue(
         default attributes to coding-agent Issue-mode election (the
         legacy default); callers pass the routing-specific text.
     """
+    # publish=branch short-circuit for post-coding downgrades. When the
+    # coding agent produced code (workdir + branch supplied), preserve that
+    # work by pushing the branch to the fork and raising the sentinel that
+    # process_target catches. The downgrade reason + detail travel with the
+    # sentinel so the step summary can render the "would have been blocked
+    # under publish=pr" context. Team reviews the branch + reasoning,
+    # decides whether to promote to PR or delete.
+    publish_mode = (os.environ.get("INPUT_PUBLISH") or "pr").strip().lower()
+    if publish_mode == "branch" and workdir is not None and branch:
+        try:
+            commit_and_push(
+                workdir, branch, format_pr_title(rec),
+                repo=target.repo, base_branch=base_branch,
+            )
+        except Exception as e:
+            log.warning(f"  branch push failed under publish=branch: {e}")
+        branch_url = f"https://github.com/{target.repo}/tree/{branch}"
+        raise BranchPushedFromDowngrade(branch, branch_url, reason, detail)
+
     title = format_pr_title(rec)
 
     sections: list[str] = []
@@ -8327,6 +8357,7 @@ def process_target(target: Target) -> dict:
                     f"site — routed to Issue so the team can decide on "
                     f"the wiring._"
                 ),
+                workdir=workdir, branch=branch, base_branch=default_branch,
             )
             result["status"] = "issue_opened_no_integration"
             result["issue_url"] = issue_url
@@ -8370,6 +8401,7 @@ def process_target(target: Target) -> dict:
                     f"surface is stubs — routed to Issue rather than "
                     f"shipping a hollow PR._"
                 ),
+                workdir=workdir, branch=branch, base_branch=default_branch,
             )
             result["status"] = "issue_opened_stub_density"
             result["issue_url"] = issue_url
@@ -8406,6 +8438,7 @@ def process_target(target: Target) -> dict:
                     f"calibrated risk crossed the auto-land threshold — routed "
                     f"to Issue for human review per RADAR's risk-aware policy._"
                 ),
+                workdir=workdir, branch=branch, base_branch=default_branch,
             )
             result["status"] = "issue_opened_high_risk"
             result["issue_url"] = issue_url
@@ -8473,6 +8506,7 @@ def process_target(target: Target) -> dict:
                             f"integration is unproven. Routed to Issue."
                             f"_"
                         ),
+                        workdir=workdir, branch=branch, base_branch=default_branch,
                     )
                     result["status"] = "issue_opened_no_test_integration"
                     result["issue_url"] = issue_url
@@ -8662,6 +8696,40 @@ def process_target(target: Target) -> dict:
         result["pr_url"] = pr_url
         result["pr_number"] = pr_number
         log.info(f"  ✓ {result['status']}: {pr_url}")
+        return result
+
+    except BranchPushedFromDowngrade as e:
+        # publish=branch — a post-coding downgrade fired (integration /
+        # stub-density / diff-risk / test-integration / self-review-orphan)
+        # after the coding agent produced code. Instead of filing an Issue,
+        # the branch has been pushed to the fork; the downgrade reason +
+        # detail are surfaced as informational content in the step summary.
+        # Team reviews the branch's code + reasoning, decides whether to
+        # promote to PR (`gh pr create`) or delete the branch.
+        result["status"] = "branch_pushed_no_pr"
+        result["branch"] = e.branch
+        result["branch_url"] = e.branch_url
+        result["would_have_downgraded_reason"] = e.reason
+        log.info(
+            f"  ✓ {result['status']}: {e.branch_url} "
+            f"(no Issue filed; publish=branch; downgrade reason: {e.reason})"
+        )
+        _append_to_step_summary(
+            "## Branch mode — downgrade suppressed, branch preserved\n\n"
+            f"Branch pushed to fork: [`{e.branch}`]({e.branch_url})\n\n"
+            f"**Downgrade reason (informational)**: {e.reason}\n\n"
+            "Under `publish=pr`, this run would have opened an Issue with "
+            "the diff attached instead of a Draft PR, because a downstream "
+            "check flagged the implementation. Under `publish=branch` the "
+            "coding agent's output is preserved as a branch on the fork so "
+            "the team can review it directly and decide whether the "
+            "flagged concern is a real blocker.\n\n"
+            "**Detail:**\n\n"
+            f"{e.detail}\n\n"
+            "Promote via `gh pr create` if the branch is worth shipping "
+            "despite the flag, or delete via `git push origin --delete "
+            f"{e.branch}` if not."
+        )
         return result
 
     except LeadCapturedInBranchMode as e:
