@@ -322,6 +322,14 @@ runs:
       shell: bash
       run: pip install pytest remyxai
 
+    - name: Install poppler-utils (pdftotext for arxiv PDF license retry)
+      shell: bash
+      # pdftotext is the last-resort discovery source when arxiv HTML 404s
+      # for a paper. Not shipped by default on ubuntu-latest runners as of
+      # 2026; installing it here keeps the license-retry path from silently
+      # returning empty on HTML-less arxiv papers.
+      run: sudo apt-get install -y --no-install-recommends poppler-utils
+
     - name: Install gh-graph selection-pass tool on PATH
       shell: bash
       # Dependency-navigation helper the selection agent calls via its Bash
