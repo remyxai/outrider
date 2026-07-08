@@ -530,6 +530,69 @@ def test_gather_candidates_from_project_page_one_hop(monkeypatch):
     assert "moonmath-ai/HyperQuant" in slugs
 
 
+def test_gather_candidates_from_pdf_when_arxiv_html_404(monkeypatch):
+    """When ``arxiv.org/html/<id>`` returns nothing (paper never rendered
+    to HTML) and no project page is discoverable, the PDF-text fallback
+    still surfaces github URLs the authors advertised in the paper body.
+
+    Reproduces the SWE-Interact failure shape: arxiv HTML 404, PDF body
+    contains ``https://github.com/scaleapi/SWE-Interact``.
+    """
+    run._ARXIV_PDF_CACHE.clear()
+    monkeypatch.setattr(run, "_fetch_arxiv_html_urls", lambda arxiv_id: [])
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_pdf_text",
+        lambda arxiv_id, timeout_s=20: (
+            "We release our benchmark and code at "
+            "https://github.com/scaleapi/SWE-Interact and evaluate "
+            "against baselines."
+        ),
+    )
+    slugs = run._gather_arxiv_html_candidate_slugs(
+        "2606.30573v1",
+        "SWE-INTERACT: Reimagining SWE Benchmarks",
+    )
+    assert "scaleapi/SWE-Interact" in slugs
+
+
+def test_pdf_fallback_not_invoked_when_html_produces_hits(monkeypatch):
+    """The PDF-fetch is the expensive last resort. Skip it entirely when
+    the HTML surface (direct URLs or project pages) already produced any
+    slug — the common case, so we don't burn network on unused work."""
+    run._ARXIV_PDF_CACHE.clear()
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_html_urls",
+        lambda arxiv_id: ["scaleapi/SWE-Interact"],
+    )
+    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
+    pdf_calls = {"n": 0}
+    def counting_pdf(arxiv_id, timeout_s=20):
+        pdf_calls["n"] += 1
+        return "should/not/see"
+    monkeypatch.setattr(run, "_fetch_arxiv_pdf_text", counting_pdf)
+
+    slugs = run._gather_arxiv_html_candidate_slugs("2606.30573v1", "SWE-INTERACT")
+    assert "scaleapi/SWE-Interact" in slugs
+    assert pdf_calls["n"] == 0
+
+
+def test_fetch_arxiv_pdf_github_slugs_filters_noise(monkeypatch):
+    """The same arxiv boilerplate noise list applied to HTML-derived slugs
+    also applies to PDF-derived slugs — no double-counting the LaTeXML /
+    html_feedback footer refs if they appear in extracted PDF text."""
+    run._ARXIV_PDF_CACHE.clear()
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_pdf_text",
+        lambda arxiv_id, timeout_s=20: (
+            "Code: https://github.com/scaleapi/SWE-Interact . "
+            "Rendered by https://github.com/brucemiller/LaTeXML ."
+        ),
+    )
+    slugs = run._fetch_arxiv_pdf_github_slugs("2606.30573v1")
+    assert slugs == ["scaleapi/SWE-Interact"]
+
+
 # ─── helper units: scoring + verification primitives ──────────────────────
 
 

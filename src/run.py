@@ -2035,6 +2035,75 @@ def _fetch_arxiv_html_urls(arxiv_id: str) -> list[str]:
     return slugs
 
 
+_ARXIV_PDF_CACHE: dict[str, list[str]] = {}
+
+
+def _fetch_arxiv_pdf_text(arxiv_id: str, timeout_s: int = 20) -> str:
+    """Fetch ``https://arxiv.org/pdf/<arxiv_id>`` and extract body text
+    via ``pdftotext``. Returns ``""`` on any failure — network, missing
+    binary, decode error, oversized PDF. Never raises.
+
+    Papers that arxiv hasn't rendered to HTML (endpoint returns 404) are
+    still available as PDF. The PDF body reliably contains github URLs
+    the authors advertise, so this is the last-resort discovery source
+    when HTML + project-page scraping both come up empty.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return ""
+    try:
+        req = urllib.request.Request(
+            f"https://arxiv.org/pdf/{arxiv_id}",
+            headers={
+                "User-Agent": "feature-finder-orchestrator",
+                "Accept": "application/pdf",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            pdf_bytes = resp.read(20 * 1024 * 1024 + 1)
+        if len(pdf_bytes) > 20 * 1024 * 1024:
+            log.debug(f"  arxiv PDF for {arxiv_id} exceeds 20 MB cap; skipping")
+            return ""
+    except Exception as e:
+        log.debug(f"  arxiv PDF fetch for {arxiv_id} failed: {e}")
+        return ""
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", "-", "-"],
+            input=pdf_bytes,
+            capture_output=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        log.debug("  pdftotext binary unavailable; skipping PDF-text discovery")
+        return ""
+    except Exception as e:
+        log.debug(f"  pdftotext for {arxiv_id} failed: {e}")
+        return ""
+    if result.returncode != 0:
+        log.debug(f"  pdftotext for {arxiv_id} exit={result.returncode}")
+        return ""
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _fetch_arxiv_pdf_github_slugs(arxiv_id: str) -> list[str]:
+    """Extract github slugs from arxiv PDF body text. Cached, filtered
+    against the standard arxiv noise list. Never raises.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return []
+    if arxiv_id in _ARXIV_PDF_CACHE:
+        return _ARXIV_PDF_CACHE[arxiv_id]
+    text = _fetch_arxiv_pdf_text(arxiv_id)
+    slugs = [
+        s for s in _extract_github_urls(text)
+        if s.lower() not in _ARXIV_HTML_NOISE
+    ]
+    _ARXIV_PDF_CACHE[arxiv_id] = slugs
+    return slugs
+
+
 def _title_words(title: str) -> list[str]:
     """Words >= 4 chars from the paper title, lowercased. Used as the
     substring corpus for repo-name overlap scoring."""
@@ -2487,17 +2556,24 @@ def _format_hf_checkpoint_section(linkage: dict | None) -> str:
 
 
 def _gather_arxiv_html_candidate_slugs(arxiv_id: str, paper_title: str) -> list[str]:
-    """Collect github repo slugs from arxiv HTML + one-hop project pages.
+    """Collect github repo slugs from arxiv HTML + one-hop project pages
+    + PDF-text fallback.
 
     Papers sometimes cite prior work / dependencies as github URLs in
     their arxiv HTML but *not* their own repo (which is instead linked
-    via a project-page URL). This gathers candidates from two sources:
+    via a project-page URL). And some papers never get rendered to HTML
+    at all — the ``arxiv.org/html/<id>`` endpoint 404s — but their PDF
+    still names the code repo. This gathers candidates from three
+    sources:
 
       1. github URLs directly in the arxiv HTML (same as v1.7.1)
       2. project-page URLs from the arxiv HTML — a URL whose path
          contains title-word substrings, e.g. ``moonmath.ai/hyperquant/``
          for a paper titled "HyperQuant..." — fetched one hop, then
          github URLs extracted from each
+      3. github URLs extracted from the PDF body via ``pdftotext`` —
+         only invoked when 1 and 2 both came up empty (the arxiv-HTML-
+         404 case), so the common path never spends the PDF fetch.
 
     Returns a deduplicated list; downstream ranks and verifies each.
     Never raises.
@@ -2522,10 +2598,15 @@ def _gather_arxiv_html_candidate_slugs(arxiv_id: str, paper_title: str) -> list[
             if s.lower() not in _ARXIV_HTML_NOISE
         ]
         from_project_pages.extend(gh_from_page)
-    # Dedupe while preserving order (direct first, then project-page finds)
+    # 3. PDF-text fallback — only spent when the HTML surface produced
+    # nothing at all. Handles papers arxiv never rendered to HTML.
+    from_pdf: list[str] = []
+    if not direct and not from_project_pages:
+        from_pdf = _fetch_arxiv_pdf_github_slugs(arxiv_id)
+    # Dedupe while preserving order.
     seen: set[str] = set()
     out: list[str] = []
-    for s in direct + from_project_pages:
+    for s in direct + from_project_pages + from_pdf:
         if s in seen:
             continue
         seen.add(s)
