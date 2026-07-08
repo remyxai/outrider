@@ -461,39 +461,14 @@ def test_retry_via_arxiv_html_tries_multiple_urls_until_match(monkeypatch):
     assert c.paper_github_url == "https://github.com/real/paperfoo_repo"
 
 
-# ─── new v1.7.3 gates: zero-overlap threshold + README verification ───────
-
-
-def test_retry_skips_zero_overlap_urls(monkeypatch):
-    """Zero-overlap URLs (a github URL from arxiv HTML that has no
-    title-word substring in its repo name) get filtered out before
-    attribution — no misattribution of cited-prior-work as paper repo.
-    HyperQuant → Lightricks/LTX-Video failure shape."""
-    monkeypatch.setattr(
-        run, "_fetch_arxiv_html_urls",
-        lambda arxiv_id: ["Lightricks/LTX-Video"],  # 0 overlap with HyperQuant title
-    )
-    monkeypatch.setattr(run, "_fetch_url_html", lambda u, timeout_s=10: "")
-    # Should not even reach README verification or license fetch.
-    verify_calls = {"n": 0}
-    def counting_verify(slug, title, arxiv_id):
-        verify_calls["n"] += 1
-        return True
-    monkeypatch.setattr(run, "_verify_repo_matches_paper", counting_verify)
-    monkeypatch.setattr(run, "_fetch_repo_license", lambda slug: "MIT")
-
-    c = Recommendation(
-        paper_title="HyperQuant: A Rate-Distortion-Optimal Quantization Pipeline",
-        arxiv_id="2606.23406v1", tier="high", z_score=0.0, spec_md="",
-        paper_abstract="", domain_summary="", raw_paper_md="",
-    )
-    c.license_class = "no-code-link"
-    c.license_compat = 0.3
-
-    result = run._retry_license_via_arxiv_html(c, target_class="permissive")
-    assert result is False
-    assert verify_calls["n"] == 0  # Zero-overlap filter fires before verify
-    assert c.license_class == "no-code-link"
+# ─── README verification as the misattribution defense ───────────────────
+# Prior versions of the retry function had a title-overlap pre-filter that
+# rejected zero-overlap slugs before README verification. That filter was
+# removed intentionally — it dropped legitimately-attributed acronym-named
+# repos (e.g. a "VRRL" repo for a paper titled "Visually Grounded ...")
+# whose README explicitly cited the arxiv id. Misattribution defense now
+# lives entirely in README verification below, which is dispositive
+# evidence (arxiv id or ≥2 title words present).
 
 
 def test_retry_skips_when_readme_does_not_match(monkeypatch):
