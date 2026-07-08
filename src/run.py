@@ -2647,7 +2647,16 @@ def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str
     paper_title = candidate.paper_title or ""
     slugs = _gather_arxiv_html_candidate_slugs(candidate.arxiv_id, paper_title)
     if not slugs:
+        log.info(
+            "  ↻ license retry on %s… (%s): no github slugs from arxiv "
+            "HTML / project-pages / PDF fallback",
+            paper_title[:50], candidate.arxiv_id,
+        )
         return False
+    log.info(
+        "  ↻ license retry on %s… (%s): %d candidate slug(s) → %s",
+        paper_title[:50], candidate.arxiv_id, len(slugs), slugs[:5],
+    )
     # README verification first (dispositive evidence): a repo whose
     # README references the arxiv id or ≥2 title words is the paper's
     # own project, regardless of whether the repo name looks acronym-y.
@@ -2656,6 +2665,10 @@ def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str
         if _verify_repo_matches_paper(s, paper_title, candidate.arxiv_id)
     ]
     if not verified:
+        log.info(
+            "  ↻ license retry on %s…: 0 of %d slug(s) README-verified",
+            paper_title[:50], len(slugs),
+        )
         return False
     # Title-overlap becomes a tie-breaker across README-verified survivors:
     # prefer the one whose repo name shares more substring with the title.
