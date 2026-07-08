@@ -107,46 +107,24 @@ TIER_RANK = {"high": 3, "moderate": 2, "low": 1, "noise": 0, "near-random": 0}
 # Paths Claude Code is allowed to create/modify. Customers can extend
 # via the `guardrails-allowlist` input on the action (comma-separated).
 #
-# Permissive on the target package because §2 of the "ready-to-ship PRs"
-# work requires the agent to be able to add small wiring edits to
-# existing files (e.g. a 3-line hook in evaluation.py). The post-hoc
-# check_integration() validator caps how much can change per existing
-# file and rejects runs that only add freestanding modules.
+# Permissive on the target package because the agent needs to add small
+# wiring edits to existing files (e.g. a 3-line hook in evaluation.py) —
+# the post-hoc check_integration() validator enforces that at least one
+# newly-added callable is invoked from another changed file (rejecting
+# scaffold-shaped runs where new code is defined but never called).
 # Python source anywhere in the repo is editable: a wiring edit has to be
 # able to reach the real call site, which often lives outside the target
 # package (a pipeline/stage driver, an entrypoint module, etc.), and we
 # don't want to hard-code any one repo's directory layout. Infra files that
 # happen to sit alongside source — container builds, shell scripts,
 # dependency/build manifests, CI config — are blocked by ROLE in
-# ALWAYS_BLOCKED, which takes precedence. The 50-line edit cap and the
-# invocation check in check_integration() keep edits surgical and honest.
+# ALWAYS_BLOCKED, which takes precedence.
 DEFAULT_ALLOWLIST_GLOBS = [
     "*.py",
     ".remyx-recommendation/**",
     "**/*.md",               # Markdown anywhere (README, CHANGELOG, docs/,
                              # ADR notes). Diff is text-only and reviewable.
-                             # The 50-line edit cap still applies to existing
-                             # files; new docs files are uncapped but still
-                             # need to be referenced somewhere to land in a PR.
 ]
-
-# Cap on additions+deletions per pre-existing file. Keeps wiring edits
-# small and surgical; rejects runs where Claude rewrote an unrelated
-# module under the cover of "integration".
-MAX_LINES_PER_EXISTING_FILE = 50
-
-# Higher cap that applies to purely-additive edits (deleted == 0) when the
-# run also creates a substantial new module. The shape being unblocked is
-# "small wrapper edit at the existing API surface + bulk implementation in
-# a new module" — the surgical pattern we want to encourage. The `deleted
-# == 0` gate ensures rewrites of existing modules still hit the tighter
-# cap (that's the case the original threshold exists to catch).
-MAX_LINES_PER_EXISTING_FILE_WITH_SPILLOVER = 100
-
-# Minimum size of the concurrent new-module spillover that unlocks the
-# higher cap. Trivial new files (a two-line stub next to a 90-line edit to
-# an existing file) don't count as real spillover.
-MIN_SPILLOVER_LINES = 100
 
 # Cap on number of newly-created .py files in the target package. A
 # real integration adds one module, sometimes two; anything beyond

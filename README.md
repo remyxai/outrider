@@ -13,6 +13,7 @@ A GitHub Action that picks the next arXiv paper most implementable in your codeb
 
 - **Draft PRs** that wire a paper's contribution into an existing module, with a self-review section honestly noting what was implemented vs. left out
 - **Issues** when a PR would be premature — pre-flight, validators, or self-review route the paper to discussion instead
+- **A quieter "branch only" mode** (`publish: branch`) — pushes the implementation to the fork without opening a PR or Issue; the team reviews the branch via GitHub UI + workflow step summary, then runs `gh pr create` when ready. Zero maintainer attention consumed until the team decides to promote. Useful for exploring multiple candidates before committing to any.
 - **No duplicate work** — the same paper isn't re-recommended once any Outrider or maintainer Issue references it; reopen to re-engage
 - **A selection narrative** in the run's GitHub Actions step summary explaining why this paper (or why nothing actionable this run)
 
