@@ -383,10 +383,18 @@ def test_retry_via_arxiv_html_recovers_timing_gap(monkeypatch):
     assert c.paper_github_url == "https://github.com/pilancilab/Riemannian_Preconditioned_LoRA"
 
 
-def test_retry_via_arxiv_html_skips_noassertion_from_retry(monkeypatch):
-    """If the retry also finds a URL but that URL's license fetch returns
-    NOASSERTION (GitHub classifier still lagging), keep the original
-    unfavorable class rather than falsely upgrading."""
+def test_retry_via_arxiv_html_records_unlicensed_discovery(monkeypatch):
+    """If the retry finds a README-verified repo but its license fetch
+    returns NOASSERTION (no LICENSE file), record the discovery with a
+    ``missing`` classification rather than silently discarding it.
+
+    ``missing`` is stricter than the original ``no-code-link`` (0.0 vs
+    0.3 compat against a permissive target) — not a false upgrade, an
+    honest downgrade with the discovery URL captured. Downstream (LEAD
+    body, coordination check, preflight) then has real information:
+    the code exists but is unlicensed, so a PR route is blocked but
+    the maintainer's Issue-mode LEAD carries the correct URL.
+    """
     # Slug "foo" scores 1 against title "Foo methods" (title word 'foo' in 'foo')
     monkeypatch.setattr(
         run, "_fetch_arxiv_html_urls",
@@ -410,8 +418,12 @@ def test_retry_via_arxiv_html_skips_noassertion_from_retry(monkeypatch):
     c.license_compat = 0.0
 
     result = run._retry_license_via_arxiv_html(c, target_class="permissive")
-    assert result is False
-    assert c.license_class == "unknown"
+    assert result is True
+    assert c.license_class == "missing"
+    assert c.license_compat == 0.0  # missing vs any target → 0.0 (stricter than unknown/no-code-link)
+    assert c.paper_github_url == "https://github.com/some/foo"
+    assert c.license_source == "arxiv_html_retry"
+    assert c.paper_license == ""
 
 
 def test_retry_via_arxiv_html_tries_multiple_urls_until_match(monkeypatch):

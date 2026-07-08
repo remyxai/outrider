@@ -2573,6 +2573,7 @@ def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str
     # Title-overlap becomes a tie-breaker across README-verified survivors:
     # prefer the one whose repo name shares more substring with the title.
     verified.sort(key=lambda s: -_score_slug_title_overlap(s, paper_title))
+    # Pass 1: prefer a verified repo with a real (bucketable) license.
     for slug in verified:
         fresh_spdx = _fetch_repo_license(slug)
         if not fresh_spdx or fresh_spdx.upper() == "NOASSERTION":
@@ -2591,7 +2592,28 @@ def _retry_license_via_arxiv_html(candidate: "Recommendation", target_class: str
             paper_title[:50], fresh_spdx, fresh_class, slug,
         )
         return True
-    return False
+    # Pass 2: no bucketable-license repo across verified candidates — but
+    # we DID find the paper's code repo (README-verified). Record the
+    # discovery so downstream (LEAD content, coordination checks, preflight
+    # reasoning, ranker feedback) knows the code exists, even when the
+    # license gate then blocks the PR route. Classifying as ``missing``
+    # rather than ``no-code-link`` correctly signals "code found, unlicensed"
+    # to the compat scorer (0.0 for any target policy), which is a stricter
+    # + more accurate state than ``no-code-link`` (0.3) — unlicensed code
+    # is real legal-status information, not just an absence of evidence.
+    top_slug = verified[0]
+    if not candidate.paper_github_url:
+        candidate.paper_github_url = f"https://github.com/{top_slug}"
+    candidate.license_source = "arxiv_html_retry"
+    candidate.license_class = "missing"
+    candidate.license_compat = _license_compat_score("missing", target_class)
+    candidate.paper_license = ""
+    log.info(
+        "  ↻ license retry via arxiv HTML on %s…: code repo found "
+        "but no bucketable license via %s",
+        paper_title[:50], top_slug,
+    )
+    return True
 
 
 # Cached extracted text (title + abstract) per arxiv id. Populated by
