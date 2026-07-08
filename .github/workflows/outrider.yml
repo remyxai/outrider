@@ -4,6 +4,27 @@ on:
   schedule:
     - cron: '0 14 * * 1'
   workflow_dispatch:
+    inputs:
+      pin-arxiv:
+        description: 'Optional arxiv_id to implement directly (bypass selection).'
+        required: false
+        default: ''
+      publish:
+        description: 'pr (default) or branch — under branch mode, produces a fork branch without opening PR/Issue.'
+        required: false
+        default: 'pr'
+      provider:
+        description: 'anthropic (default) or zai for GLM.'
+        type: choice
+        required: false
+        default: 'anthropic'
+        options:
+          - anthropic
+          - zai
+      model:
+        description: 'Model name (empty = provider default).'
+        required: false
+        default: ''
 
 concurrency:
   group: outrider
@@ -18,7 +39,6 @@ jobs:
       issues: write
     env:
       REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       # Mint a remyx[bot] token from Remyx so the PR / Issue is authored by
@@ -26,6 +46,21 @@ jobs:
       # stays on Remyx's side; this uses the REMYX_API_KEY already in secrets.
       # If it can't be minted (e.g. App not installed), the token is empty and
       # the action falls back to the workflow's built-in GITHUB_TOKEN.
+      - name: Configure provider auth
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY_SECRET: ${{ secrets.ANTHROPIC_API_KEY }}
+          ZAI_API_KEY_SECRET: ${{ secrets.ZAI_API_KEY }}
+          MODEL_INPUT: ${{ inputs.model }}
+        run: |
+          if [ "${{ inputs.provider }}" = "zai" ]; then
+            echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY_SECRET" >> "$GITHUB_ENV"
+          else
+            echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_SECRET" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$MODEL_INPUT" ]; then
+            echo "ANTHROPIC_MODEL=$MODEL_INPUT" >> "$GITHUB_ENV"
+          fi
       - name: Mint Remyx bot token
         id: remyx-bot
         shell: bash
@@ -38,3 +73,6 @@ jobs:
           interest-id: '29ca03e7-454d-446c-9941-32c96c53d95d'
           # remyx[bot] token (empty → action falls back to GITHUB_TOKEN).
           github-token: ${{ steps.remyx-bot.outputs.token }}
+          pin-arxiv: ${{ inputs.pin-arxiv }}
+          publish: ${{ inputs.publish }}
+          model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '' }}
