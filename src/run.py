@@ -2061,18 +2061,11 @@ def _fetch_arxiv_pdf_text(arxiv_id: str, timeout_s: int = 20) -> str:
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             pdf_bytes = resp.read(20 * 1024 * 1024 + 1)
-            resp_url = resp.geturl()
-            resp_status = resp.status
-            content_type = resp.headers.get("content-type", "")
-        log.info(
-            "  PDF fetch %s: %d bytes, status=%s, ct=%s, final_url=%s",
-            arxiv_id, len(pdf_bytes), resp_status, content_type, resp_url,
-        )
         if len(pdf_bytes) > 20 * 1024 * 1024:
-            log.info(f"  arxiv PDF for {arxiv_id} exceeds 20 MB cap; skipping")
+            log.debug(f"  arxiv PDF for {arxiv_id} exceeds 20 MB cap; skipping")
             return ""
     except Exception as e:
-        log.info(f"  arxiv PDF fetch for {arxiv_id} failed: {type(e).__name__}: {e}")
+        log.debug(f"  arxiv PDF fetch for {arxiv_id} failed: {e}")
         return ""
     try:
         result = subprocess.run(
@@ -2082,23 +2075,15 @@ def _fetch_arxiv_pdf_text(arxiv_id: str, timeout_s: int = 20) -> str:
             timeout=30,
         )
     except FileNotFoundError:
-        log.info("  pdftotext binary unavailable; skipping PDF-text discovery")
+        log.debug("  pdftotext binary unavailable; skipping PDF-text discovery")
         return ""
     except Exception as e:
-        log.info(f"  pdftotext for {arxiv_id} failed: {type(e).__name__}: {e}")
+        log.debug(f"  pdftotext for {arxiv_id} failed: {e}")
         return ""
     if result.returncode != 0:
-        log.info(
-            "  pdftotext for %s exit=%d stderr=%r",
-            arxiv_id, result.returncode, result.stderr[:200],
-        )
+        log.debug(f"  pdftotext for {arxiv_id} exit={result.returncode}")
         return ""
-    text = result.stdout.decode("utf-8", errors="replace")
-    log.info(
-        "  pdftotext %s: %d chars extracted, contains 'github.com': %s",
-        arxiv_id, len(text), "github.com" in text.lower(),
-    )
-    return text
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def _fetch_arxiv_pdf_github_slugs(arxiv_id: str) -> list[str]:
