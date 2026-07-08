@@ -8571,6 +8571,47 @@ def process_target(target: Target) -> dict:
             _append_to_step_summary(prepub_verdict["coverage_section"])
 
         if prepub_verdict.get("needs_judgment"):
+            # Under publish=branch, skip the fabrication-patch attempt entirely.
+            # The patch is designed to make the diff PR-ready; branch mode
+            # doesn't need PR-readiness — the team reviews the raw agent
+            # output on the branch and decides. Surface the fidelity flags as
+            # informational content in the step summary + return with the
+            # branch-pushed status. The branch itself is already on the fork
+            # (commit_and_push ran before the fidelity gate).
+            _pb_mode = (os.environ.get("INPUT_PUBLISH") or "pr").strip().lower()
+            if _pb_mode == "branch":
+                _branch_url = f"https://github.com/{target.repo}/tree/{branch}"
+                result["status"] = "branch_pushed_no_pr"
+                result["branch"] = branch
+                result["branch_url"] = _branch_url
+                result["pr_title"] = pr_title
+                result["would_have_downgraded_reason"] = (
+                    f"pre-PR fidelity flagged {prepub_verdict.get('items_count', 0)} "
+                    f"items for judgment"
+                )
+                log.info(
+                    f"  ✓ {result['status']}: {_branch_url} "
+                    f"(no PR opened; publish=branch; fidelity flagged "
+                    f"{prepub_verdict.get('items_count', 0)} items — see step summary)"
+                )
+                _append_to_step_summary(
+                    "## Branch mode — pre-PR fidelity flagged items, branch preserved\n\n"
+                    f"Branch pushed to fork: [`{branch}`]({_branch_url})\n\n"
+                    f"The pre-PR fidelity gate flagged "
+                    f"{prepub_verdict.get('items_count', 0)} item(s) as "
+                    "`needs_judgment` — under `publish=pr` this would have "
+                    "triggered a fabrication-patch attempt and (if that "
+                    "failed) skipped publication. Under `publish=branch` the "
+                    "coding agent's raw output is preserved as a branch so "
+                    "the team can review the flagged items directly and "
+                    "decide whether they're real fabrication or deliberate "
+                    "scope carve-outs.\n\n"
+                    "See the coverage matrix above for per-item detail. "
+                    "Promote via `gh pr create` if the flags reflect "
+                    "scope-carve-out rather than fabrication, or delete via "
+                    f"`git push origin --delete {branch}` if not."
+                )
+                return result
             log.info("  → pre-PR fidelity flagged fabrication; attempting one patch")
             patched = _attempt_pre_pr_fidelity_patch(
                 workdir,
