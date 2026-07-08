@@ -1203,6 +1203,24 @@ FAILURE_EXIT_STATUSES = {
 }
 
 
+class LeadCapturedInBranchMode(RuntimeError):
+    """Signals that publish=branch is in effect and an Issue would have
+    been filed; the LEAD content is captured for the step summary instead
+    of touching the target repo.
+
+    Carries the intended title + fully-formatted body (footer + reengage
+    note included) so process_target renders the captured content into the
+    step summary — matching exactly what the maintainer would have seen if
+    the Issue had been filed. Team reads the step summary and files the
+    Issue manually via ``gh issue create`` when they decide to promote.
+    Non-fatal graceful capture; run ends with ``lead_captured_no_issue``.
+    """
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__("Issue capture suppressed: publish=branch")
+        self.title = title
+        self.body = body
+
+
 class IssuesDisabledError(RuntimeError):
     """The target repo has its Issues tab disabled and the run's token
     can't re-enable it.
@@ -6888,6 +6906,15 @@ def open_issue(
         "will not re-recommend the same paper._"
     )
     full_body = f"{body}\n\n---\n\n{footer}\n\n{reengage_note}"
+    # publish=branch — do not file the Issue; capture the fully-formatted
+    # LEAD content so process_target can render it into the step summary
+    # instead. Team promotes manually via ``gh issue create`` later if they
+    # decide the substance warrants it. Same short-circuit path fires for
+    # every open_issue caller (intentional Issue route + all downgrade
+    # helpers) since they all flow through here.
+    publish_mode = (os.environ.get("INPUT_PUBLISH") or "pr").strip().lower()
+    if publish_mode == "branch":
+        raise LeadCapturedInBranchMode(title, full_body)
     log.info(f"  → opening Issue on {target.repo}")
     payload = {"title": title, "body": full_body}
     try:
@@ -8582,6 +8609,30 @@ def process_target(target: Target) -> dict:
                 )
                 return result
 
+        # publish=branch — skip PR creation entirely. The branch is already
+        # pushed to the fork by commit_and_push; team reviews the branch via
+        # `gh` / GitHub UI and runs `gh pr create` themselves when ready to
+        # ship. Coordination + evidence land in the step summary + workflow
+        # artifact, never on the branch tree — that keeps promoted PRs clean
+        # (no metadata files bleeding into the maintainer's diff).
+        publish_mode = (os.environ.get("INPUT_PUBLISH") or "pr").strip().lower()
+        if publish_mode == "branch":
+            branch_url = f"https://github.com/{target.repo}/tree/{branch}"
+            result["status"] = "branch_pushed_no_pr"
+            result["branch"] = branch
+            result["branch_url"] = branch_url
+            result["pr_title"] = pr_title
+            log.info(f"  ✓ {result['status']}: {branch_url} (no PR opened; publish=branch)")
+            _append_to_step_summary(
+                "## Branch mode — no PR opened\n\n"
+                f"Branch pushed to fork: [`{branch}`]({branch_url})\n\n"
+                "The team reviews this branch and runs `gh pr create` when "
+                "ready to ship. Coordination signal + evidence are in this "
+                "workflow's step summary and downloadable artifacts (not on "
+                "the branch tree)."
+            )
+            return result
+
         pr_url, pr_number = open_pr(
             target, branch, pr_title, pr_body, draft=draft, base=default_branch
         )
@@ -8589,6 +8640,37 @@ def process_target(target: Target) -> dict:
         result["pr_url"] = pr_url
         result["pr_number"] = pr_number
         log.info(f"  ✓ {result['status']}: {pr_url}")
+        return result
+
+    except LeadCapturedInBranchMode as e:
+        # publish=branch — an Issue would have been filed (either the
+        # intentional Issue route or one of the downgrade helpers). No
+        # Issue lands on the target repo; the LEAD content is rendered
+        # into the step summary so the team can review it and file the
+        # Issue manually via ``gh issue create`` if the substance warrants.
+        # Zero maintainer attention consumed until the team acts.
+        result["status"] = "lead_captured_no_issue"
+        result["lead_title"] = e.title
+        log.info(
+            f"  ✓ {result['status']}: '{e.title}' "
+            f"(no Issue filed; publish=branch)"
+        )
+        _append_to_step_summary(
+            "## LEAD captured — no Issue filed (branch mode)\n\n"
+            f"**Would-be Issue title**: {e.title}\n\n"
+            "---\n\n"
+            f"{e.body}\n\n"
+            "---\n\n"
+            f"To file this Issue on `{target.repo}`, run:\n\n"
+            "```bash\n"
+            f"gh issue create --repo {target.repo} \\\n"
+            f"  --title \"{e.title}\" \\\n"
+            "  --body-file <(...paste the LEAD content above...)\n"
+            "```\n\n"
+            "Or copy the title + body into the GitHub web UI. The step "
+            "summary above contains the exact content the maintainer "
+            "would have seen if the Issue had been filed automatically."
+        )
         return result
 
     except IssuesDisabledError as e:

@@ -216,6 +216,22 @@ inputs:
       = normal selection. Mutually exclusive with pin-arxiv.
     required: false
     default: ''
+  publish:
+    description: |
+      What to produce at the end of a recommend-mode run:
+        - "pr" (default): current behavior — push branch, open Draft PR,
+          run the inline chain (fidelity → convention → test).
+        - "branch": push the branch to the fork, but SKIP PR creation
+          and SKIP the inline chain. Coordination signal and evidence
+          land in the workflow step summary + workflow artifact only.
+          Team reviews the branch via `gh` / GitHub UI and runs
+          `gh pr create` themselves when ready to ship.
+
+      Zero maintainer-facing artifact until the team explicitly opens
+      the PR. Useful for batched multi-candidate exploration where you
+      want to review before committing to shipping.
+    required: false
+    default: 'pr'
   model-base-url:
     description: |
       Optional override for the Claude Code subprocess's ANTHROPIC_BASE_URL.
@@ -403,6 +419,7 @@ runs:
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         INPUT_SEARCH_METHOD: ${{ inputs.search-method }}
+        INPUT_PUBLISH: ${{ inputs.publish }}
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).
