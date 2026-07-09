@@ -419,16 +419,57 @@ Open as PR only if BOTH of these hold:
       direction (a scorer, filter, metric, evaluation hook, or focused
       behavior change) is the INTENDED deliverable, not a fallback.
 
-Open as Issue if any of these is true:
+**Three implementation modes are legitimate.** Pick the one that best fits
+this paper × this codebase, then implement it:
 
-  - The paper's contribution requires infrastructure the codebase lacks
-    (a trainer when the repo is inference-only, a dataset format the
-    repo never touches, external checkpoints with no path to load).
-  - You cannot point at a specific existing call site to modify.
-  - Your implementation would be a freestanding module that no existing
-    code imports or calls — i.e. it could be deleted without breaking
-    or altering anything in the repo.
-  - You'd be inventing the integration rather than slotting into one.
+  - **Mode 1 (direct port).** Implement the paper's method as-described.
+    Requires the repo to host the paper's full infrastructure. When it
+    fits, this is the highest-fidelity outcome.
+
+  - **Mode 2 (adapted port).** Implement the paper's CORE mechanism at
+    full fidelity while substituting AUXILIARY components (learned
+    estimators, bespoke optimizers, specialized datasets, benchmark
+    suites) with target-native equivalents:
+      • Replace a learned estimator with a parameter-free proxy
+        approximating its signal (e.g. a learned MI estimator replaced
+        by a vocab-overlap heuristic).
+      • Replace a bespoke optimizer with the repo's existing optimizer path.
+      • Cut the paper's separate benchmark / eval framework — evaluation
+        belongs in a downstream PR.
+    Example: RAPO's asymmetric per-token gradient weighting kept at full
+    fidelity while its learned profile-token MI estimator was replaced
+    with a vocab-overlap proxy, and its Psy-CoT template was cut.
+
+  - **Mode 3 (inspired experiment).** Take the paper's core INSIGHT or
+    FRAMING and implement a target-native experiment drawing on it. The
+    PR does not reproduce the paper's method — it applies the paper's
+    idea to the target's actual problem. Legitimate when the paper's
+    method shape doesn't fit but its idea maps to a real target surface.
+    Example: a paper proposing "trainable Bridge projector for
+    cross-latent-space distillation" (requires a distillation trainer
+    the repo lacks) could inspire "add latent-space consistency losses
+    as an optional distillation objective in the existing
+    consistency_distillation example" — same insight (cross-space
+    supervision helps one-step students), target-native execution.
+
+**Cite which mode you chose in the self-review** and, for Modes 2/3,
+which specific components were substituted (Mode 2) or which insight
+is being reframed (Mode 3). Un-cited substitutions or reframings read
+as scope creep. The honesty discipline is STRICTER on adapted/inspired
+outputs than on direct ports — the reader must be able to tell what's
+from the paper and what's your target-native adaptation.
+
+Open as Issue ONLY when all three modes fail:
+
+  - Mode 1 fails: the paper's method needs infrastructure the repo lacks.
+  - Mode 2 fails: substituting auxiliaries collapses the core to a naive
+    baseline the paper explicitly improves upon.
+  - Mode 3 fails: the paper's insight/framing doesn't map to any
+    target-native experiment worth running (paper genuinely doesn't help
+    this repo — pass with rationale).
+
+If none of the three modes has a call-site anchor, that's the honest
+"skip with rationale" outcome — a valid deliverable, not a failure.
 
 If ANY of those hold, DO NOT WRITE CODE. Write a file at
 `{issue_fallback_filename}` with this exact shape (Markdown):
@@ -617,18 +658,41 @@ through the existing eval path, rather than rebuilding its data-generation
 engine). Don't route to ISSUE merely because the paper's headline method
 is heavy — judge the scoped slice.
 
-Route to ISSUE only if any of these is likely true of THAT scoped slice:
+**Three implementation modes are legitimate, not just direct porting.** The
+coding session picks which mode fits this paper × this codebase; preflight's
+job is to check whether ANY of the three could produce a useful PR here:
 
-  - Even the scoped implementation requires infrastructure that isn't in
-    the repo (a trainer when the repo is inference-only, a data format the
-    repo never touches, checkpoints with no loader path).
-  - There is no clear call site — no existing module that naturally hosts
-    even the scoped contribution (and the selection rationale, if present,
-    names none that hold up against the layout).
-  - The most realistic implementation would be a freestanding module that
-    no existing code would call.
+  1. **Direct port** — implement the paper's method as-described. Requires
+     the repo to host the paper's full infrastructure.
+  2. **Adapted port** — implement the paper's CORE mechanism at full
+     fidelity while substituting AUXILIARY components (learned estimators,
+     bespoke optimizers, specialized datasets, benchmark suites) with
+     target-native equivalents (parameter-free proxies, existing library
+     functions, explicit scope cuts). Example: RAPO's asymmetric per-token
+     gradient weighting kept at full fidelity while its learned MI estimator
+     was replaced with a vocab-overlap proxy and its Psy-CoT template cut.
+  3. **Inspired experiment** — take the paper's core INSIGHT or FRAMING and
+     implement a target-native experiment drawing on it. The PR does not
+     reproduce the paper's method — it applies the paper's *idea* to the
+     target's actual problem. Example: a paper proposing "trainable Bridge
+     projector for cross-latent-space distillation" could inspire a
+     diffusers-native "add latent-space consistency losses to the existing
+     consistency_distillation example" — same insight (cross-space
+     supervision helps one-step students), target-native execution.
 
-Otherwise route to PR.
+Route to PR if ANY of the three modes could produce a useful contribution.
+Route to ISSUE only when all three fail:
+
+  - Mode 1 fails: the paper's method needs infrastructure the repo lacks
+  - Mode 2 fails: substituting auxiliaries collapses the core to a naive
+    baseline the paper explicitly improves upon
+  - Mode 3 fails: the paper's insight/framing doesn't map to any target-
+    native experiment worth running (paper genuinely doesn't help this repo)
+
+The coding session cites which mode was chosen and, for Modes 2/3, which
+specific components were substituted or which insight was reframed. Modes
+2/3 without a citation read as scope creep — the honesty discipline is
+STRICTER on adapted/inspired outputs than on direct ports.
 
 NEVER include token-shaped strings in any JSON field — the JSON you
 write here flows verbatim into a public-repo PR or Issue body, and a
