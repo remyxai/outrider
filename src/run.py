@@ -1133,7 +1133,33 @@ Markdown fences, no prose before or after. Schema:
   "honest_summary": "<one short paragraph: the value this delivers in the
                      paper's direction, and what you intentionally scoped
                      out as unnecessary for it. Frame scoped-out parts as
-                     deliberate boundaries, not as what you 'failed' to do.>"
+                     deliberate boundaries, not as what you 'failed' to do.>",
+  "mode_cited":  "<one of: 'Mode 1 (direct port)', 'Mode 2 (adapted port)',
+                   'Mode 3 (inspired experiment)'. This tells the downstream
+                   fidelity gate how to interpret the diff:
+                     Mode 1 — expect the diff to match the paper's method;
+                             fidelity gate does strict method-vs-diff.
+                     Mode 2 — core mechanism at fidelity + substitutions
+                             on auxiliaries; fidelity gate treats named
+                             substitutions as defensible deviations.
+                     Mode 3 — target-native experiment inspired by the
+                             paper; fidelity gate skips method-vs-diff and
+                             validates insight-preservation instead.>",
+  "substitutions": [<Mode-2 ONLY: bullets naming each auxiliary component
+                     you replaced with a target-native equivalent, in the
+                     shape 'paper's <X> replaced by <Y>'. Empty list for
+                     Mode 1 / Mode 3. Example: 'paper's learned MI
+                     estimator replaced by prompt/response vocab-overlap
+                     proxy'.>],
+  "reframed_insight": "<Mode-3 ONLY: one sentence naming the paper's core
+                       insight/framing that this diff draws on, and how
+                       it maps to the target's actual problem. Empty
+                       string for Mode 1 / Mode 2. Example: 'WorldSample's
+                       insight that value overestimation signals unreliable
+                       training transitions applies to SAC's critic ensemble
+                       — the clipped-double-Q spread is a target-native
+                       equivalent of the paper's world-model-augmented
+                       overestimation signal.'>"
 }
 
 Be ruthless about reachability, but distinguish LIBRARY-shape API additions
@@ -8719,6 +8745,7 @@ def process_target(target: Target) -> dict:
         # public.
         prepub_verdict = _run_pre_pr_fidelity_check(
             rec, target, workdir, pr_title, pr_body, base_branch=default_branch,
+            self_review=review,
         )
         result["prepub_fidelity"] = {
             "status": prepub_verdict.get("status"),
@@ -10560,6 +10587,9 @@ def _build_fidelity_audit_prompt(
     arxiv_id: str,
     reference_url: str,
     reference_root: Path,
+    mode: str = "mode-1",
+    substitutions: "list[str] | None" = None,
+    scoped_out: "list[str] | None" = None,
 ) -> str:
     """Compose the fidelity-audit prompt for the one-shot Claude call.
 
@@ -10595,6 +10625,46 @@ def _build_fidelity_audit_prompt(
     )
     body_excerpt = (pr_body or "")[:4000]
 
+    # Mode-aware guidance (REMYX-195). Mode 3 is handled by a separate
+    # function; here we branch between Mode 1 (strict) and Mode 2
+    # (auxiliary-substitution-tolerant).
+    substitutions = substitutions or []
+    scoped_out = scoped_out or []
+    mode_guidance = ""
+    if mode == "mode-2" and substitutions:
+        subs_bullets = "\n".join(f"  - {s}" for s in substitutions[:20])
+        mode_guidance = f"""
+
+# Mode 2 — adapted port
+
+The coding session cited this as a **Mode 2 (adapted port)** implementation:
+the paper's core mechanism is preserved at full fidelity, but auxiliary
+components were intentionally substituted with target-native equivalents.
+The following substitutions were explicitly declared in the self-review:
+
+{subs_bullets}
+
+Deltas from the reference that match these substitutions are EXPECTED
+and should be classified as ``deferred`` (with the substitution named
+in the rationale) or ``deviation`` / ``defensible``, NOT
+``needs-judgment``. Only flag as ``needs-judgment`` when the deviation
+lies OUTSIDE the declared substitutions — i.e. an unexpected change
+to the paper's core mechanism itself.
+"""
+    if scoped_out:
+        sco_bullets = "\n".join(f"  - {s}" for s in scoped_out[:20])
+        mode_guidance += f"""
+
+# Deliberately scoped out
+
+The self-review declared the following items as intentionally NOT built —
+scoping decisions, not fabrication. Items on this list should be
+classified as ``deferred`` (cite which entry justifies the deferral),
+NOT ``needs-judgment``:
+
+{sco_bullets}
+"""
+
     return f"""You are auditing a draft PR's fidelity to its reference implementation.
 
 # PR under audit
@@ -10616,7 +10686,7 @@ def _build_fidelity_audit_prompt(
 ```
 {diff_excerpt}
 ```
-
+{mode_guidance}
 # Task
 
 Read the reference impl at ./reference/ — explore the files that correspond to
@@ -10679,6 +10749,38 @@ def _local_git_diff(workdir: "Path", base_branch: str = "main") -> str:
         return ""
 
 
+_MODE_1_TOKENS = ("mode 1", "direct port")
+_MODE_2_TOKENS = ("mode 2", "adapted port")
+_MODE_3_TOKENS = ("mode 3", "inspired experiment", "inspired adaptation")
+
+
+def _classify_mode_cited(review: "dict | None") -> str:
+    """Read the self-review's ``mode_cited`` field and normalize to one
+    of ``'mode-1'`` / ``'mode-2'`` / ``'mode-3'`` / ``''`` (unspecified).
+
+    Free-text tolerant: the coding session may spell the mode as
+    ``'Mode 3 (inspired experiment)'``, ``'Mode 3'``, or ``'inspired
+    adaptation'``; all normalize to ``'mode-3'``. Returns ``''`` when
+    the self-review didn't cite a mode (pre-v1.7.14 shape or Claude
+    omitted the field) — caller falls back to strict Mode-1 semantics.
+    """
+    if not review:
+        return ""
+    raw = (review.get("mode_cited") or "").lower()
+    if not raw:
+        return ""
+    for tok in _MODE_3_TOKENS:
+        if tok in raw:
+            return "mode-3"
+    for tok in _MODE_2_TOKENS:
+        if tok in raw:
+            return "mode-2"
+    for tok in _MODE_1_TOKENS:
+        if tok in raw:
+            return "mode-1"
+    return ""
+
+
 def _run_pre_pr_fidelity_check(
     rec: "Recommendation",
     target: "Target",
@@ -10686,6 +10788,7 @@ def _run_pre_pr_fidelity_check(
     pr_title: str,
     pr_body: str,
     base_branch: str = "main",
+    self_review: "dict | None" = None,
 ) -> dict:
     """Run the fidelity audit on the local branch, before opening a PR.
 
@@ -10694,22 +10797,57 @@ def _run_pre_pr_fidelity_check(
     doesn't exist yet. Returns a verdict dict with ``needs_judgment``,
     ``items_count``, ``coverage_section``, ``status``, ``matrix``.
 
-    Only reference-anchored mode is supported here — the paper-anchored
-    degraded mode adds complexity that isn't needed for the primary
-    (fidelity-catches-fabrication) use case. When no reference URL is
-    available, returns ``needs_judgment=False`` and lets the flow
-    proceed (equivalent to the old post-PR skip behavior).
+    Mode-aware routing (REMYX-195): reads ``self_review['mode_cited']``
+    to pick the audit shape.
+
+      * **Mode 1 (direct port)** — strict reference-vs-diff comparison.
+        Items appearing in ``self_review['scoped_out']`` are cross-
+        referenced against the Coverage matrix and downgraded from
+        ``needs-judgment`` to ``deferred`` before the verdict.
+      * **Mode 2 (adapted port)** — strict on the core mechanism, but
+        deviations that match ``self_review['substitutions']`` (auxiliary
+        components deliberately swapped for target-native equivalents)
+        are treated as ``defensible`` rather than ``needs-judgment``.
+        The prompt is augmented with the substitution list so Claude
+        knows which deltas are intended.
+      * **Mode 3 (inspired experiment)** — the diff does not port the
+        paper's method. Method-vs-diff comparison is skipped; instead
+        an insight-preservation check verifies that
+        ``self_review['reframed_insight']`` (the paper's core insight
+        being drawn on) is reflected in the diff's docstrings and
+        honest_summary. This replaces the previous
+        ``pre_pr_fidelity_skipped_no_reference`` behavior for Mode-3
+        outputs, which is now the *normal* case under v1.7.14 rather
+        than a fallback edge case.
+
+    When the self-review omits ``mode_cited`` (pre-v1.7.14 runs or
+    Claude skipped the field), Mode 1 is assumed — matches historical
+    behavior.
+
+    Reference-anchored mode remains the only path when a reference URL
+    exists; when none is available AND the mode is not Mode 3, returns
+    ``needs_judgment=False`` and lets the flow proceed (equivalent to
+    the old post-PR skip behavior).
     """
+    mode = _classify_mode_cited(self_review)
     verdict = {
         "needs_judgment": False,
         "items_count": 0,
         "coverage_section": "",
         "status": "pre_pr_fidelity_skipped_no_reference",
         "matrix": None,
+        "mode_cited": mode or "mode-1",
     }
+
+    # Mode 3 has its own audit shape — insight-preservation, no reference impl needed.
+    if mode == "mode-3":
+        return _run_mode3_insight_preservation_check(
+            rec, target, workdir, pr_body, self_review, base_branch, verdict,
+        )
+
     _, reference_url = _extract_reference_url_from_pr_body(pr_body, target.repo)
     if not reference_url:
-        log.info("  → pre-PR fidelity: no reference URL, skipping")
+        log.info(f"  → pre-PR fidelity ({verdict['mode_cited']}): no reference URL, skipping")
         return verdict
     verdict["reference_url"] = reference_url
 
@@ -10728,6 +10866,8 @@ def _run_pre_pr_fidelity_check(
         log.warning("  ⚠ pre-PR fidelity: local git diff empty; skipping")
         return verdict
 
+    substitutions = (self_review or {}).get("substitutions") or []
+    scoped_out = (self_review or {}).get("scoped_out") or []
     prompt = _build_fidelity_audit_prompt(
         pr_title=pr_title,
         pr_body=pr_body,
@@ -10735,8 +10875,15 @@ def _run_pre_pr_fidelity_check(
         arxiv_id=rec.arxiv_id,
         reference_url=reference_url,
         reference_root=ref_dir,
+        mode=verdict["mode_cited"],
+        substitutions=substitutions,
+        scoped_out=scoped_out,
     )
-    log.info(f"  → pre-PR fidelity Claude one-shot (timeout={target.claude_timeout_s}s)")
+    log.info(
+        f"  → pre-PR fidelity Claude one-shot "
+        f"({verdict['mode_cited']}, subs={len(substitutions)}, "
+        f"scoped_out={len(scoped_out)}, timeout={target.claude_timeout_s}s)"
+    )
     ok, raw = _run_claude_oneshot(
         fid_workdir, prompt, target.claude_timeout_s, max_turns=20,
     )
@@ -10769,6 +10916,211 @@ def _run_pre_pr_fidelity_check(
     log.info(
         f"  ✓ pre-PR fidelity: {verdict['items_count']} items, "
         f"needs_judgment={needs_judgment}"
+    )
+    return verdict
+
+
+def _build_mode3_insight_preservation_prompt(
+    pr_title: str,
+    pr_diff: str,
+    reframed_insight: str,
+    honest_summary: str,
+    delivered: "list[str]",
+    arxiv_id: str,
+) -> str:
+    """Compose the Mode-3 insight-preservation audit prompt.
+
+    Under Mode 3 the diff does NOT port the paper's method — it applies
+    the paper's insight to a target-native problem. So the fidelity
+    question shifts from *"does the diff match the reference?"* to
+    *"does the diff preserve the paper's core insight, and does the
+    self-review honestly explain the reframing?"*.
+    """
+    diff_excerpt = pr_diff if len(pr_diff) <= 60_000 else (
+        pr_diff[:60_000] + f"\n... [diff truncated, total {len(pr_diff)} chars] ...\n"
+    )
+    delivered_bullets = "\n".join(f"  - {d}" for d in (delivered or [])[:10]) or "  (none listed)"
+    return f"""You are auditing a Mode-3 (inspired experiment) PR's INSIGHT PRESERVATION.
+
+Mode 3 means: the coding session took the paper's core insight or framing and
+implemented a target-native experiment drawing on it. The PR does NOT reproduce
+the paper's method. So the usual paper-method-vs-diff comparison is the WRONG
+question here — the diff is EXPECTED to diverge from the paper's method by
+design.
+
+The right questions:
+
+1. Is the paper's core insight actually preserved in the diff?
+2. Does the module's docstring / code comments name the paper it draws on,
+   and honestly frame this as an *inspired adaptation* rather than a port?
+3. Does the honest_summary explain the reframing?
+
+# PR under audit
+
+**Title**: {pr_title}
+
+**Paper**: arxiv:{arxiv_id or "(unknown)"}
+
+## Self-review's reframed insight (what the paper contributes that this diff draws on)
+
+{reframed_insight}
+
+## Self-review's honest summary
+
+{honest_summary}
+
+## Self-review's `delivered` items
+
+{delivered_bullets}
+
+## Diff
+
+```
+{diff_excerpt}
+```
+
+# Task
+
+Evaluate whether this PR PRESERVES the paper's insight. Emit a Coverage matrix
+whose ``items`` describe the *insight-preservation* checks, not method-diff.
+Each item's ``status`` is:
+
+- **covered**: the diff's docstrings / comments / code faithfully embody the
+  reframed insight; the reader can trace the paper's idea to the target-native
+  implementation via the docstring alone.
+- **deferred**: parts of the paper's contribution intentionally NOT implemented
+  because Mode 3 leaves them out (the world model, the full training system,
+  the paper's specific auxiliary components).
+- **deviation**: the diff diverges from the reframed insight itself.
+  - **defensible**: an adaptation of the insight to fit the target's shape.
+  - **needs-judgment**: the diff has drifted from the insight (e.g. the
+    module docstring cites the paper but the code doesn't actually implement
+    the insight; or the docstring names the paper but the code is unrelated).
+
+Also produce ``insight_check`` items with these three specific verifications:
+
+- ``docstring_cites_paper`` — does the new module's docstring name the paper
+  (arxiv id or title)?
+- ``docstring_frames_as_inspired`` — does it honestly frame this as inspired /
+  adapted rather than claiming to be a port?
+- ``code_embodies_insight`` — does the code path actually implement the reframed
+  insight, or just add scaffolding that doesn't do the work?
+
+Return ONLY a valid JSON object (no prose before or after):
+
+{{
+  "summary": "<one-sentence overall verdict on insight preservation>",
+  "needs_judgment": <true if any item.deviation_class == "needs-judgment" or
+                     any insight_check.status == "fail">,
+  "items": [
+    {{
+      "name": "<what's being checked, e.g. 'insight: value-overestimation as gating signal'>",
+      "draft_location": "<file::symbol or null>",
+      "reference_location": null,
+      "status": "covered" | "deferred" | "deviation",
+      "deviation_class": null | "defensible" | "needs-judgment",
+      "rationale": "<one to three sentences>"
+    }}
+  ],
+  "insight_check": {{
+    "docstring_cites_paper":       "pass" | "fail",
+    "docstring_frames_as_inspired": "pass" | "fail",
+    "code_embodies_insight":        "pass" | "fail",
+    "rationale": "<one to three sentences>"
+  }}
+}}
+"""
+
+
+def _run_mode3_insight_preservation_check(
+    rec: "Recommendation",
+    target: "Target",
+    workdir: "Path",
+    pr_body: str,
+    self_review: dict,
+    base_branch: str,
+    verdict: dict,
+) -> dict:
+    """Mode-3 fidelity: verify the paper's reframed insight is preserved
+    in the diff, rather than comparing the diff to a reference impl.
+
+    Returns the same verdict shape as ``_run_pre_pr_fidelity_check``,
+    but with ``status`` values ``pre_pr_fidelity_mode3_insight_preserved``
+    (clean), ``pre_pr_fidelity_mode3_needs_judgment`` (drift detected),
+    or ``pre_pr_fidelity_mode3_skipped_no_insight`` (self-review didn't
+    fill in ``reframed_insight``).
+    """
+    reframed_insight = (self_review.get("reframed_insight") or "").strip()
+    honest_summary = (self_review.get("honest_summary") or "").strip()
+    delivered = self_review.get("delivered") or []
+
+    if not reframed_insight:
+        log.info(
+            "  → pre-PR fidelity (mode-3): no reframed_insight in self-review; "
+            "skipping (Claude may have omitted the field)"
+        )
+        verdict["status"] = "pre_pr_fidelity_mode3_skipped_no_insight"
+        return verdict
+
+    diff = _local_git_diff(workdir, base_branch)
+    if not diff:
+        verdict["status"] = "pre_pr_fidelity_failed_no_diff"
+        log.warning("  ⚠ pre-PR fidelity (mode-3): local git diff empty; skipping")
+        return verdict
+
+    prompt = _build_mode3_insight_preservation_prompt(
+        pr_title=format_pr_title(rec),
+        pr_diff=diff,
+        reframed_insight=reframed_insight,
+        honest_summary=honest_summary,
+        delivered=delivered,
+        arxiv_id=rec.arxiv_id,
+    )
+    log.info(
+        f"  → pre-PR fidelity (mode-3) insight-preservation Claude one-shot "
+        f"(timeout={target.claude_timeout_s}s)"
+    )
+    audit_workdir = Path(tempfile.mkdtemp(prefix="outrider-mode3-fidelity-"))
+    ok, raw = _run_claude_oneshot(
+        audit_workdir, prompt, target.claude_timeout_s, max_turns=10,
+    )
+    if not ok:
+        verdict["status"] = "pre_pr_fidelity_failed_claude"
+        verdict["error"] = f"Claude non-zero: {raw[-500:]}"
+        log.warning("  ⚠ pre-PR fidelity (mode-3) Claude failed")
+        return verdict
+
+    matrix = _extract_json_object(raw)
+    if not matrix or "items" not in matrix:
+        verdict["status"] = "pre_pr_fidelity_failed_claude"
+        verdict["error"] = f"unparseable JSON: {raw[-500:]}"
+        log.warning("  ⚠ pre-PR fidelity (mode-3): unparseable JSON")
+        return verdict
+
+    coverage_section = _render_coverage_matrix(matrix, audit_anchor="insight")
+    # Insight-check failures also promote to needs_judgment.
+    insight_check = matrix.get("insight_check") or {}
+    insight_fail = any(
+        insight_check.get(k) == "fail"
+        for k in ("docstring_cites_paper", "docstring_frames_as_inspired",
+                  "code_embodies_insight")
+    )
+    needs_judgment = bool(matrix.get("needs_judgment", False)) or insight_fail
+
+    verdict.update({
+        "needs_judgment": needs_judgment,
+        "items_count": len(matrix.get("items", [])),
+        "coverage_section": coverage_section,
+        "matrix": matrix,
+        "insight_check": insight_check,
+        "status": (
+            "pre_pr_fidelity_mode3_needs_judgment" if needs_judgment
+            else "pre_pr_fidelity_mode3_insight_preserved"
+        ),
+    })
+    log.info(
+        f"  ✓ pre-PR fidelity (mode-3): {verdict['items_count']} items, "
+        f"insight_check={insight_check}, needs_judgment={needs_judgment}"
     )
     return verdict
 
@@ -10990,6 +11342,14 @@ def _render_coverage_matrix(matrix: dict, audit_anchor: str = "reference") -> st
             "_Audit anchor: paper abstract (no public reference impl available — "
             "this audit compares the diff to the paper's described method at the "
             "abstract level, which is less precise than a code-level comparison)._"
+        )
+        lines.append("")
+    elif audit_anchor == "insight":
+        lines.append(
+            "_Audit anchor: paper insight (Mode 3 — inspired experiment). "
+            "This diff does not port the paper's method; the check validates that "
+            "the paper's core insight is preserved in the diff's docstrings and "
+            "code path, and that the self-review honestly frames the reframing._"
         )
         lines.append("")
     if needs_judgment:

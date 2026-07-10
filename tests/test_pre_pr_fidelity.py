@@ -243,3 +243,179 @@ def test_patch_returns_true_when_files_touched(tmp_path):
     invoc = tmp_path / ".remyx-recommendation" / "INVOCATION.md"
     assert invoc.exists()
     assert "Fidelity remediation brief" in invoc.read_text()
+
+
+# --- REMYX-195: mode-aware fidelity gate -------------------------------------
+
+def test_classify_mode_cited_reads_mode_1():
+    assert run._classify_mode_cited({"mode_cited": "Mode 1 (direct port)"}) == "mode-1"
+    assert run._classify_mode_cited({"mode_cited": "mode 1"}) == "mode-1"
+    assert run._classify_mode_cited({"mode_cited": "direct port"}) == "mode-1"
+
+
+def test_classify_mode_cited_reads_mode_2():
+    assert run._classify_mode_cited({"mode_cited": "Mode 2 (adapted port)"}) == "mode-2"
+    assert run._classify_mode_cited({"mode_cited": "Mode 2"}) == "mode-2"
+    assert run._classify_mode_cited({"mode_cited": "adapted port"}) == "mode-2"
+
+
+def test_classify_mode_cited_reads_mode_3():
+    assert run._classify_mode_cited({"mode_cited": "Mode 3 (inspired experiment)"}) == "mode-3"
+    assert run._classify_mode_cited({"mode_cited": "Mode 3"}) == "mode-3"
+    assert run._classify_mode_cited({"mode_cited": "inspired experiment"}) == "mode-3"
+    assert run._classify_mode_cited({"mode_cited": "inspired adaptation"}) == "mode-3"
+
+
+def test_classify_mode_cited_returns_empty_on_missing_or_unknown():
+    assert run._classify_mode_cited(None) == ""
+    assert run._classify_mode_cited({}) == ""
+    assert run._classify_mode_cited({"mode_cited": ""}) == ""
+    assert run._classify_mode_cited({"mode_cited": "something else"}) == ""
+
+
+def test_build_fidelity_audit_prompt_mode_2_injects_substitutions():
+    """Mode 2 fidelity prompt should list the substitutions so Claude
+    treats those deltas as defensible, not needs-judgment."""
+    prompt = run._build_fidelity_audit_prompt(
+        pr_title="Test", pr_body="body", pr_diff="diff",
+        arxiv_id="2606.27025", reference_url="https://github.com/x/y",
+        reference_root=Path("/tmp/ref"),
+        mode="mode-2",
+        substitutions=["paper's learned MI estimator replaced by vocab-overlap proxy"],
+    )
+    assert "Mode 2" in prompt
+    assert "vocab-overlap proxy" in prompt
+    assert "defensible" in prompt
+
+
+def test_build_fidelity_audit_prompt_scoped_out_lists_deferred_items():
+    """Scoped-out items should appear in the prompt so the gate downgrades
+    them from needs-judgment to deferred (original REMYX-195 fix)."""
+    prompt = run._build_fidelity_audit_prompt(
+        pr_title="Test", pr_body="body", pr_diff="diff",
+        arxiv_id="2606.27025", reference_url="https://github.com/x/y",
+        reference_root=Path("/tmp/ref"),
+        mode="mode-1",
+        scoped_out=["adaptive-decay coefficient tuning (deferred as follow-up)"],
+    )
+    assert "Deliberately scoped out" in prompt
+    assert "adaptive-decay" in prompt
+    assert "deferred" in prompt
+
+
+def test_build_fidelity_audit_prompt_mode_1_no_mode_guidance_when_no_scoped():
+    """Mode 1 with no scoped_out and no substitutions produces the original prompt shape."""
+    prompt = run._build_fidelity_audit_prompt(
+        pr_title="Test", pr_body="body", pr_diff="diff",
+        arxiv_id="x", reference_url="u", reference_root=Path("/tmp/ref"),
+        mode="mode-1", substitutions=[], scoped_out=[],
+    )
+    assert "Mode 2" not in prompt
+    assert "Deliberately scoped out" not in prompt
+
+
+def test_pre_pr_fidelity_routes_mode_3_to_insight_check(tmp_path):
+    """Mode 3 self-review skips reference-clone and runs insight-preservation."""
+    rec = _make_rec()
+    target = _make_target()
+    review = {
+        "mode_cited": "Mode 3 (inspired experiment)",
+        "reframed_insight": "value overestimation → SAC critic-ensemble spread",
+        "honest_summary": "Inspired adaptation.",
+        "delivered": ["per-token weight from critic spread"],
+    }
+    fake_diff = "diff --git a/x b/x\n+new"
+    fake_matrix = {
+        "summary": "insight preserved",
+        "needs_judgment": False,
+        "items": [{"name": "insight", "status": "covered",
+                   "draft_location": "x", "reference_location": None,
+                   "deviation_class": None, "rationale": "yes"}],
+        "insight_check": {
+            "docstring_cites_paper": "pass",
+            "docstring_frames_as_inspired": "pass",
+            "code_embodies_insight": "pass",
+        },
+    }
+    with patch.object(run, "_local_git_diff", return_value=fake_diff), \
+         patch.object(run, "_run_claude_oneshot",
+                      return_value=(True, __import__("json").dumps(fake_matrix))), \
+         patch.object(run, "_extract_reference_url_from_pr_body") as ref_url_mock:
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, target, tmp_path, "title", "body", "main",
+            self_review=review,
+        )
+    # Reference URL should NEVER be looked up on Mode-3.
+    assert not ref_url_mock.called
+    assert verdict["status"] == "pre_pr_fidelity_mode3_insight_preserved"
+    assert verdict["needs_judgment"] is False
+    assert verdict["mode_cited"] == "mode-3"
+
+
+def test_pre_pr_fidelity_mode_3_flags_needs_judgment_when_insight_fails(tmp_path):
+    """Insight-check failures escalate to needs_judgment even if item list looks clean."""
+    rec = _make_rec()
+    target = _make_target()
+    review = {
+        "mode_cited": "Mode 3",
+        "reframed_insight": "some insight",
+        "honest_summary": "s",
+        "delivered": [],
+    }
+    fake_matrix = {
+        "summary": "code doesn't embody insight",
+        "needs_judgment": False,
+        "items": [],
+        "insight_check": {
+            "docstring_cites_paper": "pass",
+            "docstring_frames_as_inspired": "pass",
+            "code_embodies_insight": "fail",
+        },
+    }
+    with patch.object(run, "_local_git_diff", return_value="diff"), \
+         patch.object(run, "_run_claude_oneshot",
+                      return_value=(True, __import__("json").dumps(fake_matrix))):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, target, tmp_path, "title", "body", "main",
+            self_review=review,
+        )
+    assert verdict["status"] == "pre_pr_fidelity_mode3_needs_judgment"
+    assert verdict["needs_judgment"] is True
+
+
+def test_pre_pr_fidelity_mode_3_skips_when_no_reframed_insight(tmp_path):
+    """When Claude omits reframed_insight, skip cleanly rather than falsely pass."""
+    rec = _make_rec()
+    target = _make_target()
+    review = {"mode_cited": "Mode 3", "reframed_insight": ""}
+    verdict = run._run_pre_pr_fidelity_check(
+        rec, target, tmp_path, "title", "body", "main",
+        self_review=review,
+    )
+    assert verdict["status"] == "pre_pr_fidelity_mode3_skipped_no_insight"
+
+
+def test_pre_pr_fidelity_mode_defaults_to_mode_1_when_review_missing(tmp_path):
+    """Pre-v1.7.14 self-reviews without mode_cited still work — assume Mode 1."""
+    rec = _make_rec()
+    target = _make_target()
+    with patch.object(run, "_extract_reference_url_from_pr_body",
+                      return_value=("x", "")):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, target, tmp_path, "title", "body", "main",
+            self_review={"delivered": ["x"]},  # no mode_cited
+        )
+    assert verdict["mode_cited"] == "mode-1"
+
+
+def test_render_coverage_matrix_insight_anchor():
+    """Insight-anchor rendering explains Mode-3 shape to the reviewer."""
+    matrix = {
+        "summary": "insight preserved",
+        "needs_judgment": False,
+        "items": [{"name": "x", "status": "covered", "draft_location": "y",
+                   "reference_location": None, "rationale": "ok"}],
+    }
+    md = run._render_coverage_matrix(matrix, audit_anchor="insight")
+    assert "Mode 3" in md
+    assert "insight" in md.lower()
