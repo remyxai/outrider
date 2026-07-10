@@ -1,7 +1,7 @@
 name: Outrider
 
 on:
-    workflow_dispatch:
+  workflow_dispatch:
     inputs:
       pin-arxiv:
         description: 'Optional arxiv_id to implement directly (bypass selection).'
