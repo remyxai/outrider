@@ -1,6 +1,6 @@
 # Outrider — GitHub Action
 
-A GitHub Action that picks the next arXiv paper most implementable in your codebase — opens a draft PR wiring it into an existing call site, or an Issue if a PR would be premature. Won't re-recommend a paper that's already in front of your team.
+Validating and comparing new methods against your own codebase is 10× the work of any single implementation. Schedule Outrider (or dispatch on demand) as a GitHub Action to wire arXiv methods (or your own design-doc leads) into real call sites, so your team can measure the change against the metrics you already track.
 
 ```yaml
 - uses: remyxai/outrider@v1
@@ -8,38 +8,45 @@ A GitHub Action that picks the next arXiv paper most implementable in your codeb
     interest-id: ${{ vars.REMYX_INTEREST_ID }}
 ```
 
+Each dispatch runs the coding agent in a fresh, ephemeral runner — candidates don't share state, testing variance stays low, and you can dispatch dozens per week without context pollution. Backends are pluggable: Anthropic Opus for the shipping commit, z.ai's GLM-5.2 at ~20× lower cost for scouting and branch-mode exploration.
+
 
 ## What you get
 
-- **Draft PRs** that wire a paper's contribution into an existing module, with a self-review section honestly noting what was implemented vs. left out
-- **Issues** when a PR would be premature — pre-flight, validators, or self-review route the paper to discussion instead
-- **A quieter "branch only" mode** (`publish: branch`) — pushes the implementation to the fork without opening a PR or Issue; the team reviews the branch via GitHub UI + workflow step summary, then runs `gh pr create` when ready. Zero maintainer attention consumed until the team decides to promote. Useful for exploring multiple candidates before committing to any.
-- **No duplicate work** — the same paper isn't re-recommended once any Outrider or maintainer Issue references it; reopen to re-engage
-- **A selection narrative** in the run's GitHub Actions step summary explaining why this paper (or why nothing actionable this run)
+- **Draft PRs** wired to an existing call site, with a self-review noting what was implemented vs. left out
+- **Issues** when preflight, validators, or self-review route the paper to discussion instead
+- **Branch-only mode** (`publish: branch`) — pushes to the fork without opening a PR or Issue; explore N candidates before committing to any one
+- **No duplicate work** — a paper isn't re-recommended once Outrider or a maintainer Issue references it
+- **A selection narrative** in the step summary — why this paper, or why nothing this run
+
+
+## Model backends
+
+| Backend | Cost / full run | Best for |
+|---|---|---|
+| Anthropic Opus (default) | ~$2–3 | The commit — one candidate shipped as a draft PR |
+| z.ai GLM-5.2 | ~$0.05–0.10 | Scouting, branch-mode exploration, batched candidate scans |
+
+Route per-dispatch via a `provider` input — see [`docs/backends.md`](docs/backends.md) for the auth-header matrix and the switching workflow template. Rule of thumb: GLM for the exploration ladder, Opus for the candidate you commit to ship.
 
 
 ## Quickstart
 
 ```bash
 pip install remyxai
-```
-
-Install Outrider on a repo (engine-driven via the Remyx GitHub App — writes the workflow, sets the repo secrets, opens a bot-authored setup PR):
-
-```bash
 remyxai outrider init --repo owner/name --auto-interest
 ```
 
-From then on, the scheduled cron handles it — a draft PR or Issue appears each cycle. Trigger an ad-hoc run on a specific paper without waiting:
+Installs the action, writes the workflow, sets the secrets (`REMYX_API_KEY`, `ANTHROPIC_API_KEY`). Scheduled cron handles the weekly cadence from there.
+
+Trigger an ad-hoc run:
 
 ```bash
 remyxai outrider trigger --repo owner/name --pin-arxiv 2410.20305v2
 remyxai outrider trigger --repo owner/name --pin-method "riemannian preconditioning LoRA optimizer"
 ```
 
-`--pin-arxiv` implements the exact arxiv id (bypasses selection). `--pin-method` runs an engine search and implements the top hit — use it for exploratory dispatches when you know the method family but not the specific arxiv id, not for reproducible re-runs.
-
-Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Settings) and an Anthropic key (`--anthropic-key` or `ANTHROPIC_API_KEY`). See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install, per-dispatch routing flags, and secret management.
+`--pin-arxiv` implements the exact paper; `--pin-method` searches for the top hit. See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install and per-dispatch routing.
 
 <details>
 <summary><b>Manual install (5 minutes)</b></summary>
@@ -60,15 +67,23 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
    name: Outrider
    on:
      schedule:
-       - cron: '0 14 * * 1'  # Mondays 14:00 UTC; pick any cadence
+       - cron: '0 14 * * 1'   # Mondays 14:00 UTC; pick any cadence
      workflow_dispatch:
        inputs:
-         pin-method:
-           description: 'Optional arxiv_id or method query to implement directly.'
+         pin-arxiv:
+           description: 'Optional arxiv_id to implement directly (bypasses selection).'
            required: false
            default: ''
+         search-method:
+           description: 'Optional method query — searches for the top-hit paper and implements it.'
+           required: false
+           default: ''
+         publish:
+           description: 'pr (default) or branch — branch mode pushes to the fork without opening PR/Issue.'
+           required: false
+           default: 'pr'
          claude-timeout:
-           description: 'Wall-clock seconds for Claude Code (preflight + implementation).'
+           description: 'Wall-clock seconds for the Claude Code agent (preflight + implementation).'
            required: false
            default: '900'
    jobs:
@@ -85,40 +100,39 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
          - uses: remyxai/outrider@v1
            with:
              interest-id: 'YOUR-INTEREST-UUID-HERE'
-             pin-method: ${{ inputs.pin-method }}
+             pin-arxiv: ${{ inputs.pin-arxiv }}
+             search-method: ${{ inputs.search-method }}
+             publish: ${{ inputs.publish }}
              claude-timeout: ${{ inputs.claude-timeout }}
    ```
 
-   For multi-provider routing (route this run at z.ai's GLM endpoint vs Anthropic per dispatch), see [`docs/backends.md`](docs/backends.md) — adds a `provider` workflow_dispatch input + a `Configure provider auth` step. `outrider setup-local` (v0.4.3+) generates that shape by default.
+   For multi-provider routing (route this dispatch at z.ai's GLM endpoint vs Anthropic per run), see [`docs/backends.md`](docs/backends.md) — adds a `provider` input, a `ZAI_API_KEY` secret, and a `Configure provider auth` step. `outrider setup-local` (v0.4.3+) generates that shape by default; the workflow above is the Anthropic-only minimal path.
 
-6. **First run**: *Actions tab → Outrider → Run workflow*. Takes 4–6 minutes. A draft PR or Issue appears when complete.
+6. **First run**: *Actions tab → Outrider → Run workflow*. Takes 2–4 min on GLM, 4–6 min on Anthropic Opus. A draft PR, Issue, or branch appears when complete.
 
 </details>
 
 
-## Costs
-
-~$2–3 per full PR-route run on Anthropic Opus (recommend + chain); ~$0.50–1 with `chain: false`. Cost varies by provider and model — see [`docs/backends.md`](docs/backends.md). With the default cadence guard, expect ~$1–2/mo at typical engagement. You bring `ANTHROPIC_API_KEY`; Remyx API usage is covered by your engine.remyx.ai subscription.
-
-
 ## Examples
 
-- **[smellslikeml/OpenRLHF PR #14](https://github.com/smellslikeml/OpenRLHF/pull/14)** — MRPO step-level reward penalty for PPO ([arXiv:2606.31825v1](https://arxiv.org/abs/2606.31825v1)). +431/-15 LOC across 7 files: new `openrlhf/trainer/ppo_utils/step_reward_hook.py` with `MRPOStepPenaltyHook` + `apply_step_penalties`, wired into `RemoteExperienceMaker.compute_advantages_and_returns` alongside `apply_length_penalties`. Opt-in via `--reward.mrpo_step_decay`; default-off is byte-for-byte identical to the current PPO path. Body carries an "Out of scope" section that names the sibling papers in this fork's PPO-lifecycle cluster (Issues #11 async-pipeline, #12 PBRS, #13 FORCE) as follow-up-PR candidates that could reuse this call-site pattern rather than scope creep for this one. Illustrates the landing-zone-to-PR shape: one paper leads because it has the cleanest anchor; the cluster context survives in the PR narrative.
-- **[smellslikeml/agents PR #8](https://github.com/smellslikeml/agents/pull/8)** — Entity-binding preconditions for tool calls ([arXiv:2606.30531v1](https://arxiv.org/abs/2606.30531v1)). +561 LOC / 7 files: new `entity_binding` module with `EntityBindingError` subclassing existing `ToolError`, so the ambiguity/clarification message is routed back to the LLM via the repo's existing self-correct channel. Opt-in via `@function_tool(entities=resolver)` — behavior-preserving for tools that don't declare a resolver. Runnable example + tests included.
-- **[smellslikeml/peft PR #5](https://github.com/smellslikeml/peft/pull/5)** — Riemannian preconditioner for LoRA ([arXiv:2402.02347v3](https://arxiv.org/abs/2402.02347v3)). +284/-2 LOC across 3 files: new `preconditioned_optimizer.py` with `create_riemannian_optimizer` wired into the MetaMathQA benchmark's optimizer dispatch, `test_preconditioned_optimizer.py`, and a surgical +7/-2 wiring edit. Any config selecting `optimizer_type: "riemannian"` trains with the r×r preconditioner while non-LoRA params update unchanged. _Human shepherded this Outrider draft into an upstream contribution attempt at [huggingface/peft PR #3382](https://github.com/huggingface/peft/pull/3382) (Draft), coordinated via [issue #3380](https://github.com/huggingface/peft/issues/3380)._
-- **[smellslikeml/opik PR #8](https://github.com/smellslikeml/opik/pull/8)** — SAFARI persistent short-term memory tool for the agentic trace judge ([arXiv:2606.24626v1](https://arxiv.org/abs/2606.24626v1)). +420/-3 LOC across 5 files: new `memory` `ToolExecutor` (record/recall/clear keyed notepad) in `default_tool_registry()`, wired into the existing tool-call loop at `judge.py:70`; state on the tool instance and registry rebuilt per `AgenticLLMJudge` so notes survive every round of one loop yet never leak across evaluations; 16 KB recall cap matching sibling drill-in tools. Extends the existing multi-tool investigation loop as a peer of read/scan/search rather than sitting beside it.
-- **[smellslikeml/lerobot PR #9](https://github.com/smellslikeml/lerobot/pull/9)** — Dense Embodied Chain-of-Thought supervision for the `lerobot-annotate` pipeline ([arXiv:2606.30552v1](https://arxiv.org/abs/2606.30552v1)). +561/-20 LOC across 11 files: new `EcotReasoningModule` (245 lines) with the same `episode + FrameProvider + VlmClient → staged language columns` I/O contract as existing plan/vqa modules; wired into the executor as phase 4.5; landed in the `language_persistent` parquet column via the existing StagingValidator + LanguageColumnsWriter path. Positioned as the next step in the team's existing chain: *Language Support Schema → lerobot-annotate → Contact Sheets → ECoT reasoning traces.*
-- **[smellslikeml/ag2 PR #9](https://github.com/smellslikeml/ag2/pull/9)** — Adaptive Context Elasticizer for agent trajectories ([arXiv:2606.31564v1](https://arxiv.org/abs/2606.31564v1)). +454/-1 LOC across 6 files: new `ContextElasticizer` middleware plugging into ag2's `on_llm_call` hook — at every model call each historical step is assigned an elastic type (raw / abstract / drop) rather than a single keep/drop decision, with reversibility via a per-instance abstraction cache. Ships as a `MiddlewareFactory` subclass alongside existing `HistoryLimiter` / `TokenLimiter`; deterministic extractive digest keeps the middleware dependency-free. ADR + mdx doc + 145-line test suite.
+Each PR below shows the **match** (what in the paper mapped to what in the repo) and the **shape** (how the wiring landed):
+
+- **[OpenRLHF #14](https://github.com/smellslikeml/OpenRLHF/pull/14)** — MRPO step-level reward penalty ([arXiv:2606.31825v1](https://arxiv.org/abs/2606.31825v1)). *Match:* PPO advantages already carry per-step weighting; MRPO's decay factor slots in as a second multiplier. *Shape:* new hook wired into `RemoteExperienceMaker.compute_advantages_and_returns`, opt-in flag, default-off byte-identical. PR body names the sibling papers in the same PPO cluster as follow-ups.
+- **[agents #8](https://github.com/smellslikeml/agents/pull/8)** — Entity-binding preconditions for tool calls ([arXiv:2606.30531v1](https://arxiv.org/abs/2606.30531v1)). *Match:* `ToolError` already routes back through the self-correct channel; a subclass can carry clarification prompts. *Shape:* `EntityBindingError(ToolError)`, opt-in via `@function_tool(entities=resolver)`, behavior-preserving without a resolver.
+- **[peft #5](https://github.com/smellslikeml/peft/pull/5)** — Riemannian preconditioner for LoRA ([arXiv:2402.02347v3](https://arxiv.org/abs/2402.02347v3)). *Match:* the MetaMathQA benchmark already has a config-keyed optimizer dispatch. *Shape:* new `create_riemannian_optimizer`, +7/-2 wiring edit. _Human shepherded to [huggingface/peft #3382](https://github.com/huggingface/peft/pull/3382), coordinated via [issue #3380](https://github.com/huggingface/peft/issues/3380)._
+- **[opik #8](https://github.com/smellslikeml/opik/pull/8)** — SAFARI short-term memory for the agentic trace judge ([arXiv:2606.24626v1](https://arxiv.org/abs/2606.24626v1)). *Match:* the tool loop is already multi-tool; add a `memory` `ToolExecutor` as a peer of read/scan/search. *Shape:* per-`AgenticLLMJudge` state — notes survive within one loop, never leak across evaluations.
+- **[lerobot #9](https://github.com/smellslikeml/lerobot/pull/9)** — Dense Embodied Chain-of-Thought supervision ([arXiv:2606.30552v1](https://arxiv.org/abs/2606.30552v1)). *Match:* the annotator has staged language modules (plan / vqa); ECoT slots in as another stage with the same I/O contract. *Shape:* new `EcotReasoningModule`, wired into the executor as phase 4.5.
+- **[ag2 #9](https://github.com/smellslikeml/ag2/pull/9)** — Adaptive Context Elasticizer ([arXiv:2606.31564v1](https://arxiv.org/abs/2606.31564v1)). *Match:* `MiddlewareFactory` already extends the LLM-call pipeline; a new elastic middleware sits alongside `HistoryLimiter` / `TokenLimiter`. *Shape:* per-instance abstraction cache for reversibility, deterministic extractive digest keeps the middleware dependency-free.
 
 
 ## Documentation
 
 - **[Configuration reference](docs/configuration.md)** — full inputs, outputs, status codes
-- **[Customization](docs/customization.md)** — how to tailor Outrider to your repo + signals it reads
+- **[Customization](docs/customization.md)** — tailor Outrider to your repo + signals it reads
 - **[Architecture](docs/architecture.md)** — selection taxonomy, pipeline, refinement chain
 - **[Guardrails](docs/guardrails.md)** — what the agent can and can't modify
-- **[Model backends](docs/backends.md)** — route at any Anthropic-Messages-compatible backend (z.ai's GLM, Bedrock, Vertex, on-prem); auth-header matrix; per-dispatch backend-switching workflow template
-- **[Environments](docs/environments.md)** — describe workflow-attached tooling (Claude Code skills, MCP servers, custom search) via `ENVIRONMENTS.md` so the agent knows to reach for it
+- **[Model backends](docs/backends.md)** — full backend/auth matrix + per-dispatch switching template
+- **[Environments](docs/environments.md)** — describe workflow-attached tooling via `ENVIRONMENTS.md`
 - **[Weekly summary mode](docs/weekly-summary.md)** — opt-in rolling digest comments
 
 
