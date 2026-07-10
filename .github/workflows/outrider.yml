@@ -2,7 +2,7 @@ name: Outrider
 
 on:
   schedule:
-    - cron: '0 14 * * 1'
+    # - cron: '0 14 * * 1'  # disabled 2026-07-10 in favor of outrider-daily.yml (branch-mode GLM)
   workflow_dispatch:
     inputs:
       pin-arxiv:
