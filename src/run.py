@@ -361,6 +361,122 @@ lint config (treat as no strict convention to follow) or the orchestrator
 couldn't read it (rare; surface in your summary if so).
 """
 
+_RESEARCH_INVOCATION_MD_TEMPLATE = """\
+---
+type: research_invocation
+description: Headless prompt for the research-phase Claude Code invocation.
+---
+
+You are the **research stage** of a two-stage Outrider dispatch. A downstream
+coding session (a separate Claude Code invocation) will implement the paper
+against the target repository; your job is to prepare its context by gathering
+structured evidence and producing a single ``web_findings.json`` artifact.
+
+# Your role
+
+- **Investigate, do not implement.** You are explicitly forbidden from writing
+  implementation code, editing production files, or opening PRs / commits.
+  Your only write output is ``web_findings.json`` in the workspace root.
+- **Decompose the paper into research subquestions** and dispatch parallel
+  tool calls. Aim for at least 5 concurrent tool calls per turn unless you
+  have already converged — the underlying tool-use loop resolves parallel
+  calls in a single turn, so breadth-per-turn is essentially free latency.
+- **Annotate every finding** with a one-line "why included" justification.
+  Downstream stages use these annotations to spot rationalizations.
+- **Bounded budget**: aim for ≤ 8 turns. If you cannot converge in that
+  budget, halt and produce a partial ``web_findings.json`` with a
+  ``truncation_reason`` field explaining what's missing.
+
+# Research task
+
+Paper: **{paper_title}** (arxiv:{arxiv_id})
+Target repo: **{target_repo}**
+Prior-attempt context: {prior_attempt_hint}
+
+# What the coding session needs
+
+Write ``web_findings.json`` at the workspace root with at least these fields:
+
+```
+{{
+  "paper": {{
+    "arxiv_id": str,
+    "title": str,
+    "core_mechanism": str,   // 2-3 sentences on the paper's central technical claim
+    "call_site_candidates": [
+      {{ "path": str, "why": str, "confidence": "high" | "medium" | "low" }}
+    ]
+  }},
+  "target_repo": {{
+    "conventions": [str],
+    "prior_attempts_on_this_paper": [ {{ "branch": str, "sha": str, "outcome": str }} ],
+    "sibling_implementations": [ {{ "url": str, "why_relevant": str }} ]
+  }},
+  "coordination_signals": [
+    {{ "url": str, "kind": "issue" | "pr" | "discussion", "summary": str, "significance": str }}
+  ],
+  "scope_recommendations": {{
+    "mode_hint": "Mode 1 (direct port)" | "Mode 2 (adapted port)" | "Mode 3 (inspired experiment)",
+    "substitutions_to_expect": [str],
+    "scope_to_avoid": [str]
+  }},
+  "provenance": [
+    {{ "source_id": str, "tool": str, "url": str, "retrieved_at": str, "why": str }}
+  ],
+  "turn_count": int,
+  "cost_usd": float | null,
+  "truncation_reason": str | null
+}}
+```
+
+# Available tools
+
+Standard Claude Code toolkit: ``Read``, ``Bash``, ``WebFetch``, ``Grep``,
+``Glob``. Use ``gh`` CLI via ``Bash`` for GitHub queries. When ``WebFetch``
+returns binary content (typical for arxiv PDFs), pivot to the ar5iv HTML
+mirror at ``ar5iv.labs.arxiv.org/html/<arxiv_id>``.
+
+# Suggested decomposition (the first turn)
+
+Dispatch these in parallel to seed the investigation:
+
+- Fetch the paper's abstract page (arxiv or ar5iv HTML)
+- ``gh api`` for the target-repo metadata + default branch + top-level files
+- If prior-attempt context names a branch, ``gh api compare`` the baseline
+  diff against ``main``
+- ``gh issue list`` / ``gh api search issues`` for coordination signals on
+  the target repo's upstream (open issues touching the paper's capability
+  class — output-constrained, structured-output, whatever the paper is
+  about)
+- ``gh api`` for a recent-merged-PR sample on the target repo (~5 items)
+  to establish convention patterns
+
+Depth turns follow the fanout: verify the paper's methodology (Section 3),
+read the baseline branch's core file, check upstream conventions
+against the baseline's wiring, deepen high-signal coordination hits.
+
+# Termination
+
+Write ``web_findings.json`` to the workspace root using the ``Write`` tool.
+Do NOT open any PRs / issues / commits. Do NOT call the Task tool. Your
+final assistant message should be one paragraph summarizing what the coding
+session should now do — no code, no diffs.
+"""
+
+
+_RESEARCH_FINDINGS_REF_TEMPLATE = """\
+  6. ``web_findings.json``                    — structured research context from the
+                                              research phase: paper's core mechanism,
+                                              call-site candidates with confidence,
+                                              prior attempts, coordination signals,
+                                              mode hint, and scope recommendations.
+                                              Read this before opening files —
+                                              call_site_candidates points you at
+                                              the exact call sites the research
+                                              phase already scoped.
+"""
+
+
 _INVOCATION_MD_TEMPLATE = """\
 ---
 type: agent_invocation
@@ -386,7 +502,7 @@ Read these files in order:
                                               + tests near the planned call
                                               site. Use these patterns
                                               without re-exploring them.
-{environment_file_ref}
+{environment_file_ref}{research_findings_ref}
 
 SPEC.md names a PROPOSED CALL SITE under "How this maps onto your repo"
 (the file + function the selection pass judged most implementable). Start
@@ -4922,11 +5038,20 @@ def write_spec_bundle(
         ))
         environment_file_ref = _ENVIRONMENT_FILE_REF_TEMPLATE
 
+    # Research-findings ref: filled when the staged-synthesis research phase
+    # ran and produced web_findings.json in the workspace root. Coding session
+    # reads it as another bundle-adjacent context file.
+    research_findings_ref = (
+        _RESEARCH_FINDINGS_REF_TEMPLATE
+        if (workdir / "web_findings.json").exists()
+        else ""
+    )
     (bundle / "INVOCATION.md").write_text(_INVOCATION_MD_TEMPLATE.format(
         package=package,
         attribution_url=CANONICAL_ATTRIBUTION_URL,
         issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
         environment_file_ref=environment_file_ref,
+        research_findings_ref=research_findings_ref,
     ))
 
     # ORIENTATION.md — target repo's contributor guides, PR template, recent
@@ -5429,6 +5554,85 @@ def _strip_leading_frontmatter(text: str) -> str:
             return "".join(lines[i + 1:]).lstrip("\n")
     # No closing fence — not a frontmatter block; leave untouched.
     return text
+
+
+def write_research_invocation(
+    workdir: Path, rec: "Recommendation", target: "Target",
+) -> None:
+    """Write RESEARCH_INVOCATION.md into the bundle for the staged-synthesis pass.
+
+    Called before the research phase runs when INPUT_STAGED_SYNTHESIS is set.
+    Fills the paper title / arxiv ID / target repo / prior-attempt hint into
+    the research template so the invocation has a concrete task to work on.
+    """
+    bundle = workdir / BUNDLE_DIR_NAME
+    bundle.mkdir(exist_ok=True)
+
+    # Prior-attempt hint: if start-from-ref names a preserved branch on the
+    # target fork, surface it explicitly so the research phase probes it.
+    prior_ref = (os.environ.get("INPUT_START_FROM_REF") or "").strip()
+    if prior_ref:
+        prior_attempt_hint = (
+            f"an earlier dispatch produced the branch ``{prior_ref}`` on the "
+            f"fork; the research phase should probe it as a baseline candidate."
+        )
+    else:
+        prior_attempt_hint = "no prior-attempt branch is pinned; probe git history for any earlier attempts."
+
+    (bundle / "RESEARCH_INVOCATION.md").write_text(
+        _RESEARCH_INVOCATION_MD_TEMPLATE.format(
+            paper_title=rec.paper_title or "(unknown title)",
+            arxiv_id=rec.arxiv_id or "(unknown)",
+            target_repo=target.repo,
+            prior_attempt_hint=prior_attempt_hint,
+        )
+    )
+
+
+def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, str]:
+    """Invoke the research-phase Claude Code CLI pass.
+
+    Reads ``.remyx-recommendation/RESEARCH_INVOCATION.md`` as the prompt,
+    runs the CLI, and expects ``web_findings.json`` to appear at the
+    workspace root when the pass completes successfully. Returns
+    ``(success, stdout/stderr tail)``.
+
+    Failure modes handled gracefully upstream: caller should treat a
+    False return as "no research context available for coding session"
+    and continue with the classic single-invocation flow rather than
+    fail the whole dispatch.
+
+    Uses a tighter default timeout (600s / 10 min) than the coding
+    invocation — the research phase should converge in ≤ 8 turns per the
+    prompt's own budget; a longer wall clock usually signals a hung
+    tool call rather than legitimate work.
+    """
+    invocation = _strip_leading_frontmatter(
+        (workdir / BUNDLE_DIR_NAME / "RESEARCH_INVOCATION.md").read_text()
+    )
+    log.info(f"  → invoking research phase (timeout={timeout_s}s) in {workdir}")
+    cmd = ["claude", "--dangerously-skip-permissions"]
+    # Cap turns via the same knob the coding invocation honors, but with a
+    # tighter default for the research phase (8 turns per the prompt's
+    # bounded-budget instruction).
+    max_turns = os.environ.get("REMYX_RESEARCH_MAX_TURNS", "8").strip()
+    if max_turns:
+        cmd += ["--max-turns", max_turns]
+    ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
+    findings_path = workdir / "web_findings.json"
+    if ok and not findings_path.exists():
+        # Session succeeded but the agent didn't write the artifact — surface
+        # this as a soft failure so the caller falls back to non-staged flow.
+        log.warning(
+            "  ✗ research phase completed but web_findings.json is missing; "
+            "coding session will run without research context."
+        )
+        return False, text[-4000:]
+    if ok:
+        log.info(f"  ✓ research phase produced web_findings.json ({findings_path.stat().st_size} bytes)")
+    else:
+        log.warning(f"  ✗ research phase failed; coding session will run without research context.")
+    return ok, text[-4000:]
 
 
 def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
@@ -8457,6 +8661,25 @@ def process_target(target: Target) -> dict:
         # rationale through so pre-flight and the implementer evaluate the
         # same scoped framing the selection pass reasoned about.
         branch = format_branch_name(rec)
+        # 4.5. Research phase (opt-in via INPUT_STAGED_SYNTHESIS). Runs a
+        # bounded research-only Claude Code invocation before the coding
+        # session, producing web_findings.json at the workspace root.
+        # Coding session (and downstream refinement chain) read that
+        # artifact as structured context alongside SPEC.md.
+        #
+        # Falls back to classic single-invocation flow when the research
+        # phase fails — no web_findings.json written, INVOCATION.md
+        # skips the ref block, coding session runs as today.
+        staged = (os.environ.get("INPUT_STAGED_SYNTHESIS") or "").strip().lower()
+        if staged in ("true", "1", "yes"):
+            log.info("  → staged-synthesis enabled; running research phase before coding session")
+            write_research_invocation(workdir, rec, target)
+            research_ok, research_log = invoke_research_phase(
+                workdir, timeout_s=min(600, target.claude_timeout_s),
+            )
+            result["research_phase_ok"] = research_ok
+            result["research_log_tail"] = research_log[-1000:]
+
         write_spec_bundle(
             workdir, target, rec, package,
             selection_note=result.get("selection_reasoning", ""),

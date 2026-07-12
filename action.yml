@@ -244,6 +244,25 @@ inputs:
       want to review before committing to shipping.
     required: false
     default: 'pr'
+  staged-synthesis:
+    description: |
+      Opt-in two-stage coding session: a bounded research invocation runs
+      first, produces `web_findings.json` in the workspace, then the coding
+      invocation reads it as structured context alongside SPEC.md. The
+      research invocation decomposes the paper into parallel research
+      subquestions (target-repo state, prior attempts, coordination
+      signals, convention patterns), dispatches concurrent tool calls,
+      and aggregates into a typed handoff artifact.
+
+      When enabled, adds ~$0.15-0.50 and ~1-3 minutes to the run. The
+      coding session's INVOCATION.md gains a "Research context" section
+      referencing `web_findings.json`. Downstream refinement-chain agents
+      (fidelity / convention / test) also read the artifact, avoiding
+      re-discovery.
+
+      Empty / 'false' (default) = classic single-invocation flow.
+    required: false
+    default: 'false'
   linear-api-key:
     description: |
       Linear API key used by the tool-plane's Linear connector to resolve
@@ -479,6 +498,7 @@ runs:
         INPUT_LEAD_CONTENT: ${{ inputs.lead-content }}
         INPUT_START_FROM_REF: ${{ inputs.start-from-ref }}
         INPUT_LINEAR_API_KEY: ${{ inputs.linear-api-key }}
+        INPUT_STAGED_SYNTHESIS: ${{ inputs.staged-synthesis }}
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).
