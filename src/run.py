@@ -4855,7 +4855,21 @@ def write_spec_bundle(
     # full-paper-integration attempt — the preflight + implementer both
     # reason against the LEAD's scoped framing, which is exactly what the
     # human who chose to convert this LEAD to a PR wants shipped.
-    lead_content_override = (os.environ.get("INPUT_LEAD_CONTENT") or "").strip()
+    #
+    # URLs matching a tool-plane connector's owned domain get pre-resolved
+    # before substitution. Linear URLs fetch their issue body via the Linear
+    # connector using LINEAR_API_KEY; unknown URLs / raw text fall through
+    # unchanged (backward compat with the classic WebFetch flow).
+    from tool_plane.lead_content_routing import resolve_lead_content
+
+    lead_content_raw = (os.environ.get("INPUT_LEAD_CONTENT") or "").strip()
+    lead_content_override, lead_tool_response = resolve_lead_content(lead_content_raw)
+    if lead_tool_response is not None:
+        log.info(
+            f"  → lead-content routed via {lead_tool_response.connector} "
+            f"connector: status={lead_tool_response.status} "
+            f"latency={lead_tool_response.latency_ms:.0f}ms"
+        )
     effective_experiment = lead_content_override or (rec.suggested_experiment or "(none)")
     (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
         paper_title=rec.paper_title,
