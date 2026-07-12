@@ -244,6 +244,27 @@ inputs:
       want to review before committing to shipping.
     required: false
     default: 'pr'
+  start-from-ref:
+    description: |
+      Optional branch/tag/SHA on the target fork to start the coding session
+      from, instead of the repo's default branch. Enables refinement runs on
+      a prior Outrider draft (e.g. add tests, apply convention pass, fix a
+      failing gate) — the agent sees the ref's diff already applied to the
+      workspace, so `lead-content` phrasing like "add coverage for X" or
+      "refactor Y" becomes actionable rather than advisory.
+
+      Semantics: clone the target fork, `git fetch` + `git checkout` this
+      ref, run the coding session on top. The eventual push lands on a new
+      branch named `<paper-slug>-refined` (suffix avoids the collision when
+      the same paper feeds both the original and refinement run). PR is
+      still opened against the repo's default branch, so the diff review
+      shows the full state — original artifact plus refinement — in one
+      place.
+
+      Empty (default) = clone default branch (main / master), the classic
+      per-paper implementation flow.
+    required: false
+    default: ''
   model-base-url:
     description: |
       Optional override for the Claude Code subprocess's ANTHROPIC_BASE_URL.
@@ -441,6 +462,7 @@ runs:
         INPUT_SEARCH_METHOD: ${{ inputs.search-method }}
         INPUT_PUBLISH: ${{ inputs.publish }}
         INPUT_LEAD_CONTENT: ${{ inputs.lead-content }}
+        INPUT_START_FROM_REF: ${{ inputs.start-from-ref }}
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).

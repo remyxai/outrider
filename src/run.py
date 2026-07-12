@@ -1805,10 +1805,19 @@ def format_branch_name(rec: "Recommendation") -> str:
     with the arxiv id as a fallback identifier when the title is empty.
     Dedup paths that previously matched against ``BRANCH_PREFIX`` now
     fall back to identifying our PRs via the body marker.
+
+    REMYX-219: when INPUT_START_FROM_REF is set, this is a refinement run
+    on a prior draft — append ``-refined`` so the push doesn't collide
+    with (or force-push over) the original artifact when the same paper
+    drives both runs.
     """
     if rec.paper_title:
-        return slugify(rec.paper_title)
-    return rec.arxiv_id or "paper-recommendation"
+        base = slugify(rec.paper_title)
+    else:
+        base = rec.arxiv_id or "paper-recommendation"
+    if (os.environ.get("INPUT_START_FROM_REF") or "").strip():
+        return f"{base}-refined"
+    return base
 
 
 def strip_html(s: str) -> str:
@@ -4295,6 +4304,29 @@ def prepare_workdir(target: Target) -> Path:
         ["git", "clone", "--depth", "20", repo_url, str(workdir)],
         check=True, env=clone_env,
     )
+    # REMYX-219 refinement mode: when INPUT_START_FROM_REF names a branch /
+    # tag / SHA on the fork, check that ref out on top of the default-branch
+    # clone. Downstream: the sanity check in commit_and_push validates
+    # against origin/<start_from_ref> instead of origin/<default>, and the
+    # derived branch name gets a "-refined" suffix so the refinement push
+    # doesn't collide with the original artifact when the same paper feeds
+    # both runs.
+    start_from_ref = (os.environ.get("INPUT_START_FROM_REF") or "").strip()
+    if start_from_ref:
+        log.info(f"  → fetching + checking out start-from-ref '{start_from_ref}'")
+        # Explicit refspec so ``origin/<ref>`` remote-tracking exists too —
+        # commit_and_push's sanity check resolves ``origin/<start-from-ref>``,
+        # and a plain ``git fetch origin <ref>`` only updates FETCH_HEAD.
+        subprocess.run(
+            ["git", "fetch", "--depth", "20", "origin",
+             f"{start_from_ref}:refs/remotes/origin/{start_from_ref}"],
+            cwd=workdir, check=True, env=clone_env,
+        )
+        subprocess.run(
+            ["git", "checkout", "-B", start_from_ref,
+             f"origin/{start_from_ref}"],
+            cwd=workdir, check=True,
+        )
     # The branch head is normally re-authored via the git data API
     # (see commit_and_push → _recommit_via_api), which stamps the bot
     # identity itself. This local identity is the fallback: it's what the
@@ -7195,21 +7227,29 @@ def commit_and_push(
         duplicate content already in the PR body and add noise to the
         diff.
     """
-    # Sanity check: make sure local HEAD still equals origin/<base_branch>
+    # Sanity check: make sure local HEAD still equals its expected upstream
     # before we branch. If Claude (or pytest) disturbed the git state during
     # the session — `git checkout --orphan`, `rm -rf .git`, `git init`,
     # whatever — local HEAD can diverge from the remote default, and the
     # subsequent `git checkout -b branch` produces a root-commit branch with
     # no history in common with it. The PR-creation API then rejects with
-    # HTTP 422. Fail fast with a clear error instead. (base_branch is the
-    # repo's real default — `main` or `master` — not a hardcoded `main`.)
+    # HTTP 422. Fail fast with a clear error instead.
+    #
+    # REMYX-219 refinement mode: when INPUT_START_FROM_REF is set the
+    # session started from a non-default ref, so its expected upstream is
+    # origin/<start-from-ref>, not origin/<base_branch>. The eventual PR
+    # still targets base_branch (main / master); only the commit ancestry
+    # sanity check changes.
+    expected_ref = (
+        (os.environ.get("INPUT_START_FROM_REF") or "").strip() or base_branch
+    )
     head_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=workdir, capture_output=True, text=True, check=True,
     ).stdout.strip()
     try:
         remote_sha = subprocess.run(
-            ["git", "rev-parse", f"origin/{base_branch}"],
+            ["git", "rev-parse", f"origin/{expected_ref}"],
             cwd=workdir, capture_output=True, text=True, check=True,
         ).stdout.strip()
     except subprocess.CalledProcessError:
@@ -7217,7 +7257,7 @@ def commit_and_push(
     if not remote_sha or head_sha != remote_sha:
         raise RuntimeError(
             f"local HEAD ({head_sha[:8]}) doesn't match "
-            f"origin/{base_branch} ({(remote_sha or 'MISSING')[:8]}) — git "
+            f"origin/{expected_ref} ({(remote_sha or 'MISSING')[:8]}) — git "
             f"state was disturbed during the session. Refusing to commit; "
             f"would produce a root-commit branch and fail at PR creation."
         )
