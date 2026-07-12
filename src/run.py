@@ -9156,9 +9156,19 @@ def process_target(target: Target) -> dict:
                 # HEAD to the remote's API commit without touching the
                 # working tree (patch changes stay uncommitted); the
                 # subsequent commit is a clean fast-forward.
+                #
+                # Explicit refspec (``+<branch>:refs/remotes/origin/<branch>``)
+                # so ``refs/remotes/origin/<branch>`` actually gets populated
+                # locally — a bare ``git fetch origin <branch>`` only updates
+                # ``FETCH_HEAD``, and the subsequent ``origin/<branch>``
+                # rev-parse resolves the remote-tracking ref, not FETCH_HEAD.
+                # Without the explicit refspec this consistently 500s on the
+                # reset with "ambiguous argument 'origin/<branch>': unknown
+                # revision or path not in the working tree."
                 try:
                     subprocess.run(
-                        ["git", "fetch", "origin", branch],
+                        ["git", "fetch", "origin",
+                         f"+{branch}:refs/remotes/origin/{branch}"],
                         cwd=workdir, check=True, capture_output=True, text=True,
                     )
                     subprocess.run(
