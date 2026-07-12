@@ -244,6 +244,21 @@ inputs:
       want to review before committing to shipping.
     required: false
     default: 'pr'
+  linear-api-key:
+    description: |
+      Linear API key used by the tool-plane's Linear connector to resolve
+      `lead-content` URLs of the form `linear.app/<workspace>/issue/<ID>`.
+      When set, a Linear issue's body + top-level metadata is fetched and
+      substituted into the coding session's SPEC.md in place of the URL,
+      so the agent gets structured phase-spec content rather than a login
+      page via WebFetch.
+
+      Empty (default) = the Linear connector reports `not_configured`
+      per fetch attempt, and the URL falls through to today's WebFetch
+      flow. No auth wire-up required for forks that don't use
+      Linear-based lead-content.
+    required: false
+    default: ''
   start-from-ref:
     description: |
       Optional branch/tag/SHA on the target fork to start the coding session
@@ -463,6 +478,7 @@ runs:
         INPUT_PUBLISH: ${{ inputs.publish }}
         INPUT_LEAD_CONTENT: ${{ inputs.lead-content }}
         INPUT_START_FROM_REF: ${{ inputs.start-from-ref }}
+        INPUT_LINEAR_API_KEY: ${{ inputs.linear-api-key }}
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).

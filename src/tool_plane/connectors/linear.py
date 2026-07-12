@@ -4,9 +4,13 @@ Fetches an issue's body + relevant metadata given a ``linear.app/*/issue/<ID>``
 URL. Returns a ``ToolResponse`` envelope so callers get uniform audit-shaped
 output regardless of connector.
 
-Auth: reads ``LINEAR_API_KEY`` from the environment. Missing key returns
-``status: not_configured`` (not an error) so callers can fall through to
-plain HTTP GET when Linear-specific auth isn't wired.
+Auth: reads the Linear API key from ``INPUT_LINEAR_API_KEY`` (set by the
+action.yml ``linear-api-key`` input) with a fallback to a bare
+``LINEAR_API_KEY`` env var (for local invocations or workflows that
+export the secret at the job-level ``env:`` block instead of passing it
+through the action input). Missing key returns ``status: not_configured``
+(not an error) so callers can fall through to plain HTTP GET when
+Linear-specific auth isn't wired.
 
 Scope: read-only ``issue`` fetch by identifier. Comments, attachments,
 related-issue graph — deferred to follow-up connector work once
@@ -96,7 +100,14 @@ def fetch_issue(url: str, *, timeout_s: float = 15.0) -> ToolResponse:
             connector_version=CONNECTOR_VERSION,
         )
 
-    api_key = os.environ.get("LINEAR_API_KEY", "").strip()
+    # Prefer the action-input passthrough (INPUT_LINEAR_API_KEY) over the
+    # bare env var, matching the same precedence as INPUT_GITHUB_TOKEN vs
+    # GITHUB_TOKEN. Either wiring path works; explicit-input takes precedence
+    # so a customer who passes both gets the input-declared value.
+    api_key = (
+        os.environ.get("INPUT_LINEAR_API_KEY", "").strip()
+        or os.environ.get("LINEAR_API_KEY", "").strip()
+    )
     if not api_key:
         return tool_response_error(
             connector=CONNECTOR,

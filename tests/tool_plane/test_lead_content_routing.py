@@ -93,6 +93,7 @@ def test_linear_url_falls_through_on_missing_api_key(monkeypatch):
     (the coding session's WebFetch will hit Linear's login page and the operator
     will see the auth gap in the run log). Response is still returned for audit."""
     monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("INPUT_LINEAR_API_KEY", raising=False)
     url = "https://linear.app/example/issue/TEAM-2"
     resolved, response = lead_content_routing.resolve_lead_content(url)
     assert resolved == url

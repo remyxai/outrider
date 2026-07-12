@@ -39,10 +39,70 @@ def test_is_linear_url_negative():
 
 def test_fetch_issue_missing_api_key_returns_not_configured(monkeypatch):
     monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("INPUT_LINEAR_API_KEY", raising=False)
     r = linear.fetch_issue("https://linear.app/example/issue/TEAM-1")
     assert r.status == "not_configured"
     assert r.error_code == "linear_api_key_missing"
     assert r.latency_ms == 0.0  # no network happened
+
+
+def test_fetch_issue_reads_input_prefixed_env(monkeypatch):
+    """The action.yml passthrough sets INPUT_LINEAR_API_KEY, mirroring the
+    INPUT_GITHUB_TOKEN pattern. Connector must pick that up too, not just
+    the bare env var name."""
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.setenv("INPUT_LINEAR_API_KEY", "input-passthrough-key")
+    fake_body = {
+        "data": {
+            "issue": {
+                "identifier": "TEAM-1",
+                "title": "input-passthrough test",
+                "description": "body",
+                "url": "https://linear.app/example/issue/TEAM-1",
+                "state": {"name": "Backlog", "type": "backlog"},
+                "priority": 0,
+                "priorityLabel": None,
+                "project": None,
+                "labels": {"nodes": []},
+                "updatedAt": "2026-07-12T00:00:00.000Z",
+                "createdAt": "2026-07-12T00:00:00.000Z",
+            }
+        }
+    }
+    with patch(
+        "tool_plane.connectors.linear.urllib.request.urlopen",
+        return_value=_FakeResponse(fake_body),
+    ):
+        r = linear.fetch_issue("https://linear.app/example/issue/TEAM-1")
+    assert r.status == "ok"
+
+
+def test_fetch_issue_input_prefixed_takes_precedence_over_bare(monkeypatch):
+    """Both env vars set: INPUT_ prefix wins, matching the INPUT_GITHUB_TOKEN
+    precedence rule elsewhere in run.py."""
+    monkeypatch.setenv("LINEAR_API_KEY", "bare-env-key")
+    monkeypatch.setenv("INPUT_LINEAR_API_KEY", "input-passthrough-key")
+    captured_headers = {}
+
+    class _FakeUrlOpen:
+        def __init__(self, req, timeout):
+            captured_headers.update(dict(req.header_items()))
+            self._body = json.dumps({"data": {"issue": None}}).encode()
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with patch("tool_plane.connectors.linear.urllib.request.urlopen", side_effect=_FakeUrlOpen):
+        linear.fetch_issue("https://linear.app/example/issue/TEAM-1")
+
+    # Authorization header should carry the INPUT_-prefixed key, not the bare env value.
+    assert captured_headers.get("Authorization") == "input-passthrough-key"
 
 
 def test_fetch_issue_malformed_url(monkeypatch):
