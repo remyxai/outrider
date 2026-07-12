@@ -1,4 +1,4 @@
-"""Tests for the ``start-from-ref`` refinement input (REMYX-219).
+"""Tests for the ``start-from-ref`` refinement input.
 
 Covers:
 

@@ -376,7 +376,7 @@ structured evidence and producing a single ``web_findings.json`` artifact.
 
 - **Investigate, do not implement.** You are explicitly forbidden from writing
   implementation code, editing production files, or opening PRs / commits.
-  Your only write output is ``web_findings.json`` in the workspace root.
+  Your only write output is ``.remyx-recommendation/web_findings.json`` in the briefing bundle dir.
 - **Decompose the paper into research subquestions** and dispatch parallel
   tool calls. Aim for at least 5 concurrent tool calls per turn unless you
   have already converged — the underlying tool-use loop resolves parallel
@@ -395,7 +395,7 @@ Prior-attempt context: {prior_attempt_hint}
 
 # What the coding session needs
 
-Write ``web_findings.json`` at the workspace root with at least these fields:
+Write ``.remyx-recommendation/web_findings.json`` (the briefing bundle dir, NOT workspace root) with at least these fields:
 
 ```
 {{
@@ -457,15 +457,17 @@ against the baseline's wiring, deepen high-signal coordination hits.
 
 # Termination
 
-Write ``web_findings.json`` to the workspace root using the ``Write`` tool.
-Do NOT open any PRs / issues / commits. Do NOT call the Task tool. Your
-final assistant message should be one paragraph summarizing what the coding
-session should now do — no code, no diffs.
+Write your artifact to ``.remyx-recommendation/web_findings.json`` (the
+briefing-bundle directory, NOT the workspace root — files at the root
+would trip the path-allowlist gate on the downstream commit). Use the
+``Write`` tool. Do NOT open any PRs / issues / commits. Do NOT call the
+Task tool. Your final assistant message should be one paragraph
+summarizing what the coding session should now do — no code, no diffs.
 """
 
 
 _RESEARCH_FINDINGS_REF_TEMPLATE = """\
-  6. ``web_findings.json``                    — structured research context from the
+  6. ``.remyx-recommendation/web_findings.json`` — structured research context from the
                                               research phase: paper's core mechanism,
                                               call-site candidates with confidence,
                                               prior attempts, coordination signals,
@@ -1922,7 +1924,7 @@ def format_branch_name(rec: "Recommendation") -> str:
     Dedup paths that previously matched against ``BRANCH_PREFIX`` now
     fall back to identifying our PRs via the body marker.
 
-    REMYX-219: when INPUT_START_FROM_REF is set, this is a refinement run
+    When INPUT_START_FROM_REF is set, this is a refinement run
     on a prior draft — append ``-refined`` so the push doesn't collide
     with (or force-push over) the original artifact when the same paper
     drives both runs.
@@ -4420,7 +4422,7 @@ def prepare_workdir(target: Target) -> Path:
         ["git", "clone", "--depth", "20", repo_url, str(workdir)],
         check=True, env=clone_env,
     )
-    # REMYX-219 refinement mode: when INPUT_START_FROM_REF names a branch /
+    # Refinement mode: when INPUT_START_FROM_REF names a branch /
     # tag / SHA on the fork, check that ref out on top of the default-branch
     # clone. Downstream: the sanity check in commit_and_push validates
     # against origin/<start_from_ref> instead of origin/<default>, and the
@@ -5039,11 +5041,11 @@ def write_spec_bundle(
         environment_file_ref = _ENVIRONMENT_FILE_REF_TEMPLATE
 
     # Research-findings ref: filled when the staged-synthesis research phase
-    # ran and produced web_findings.json in the workspace root. Coding session
+    # ran and produced web_findings.json in the briefing bundle dir. Coding session
     # reads it as another bundle-adjacent context file.
     research_findings_ref = (
         _RESEARCH_FINDINGS_REF_TEMPLATE
-        if (workdir / "web_findings.json").exists()
+        if (workdir / BUNDLE_DIR_NAME / "web_findings.json").exists()
         else ""
     )
     (bundle / "INVOCATION.md").write_text(_INVOCATION_MD_TEMPLATE.format(
@@ -5593,8 +5595,8 @@ def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, st
     """Invoke the research-phase Claude Code CLI pass.
 
     Reads ``.remyx-recommendation/RESEARCH_INVOCATION.md`` as the prompt,
-    runs the CLI, and expects ``web_findings.json`` to appear at the
-    workspace root when the pass completes successfully. Returns
+    runs the CLI, and expects ``web_findings.json`` to appear in the
+    briefing bundle directory when the pass completes successfully. Returns
     ``(success, stdout/stderr tail)``.
 
     Failure modes handled gracefully upstream: caller should treat a
@@ -5619,7 +5621,7 @@ def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, st
     if max_turns:
         cmd += ["--max-turns", max_turns]
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
-    findings_path = workdir / "web_findings.json"
+    findings_path = workdir / BUNDLE_DIR_NAME / "web_findings.json"
     if ok and not findings_path.exists():
         # Session succeeded but the agent didn't write the artifact — surface
         # this as a soft failure so the caller falls back to non-staged flow.
@@ -7323,7 +7325,7 @@ def detect_default_branch(workdir: Path) -> str:
     aborted. Detect it once and thread it through.
 
     Prefers ``refs/remotes/origin/HEAD`` over the local ``HEAD`` so the
-    answer stays correct when INPUT_START_FROM_REF (REMYX-219) has
+    answer stays correct when INPUT_START_FROM_REF has
     swapped the working checkout to a non-default ref. The remote's
     HEAD is set at clone time and doesn't move on local checkouts.
     Falls back to local HEAD for local-only test repos where no remote
@@ -7503,7 +7505,7 @@ def commit_and_push(
     # no history in common with it. The PR-creation API then rejects with
     # HTTP 422. Fail fast with a clear error instead.
     #
-    # REMYX-219 refinement mode: when INPUT_START_FROM_REF is set the
+    # Refinement mode: when INPUT_START_FROM_REF is set the
     # session started from a non-default ref, so its expected upstream is
     # origin/<start-from-ref>, not origin/<base_branch>. The eventual PR
     # still targets base_branch (main / master); only the commit ancestry
@@ -7555,6 +7557,7 @@ def commit_and_push(
     bundle_path = workdir / BUNDLE_DIR_NAME
     if bundle_path.exists():
         shutil.rmtree(bundle_path, ignore_errors=True)
+
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
     subprocess.run(["git", "commit", "-m", title], cwd=workdir, check=True)
 
@@ -8663,7 +8666,7 @@ def process_target(target: Target) -> dict:
         branch = format_branch_name(rec)
         # 4.5. Research phase (opt-in via INPUT_STAGED_SYNTHESIS). Runs a
         # bounded research-only Claude Code invocation before the coding
-        # session, producing web_findings.json at the workspace root.
+        # session, producing web_findings.json in the briefing bundle dir.
         # Coding session (and downstream refinement chain) read that
         # artifact as structured context alongside SPEC.md.
         #

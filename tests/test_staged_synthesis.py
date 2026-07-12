@@ -110,13 +110,13 @@ def test_invoke_research_phase_success_when_findings_written(tmp_path, monkeypat
 
     def fake_claude(cmd, prompt, workdir, timeout_s):
         # Simulate the research invocation writing the artifact
-        (workdir / "web_findings.json").write_text(json.dumps({"paper": {"title": "x"}}))
+        (workdir / ".remyx-recommendation" / "web_findings.json").write_text(json.dumps({"paper": {"title": "x"}}))
         return True, "research succeeded"
 
     with patch.object(run, "_run_claude_json", side_effect=fake_claude):
         ok, tail = run.invoke_research_phase(tmp_path, timeout_s=60)
     assert ok
-    assert (tmp_path / "web_findings.json").exists()
+    assert (tmp_path / ".remyx-recommendation" / "web_findings.json").exists()
 
 
 def test_invoke_research_phase_soft_fail_when_artifact_missing(tmp_path):
@@ -135,7 +135,7 @@ def test_invoke_research_phase_soft_fail_when_artifact_missing(tmp_path):
     with patch.object(run, "_run_claude_json", side_effect=fake_claude):
         ok, _ = run.invoke_research_phase(tmp_path, timeout_s=60)
     assert not ok  # Soft failure
-    assert not (tmp_path / "web_findings.json").exists()
+    assert not (tmp_path / ".remyx-recommendation" / "web_findings.json").exists()
 
 
 def test_invoke_research_phase_hard_fail(tmp_path):
@@ -166,7 +166,7 @@ def test_invoke_research_phase_uses_research_max_turns_env(tmp_path, monkeypatch
 
     def fake_claude(cmd, prompt, workdir, timeout_s):
         captured_cmd["cmd"] = list(cmd)
-        (workdir / "web_findings.json").write_text("{}")
+        (workdir / ".remyx-recommendation" / "web_findings.json").write_text("{}")
         return True, ""
 
     monkeypatch.setenv("REMYX_RESEARCH_MAX_TURNS", "12")
@@ -201,7 +201,8 @@ def test_invocation_md_includes_findings_ref_when_web_findings_present(tmp_path)
     """Staged flow: research phase produced web_findings.json → INVOCATION.md
     references it so the coding session reads it as another bundle context file."""
     wd = _make_workdir_with_bundle_prereqs(tmp_path)
-    (wd / "web_findings.json").write_text(json.dumps({"paper": {"title": "x"}}))
+    (wd / ".remyx-recommendation").mkdir(exist_ok=True)
+    (wd / ".remyx-recommendation" / "web_findings.json").write_text(json.dumps({"paper": {"title": "x"}}))
     run.write_spec_bundle(wd, _target(), _rec(), "src", env_body="")
     content = (wd / ".remyx-recommendation" / "INVOCATION.md").read_text()
     assert "web_findings.json" in content
