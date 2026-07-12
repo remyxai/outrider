@@ -7070,7 +7070,24 @@ def detect_default_branch(workdir: Path) -> str:
     Hardcoding `main` failed on `master`-default repos: the PR base 404'd
     and the commit_and_push sanity check saw `origin/main` MISSING and
     aborted. Detect it once and thread it through.
+
+    Prefers ``refs/remotes/origin/HEAD`` over the local ``HEAD`` so the
+    answer stays correct when INPUT_START_FROM_REF (REMYX-219) has
+    swapped the working checkout to a non-default ref. The remote's
+    HEAD is set at clone time and doesn't move on local checkouts.
+    Falls back to local HEAD for local-only test repos where no remote
+    is configured.
     """
+    r = subprocess.run(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    )
+    name = r.stdout.strip()
+    if name.startswith("origin/"):
+        return name[len("origin/"):]
+    if name:
+        return name
+    # No remote HEAD (e.g. local-only test repo) — fall back to local HEAD.
     r = subprocess.run(
         ["git", "symbolic-ref", "--short", "HEAD"],
         cwd=workdir, capture_output=True, text=True, check=False,

@@ -156,6 +156,44 @@ def test_prepare_workdir_checks_out_start_from_ref(fake_remote, tmp_path, monkey
     assert (workdir / "PRIOR_DRAFT.md").exists()
 
 
+def test_detect_default_branch_after_ref_checkout(fake_remote, tmp_path, monkeypatch):
+    """After a start-from-ref checkout, detect_default_branch still returns the
+    remote's default (main) — not the currently-checked-out ref. Otherwise
+    the PR base would open against the ref instead of main, and the diff
+    review wouldn't show the full baseline+refinement state (observed on
+    the OLMo-core live test, run 29198542589 → PR #12 with base=T3 ref)."""
+    bare, _main_sha, _refine_sha = fake_remote
+    monkeypatch.setenv("INPUT_START_FROM_REF", "refine-me")
+
+    class _FakeTarget:
+        repo = "owner/repo"
+
+    def fake_github_token():
+        return "gh_placeholder_token"
+
+    def fake_mkdtemp(prefix):
+        d = tmp_path / prefix
+        d.mkdir()
+        return str(d)
+
+    original_run = subprocess.run
+
+    def routed_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "clone"] and len(cmd) >= 4 and cmd[-2].startswith("https://"):
+            cmd = list(cmd)
+            cmd[-2] = str(bare)
+        return original_run(cmd, *args, **kwargs)
+
+    with patch.object(run, "_github_token", fake_github_token), \
+         patch.object(run.tempfile, "mkdtemp", fake_mkdtemp), \
+         patch.object(run.subprocess, "run", side_effect=routed_run):
+        workdir = run.prepare_workdir(_FakeTarget())
+
+    # Local HEAD is on refine-me (verified by another test), but the
+    # remote-tracking origin/HEAD still points at main.
+    assert run.detect_default_branch(workdir) == "main"
+
+
 def test_prepare_workdir_default_flow_stays_on_main(fake_remote, tmp_path, monkeypatch):
     """When start-from-ref is unset, HEAD stays on main — no regression on classic flow."""
     bare, main_sha, _refine_sha = fake_remote
