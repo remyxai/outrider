@@ -198,6 +198,93 @@ def test_large_additive_edit_to_existing_file_passes():
     assert ok, f"expected pass, got violations: {violations}"
 
 
+# ── Test-file exemption: pytest is the invoker for test_* functions ──────
+#
+# Coverage-only refinement PRs (e.g. adding edge-case tests exercising an
+# existing baseline branch) hit the invocation gate as false positives —
+# the newly-added test_* callables are wired into pytest, not into any
+# other diff file. `_is_test_file` + the `startswith("test_")` filter in
+# check_integration are what makes those diffs pass without loosening the
+# gate for production code.
+
+
+def test_coverage_only_diff_passes_without_wiring():
+    """A pure test-file diff (new test_* functions) exercises existing
+    baseline code through pytest, not through another diff file. Must
+    pass the invocation gate without further wiring."""
+    wd = _base_repo()
+    (wd / "tests" / "test_edge_cases.py").write_text(
+        "from vqasynth.benchmarks import BenchmarkRunner\n"
+        "def test_edge_a():\n    BenchmarkRunner().score(0)\n"
+        "def test_edge_b():\n    BenchmarkRunner().score(-1)\n"
+    )
+    ok, violations = run.check_integration(wd, TGT, "vqasynth")
+    assert ok, f"coverage-only diff should pass; got: {violations}"
+
+
+def test_public_non_test_helper_in_test_file_still_requires_wiring():
+    """The exemption only strips ``test_*`` names. A public non-test helper
+    in a test file that isn't called by any diff file still trips the gate.
+    Underscore-prefixed helpers are pre-filtered by ``_public_callables``
+    (private convention) and never reach the invocation check regardless."""
+    wd = _base_repo()
+    (wd / "tests" / "test_uncalled_helper.py").write_text(
+        "def helper_never_called(x):\n    return x + 1\n"  # public name — must be wired
+    )
+    ok, violations = run.check_integration(wd, TGT, "vqasynth")
+    assert not ok
+    assert any("nothing calls" in v for v in violations)
+
+
+def test_test_file_with_private_helper_and_test_functions_passes():
+    """A test file that adds a private helper (``_make_input``) alongside
+    ``test_*`` functions passes the invocation check cleanly:
+    - ``_make_input`` is underscore-prefixed → filtered by _public_callables
+    - ``test_uses_helper`` is exempt (pytest invokes it)
+    - added_by_file ends up empty → gate not tripped
+    Documents that the common "test file with tests + helpers" shape works."""
+    wd = _base_repo()
+    (wd / "tests" / "test_with_helper.py").write_text(
+        "def _make_input(v):\n    return v * 2\n"
+        "def test_uses_helper():\n"
+        "    from vqasynth.benchmarks import BenchmarkRunner\n"
+        "    assert BenchmarkRunner().score(_make_input(1)) == 2\n"
+    )
+    ok, violations = run.check_integration(wd, TGT, "vqasynth")
+    assert ok, f"expected pass, got: {violations}"
+
+
+def test_is_test_file_recognizes_common_patterns():
+    """Direct unit test of the helper — ensures the recognition covers
+    the pytest-convention shapes without being overly loose."""
+    assert run._is_test_file("tests/test_foo.py")
+    assert run._is_test_file("tests/nested/test_bar.py")
+    assert run._is_test_file("test/test_top.py")  # singular directory
+    assert run._is_test_file("src/pkg/tests/test_inner.py")  # tests/ anywhere
+    assert run._is_test_file("test_top_level.py")  # basename pattern
+    # Non-test paths
+    assert not run._is_test_file("src/pkg/module.py")
+    assert not run._is_test_file("src/testing_utils/helpers.py")
+    assert not run._is_test_file("tests.py")  # basename doesn't start with test_
+
+
+def test_mixed_diff_production_still_requires_wiring():
+    """A refinement PR that adds both a new production callable AND a
+    test file must still wire the production callable somewhere the diff
+    can see it. The test-file exemption only covers test_* additions —
+    it doesn't let un-wired production code slip through."""
+    wd = _base_repo()
+    (wd / "vqasynth" / "newprod.py").write_text(
+        "def unused_production_fn(x):\n    return x\n"
+    )
+    (wd / "tests" / "test_unrelated.py").write_text(
+        "def test_baseline():\n    assert True\n"
+    )
+    ok, violations = run.check_integration(wd, TGT, "vqasynth")
+    assert not ok
+    assert any("nothing calls" in v for v in violations)
+
+
 def test_large_inplace_rewrite_of_existing_file_passes():
     """An in-place rewrite (deleted > 0) that's large is not gated — the
     integration check does not enforce a per-file line ceiling. As long

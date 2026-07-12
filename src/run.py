@@ -6691,6 +6691,25 @@ def _file_is_new(workdir: Path, path: str) -> bool:
     return not result.stdout.strip()
 
 
+def _is_test_file(path: str) -> bool:
+    """True iff `path` looks like a pytest-collected test file.
+
+    Recognizes the two conventions pytest itself uses for auto-discovery:
+    files under a ``tests/`` or ``test/`` directory anywhere in the tree,
+    and files whose basename starts with ``test_``. Both cover the common
+    layouts; nothing else (fixtures, conftest, helper modules) counts.
+
+    Used by the integration-check invocation gate to exempt ``test_*``
+    functions from the "must be invoked from another changed file"
+    requirement — pytest is the invoker, and it lives outside the diff.
+    """
+    parts = path.split("/")
+    if any(seg in ("tests", "test") for seg in parts[:-1]):
+        return True
+    basename = parts[-1]
+    return basename.startswith("test_") and basename.endswith(".py")
+
+
 def _diff_line_changes(workdir: Path, path: str) -> tuple[int, int]:
     """Return (added, deleted) lines for `path` vs HEAD."""
     result = subprocess.run(
@@ -6821,12 +6840,26 @@ def check_integration(
 
     # Invocation check. Every newly-added callable, keyed by the file that
     # defines it, must be called from some OTHER changed file.
+    #
+    # Test-file exemption: ``test_*`` functions inside test files are invoked
+    # by pytest, not by other diff files, so requiring another changed file to
+    # call them is a false-positive gate. Coverage-only refinement PRs (all
+    # additions are new tests exercising baseline code) hit this gate today
+    # even though the tests DO wire into real call sites — just ones on the
+    # baseline branch, not in the current diff. Strip ``test_*`` names in
+    # test-shaped files from the added-callables accounting so those diffs
+    # pass the check without loosening the gate for production code.
     changed_py = [p for p in paths if p.endswith(".py")]
     added_by_file: dict[str, set[str]] = {}
     for p in changed_py:
         added = _added_callables(workdir, p)
-        if added:
-            added_by_file[p] = added
+        if not added:
+            continue
+        if _is_test_file(p):
+            added = {n for n in added if not n.startswith("test_")}
+            if not added:
+                continue
+        added_by_file[p] = added
 
     if added_by_file:
         calls_by_file: dict[str, set[str]] = {}
