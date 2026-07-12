@@ -9399,9 +9399,18 @@ def process_target(target: Target) -> dict:
                     result["status"] = "skipped_fidelity_fabrication"
                     result["error"] = f"patch commit failed: {stderr[-200:]}"
                     return result
+                # Thread the coding session's self_review through so the
+                # remediation-pass fidelity check evaluates against the same
+                # ``mode_cited`` / ``substitutions`` / ``scoped_out`` context
+                # the first-pass check used. Without this, the remediation
+                # pass silently downgrades to ``mode-1, subs=0, scoped_out=0``
+                # and re-flags every legitimate Mode-2 substitution as
+                # fabrication — hard-to-shift outcome for any Mode-2 refinement
+                # that triggers judgment on the first pass.
                 revised_verdict = _run_pre_pr_fidelity_check(
                     rec, target, workdir, pr_title, pr_body,
                     base_branch=default_branch,
+                    self_review=review,
                 )
                 result["prepub_fidelity_after_patch"] = {
                     "status": revised_verdict.get("status"),

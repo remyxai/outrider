@@ -419,3 +419,71 @@ def test_render_coverage_matrix_insight_anchor():
     md = run._render_coverage_matrix(matrix, audit_anchor="insight")
     assert "Mode 3" in md
     assert "insight" in md.lower()
+
+
+# --- Remediation-pass mode-context regression ------------------------------
+#
+# process_target runs _run_pre_pr_fidelity_check twice when the first pass
+# flags fabrication: once before the patch attempt (with self_review), and
+# once after the patch (was: without self_review, hence Mode-1 default).
+# The second call MUST pass the same self_review as the first so Mode-2
+# refinements' substitutions + scope-outs stay honored on the remediation
+# pass — otherwise the fidelity gate systematically over-flags legitimate
+# Mode-2 diffs on remediation and downgrades runs that should have shipped.
+
+
+def test_classify_mode_cited_defaults_to_none_on_missing_self_review():
+    """No self_review → no mode signal, downstream defaults to mode-1.
+    This is the bug's blast radius: without self_review, every downstream
+    Mode-2 substitution appears as "fabrication" instead of "defensible"."""
+    assert not run._classify_mode_cited(None)  # falsy — empty str / None
+    assert not run._classify_mode_cited({})
+
+
+def test_classify_mode_cited_reads_mode_2_from_self_review():
+    """With a Mode-2 self_review present, downstream evaluates as Mode 2
+    and honors substitutions + scoped_out annotations."""
+    self_review = {
+        "mode_cited": "Mode 2 (adapted port)",
+        "substitutions": ["paper's trainer-level → reward-level shaping"],
+        "scoped_out": ["trainer-level GRPO advantage computation"],
+    }
+    assert run._classify_mode_cited(self_review) == "mode-2"
+
+
+def test_process_target_source_passes_self_review_to_both_fidelity_calls():
+    """Both `_run_pre_pr_fidelity_check` calls inside `process_target` must
+    receive `self_review=review` — otherwise the remediation pass defaults
+    to Mode 1 and over-flags Mode-2 substitutions.
+
+    Source-code regression check: guards against dropping the kwarg on the
+    second call site during future refactors. Cheaper than mocking the
+    1000+-line process_target flow end-to-end while still catching the
+    exact regression class this test file names.
+    """
+    src_path = Path(__file__).resolve().parent.parent / "src" / "run.py"
+    text = src_path.read_text()
+    # Find every _run_pre_pr_fidelity_check invocation site (both call sites
+    # in process_target) — each must have `self_review=` in its argument list.
+    # We look at the call-site window (up to the closing paren) rather than
+    # the whole function to keep the check narrow.
+    import re
+    call_windows = re.findall(
+        r"_run_pre_pr_fidelity_check\s*\((?:[^()]|\([^()]*\))*?\)",
+        text,
+    )
+    # Filter to invocation sites (not the def itself). The def has arg names
+    # like `rec: "Recommendation"` — invocations have kwargs or bare rec.
+    invocations = [
+        w for w in call_windows if not w.startswith("_run_pre_pr_fidelity_check(\n    rec: ")
+    ]
+    assert len(invocations) >= 2, (
+        f"expected ≥ 2 invocation sites in process_target; got {len(invocations)}"
+    )
+    for i, window in enumerate(invocations):
+        assert "self_review=" in window, (
+            f"invocation {i} at {window[:80]!r} is missing self_review= — "
+            "the remediation-pass fidelity check must inherit the coding session's "
+            "mode context from the first-pass check. Bug: without self_review, "
+            "the check defaults to Mode 1 with no substitutions honored."
+        )
