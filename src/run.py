@@ -5690,7 +5690,21 @@ def write_research_invocation(
     # (paper not indexed / no sibling impls found) render as "(none)" rather
     # than being omitted, so downstream reviewers of the prompt can tell the
     # difference between "not looked up" and "looked up, no signal."
-    hf_linkage_block = _render_hf_linkage_block(rec.arxiv_id)
+    hf_linkage = _fetch_hf_paper_linkage(rec.arxiv_id)
+    sibling_hits = _fetch_sibling_implementations(
+        rec.arxiv_id, rec.paper_title, target.repo,
+    )
+    hf_signal = (
+        f"{len(hf_linkage.get('linked_models', []))} models, "
+        f"{len(hf_linkage.get('linked_datasets', []))} datasets"
+        if hf_linkage else "not indexed"
+    )
+    log.info(
+        f"  → research-phase enrichment pre-fetched: "
+        f"HF Hub linkage ({hf_signal}); "
+        f"sibling implementations (hits={len(sibling_hits)})"
+    )
+    hf_linkage_block = _render_hf_linkage_block(rec.arxiv_id)  # cached, reuses fetch
     sibling_impls_block = _render_sibling_impls_block(
         rec.arxiv_id, rec.paper_title, target.repo,
     )
