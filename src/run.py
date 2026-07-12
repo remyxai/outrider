@@ -393,6 +393,12 @@ Paper: **{paper_title}** (arxiv:{arxiv_id})
 Target repo: **{target_repo}**
 Prior-attempt context: {prior_attempt_hint}
 
+# Pre-fetched signals (deterministic; save your tool budget for judgment work)
+
+{hf_linkage_block}
+
+{sibling_impls_block}
+
 # What the coding session needs
 
 Write ``.remyx-recommendation/web_findings.json`` (the briefing bundle dir, NOT workspace root) with at least these fields:
@@ -2549,6 +2555,95 @@ def _fetch_hf_paper_linkage(arxiv_id: str, timeout_s: int = 5) -> dict | None:
     }
     _HF_PAPER_CACHE[key] = parsed
     return parsed
+
+
+# Well-known ML-library orgs whose repos are strong sibling-implementation signals.
+# Curated conservatively — presence in the top-10 search hit is a stronger "this
+# paper is worth engaging with" signal when the repo owner is one of these.
+_SIBLING_LIB_ORGS = frozenset({
+    "huggingface", "EleutherAI", "allenai", "microsoft", "google-research",
+    "google", "openai", "meta-research", "facebookresearch", "deepmind",
+    "pytorch", "tensorflow", "nvidia", "pytorch-labs", "ray-project",
+    "unslothai", "axolotl-ai-cloud", "outlines-dev", "guidance-ai",
+    "lightning-ai", "vllm-project", "sglang-project", "linkedin",
+    "salesforce", "IBM", "MIT-IBM-Watson-AI-Lab", "cornell-tech",
+})
+
+_SIBLING_IMPL_CACHE: dict[str, list[dict] | None] = {}
+
+
+def _fetch_sibling_implementations(
+    arxiv_id: str, paper_title: str, target_repo: str = "",
+    timeout_s: int = 5,
+) -> list[dict]:
+    """Search GitHub for adjacent-library implementations of this paper.
+
+    Uses GitHub's repository search API with the paper title + arxiv id;
+    filters to top hits whose owner is a well-known ML-library org
+    (:data:`_SIBLING_LIB_ORGS`). Excludes the target repo itself so a
+    matching PR body on the target doesn't self-reference.
+
+    Returns a list of ``{"full_name": str, "stars": int, "description":
+    str, "why_relevant": str}`` dicts, top ~5 sorted by stars. Empty list
+    when no signal or on any network failure — callers should treat
+    empty as "no adjacent implementations found," not as an error.
+
+    Cached per (arxiv_id, target_repo) within a run.
+    """
+    if not arxiv_id or not paper_title:
+        return []
+    cache_key = f"{arxiv_id}|{target_repo}"
+    if cache_key in _SIBLING_IMPL_CACHE:
+        return _SIBLING_IMPL_CACHE[cache_key] or []
+
+    # Strip version suffix from arxiv id — canonical index is versionless
+    arxiv_bare = arxiv_id.strip().lower().replace("v", " ").split()[0]
+    # Search on the paper title + arxiv id — either match is a signal.
+    query = f'{paper_title} arxiv:{arxiv_bare}'
+    url = (
+        "https://api.github.com/search/repositories"
+        f"?q={urllib.parse.quote(query)}&sort=stars&order=desc&per_page=20"
+    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "outrider-sibling-impl-search",
+    }
+    token = os.environ.get("INPUT_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        log.debug(f"  sibling-impl search for {arxiv_bare!r} failed: {e}")
+        _SIBLING_IMPL_CACHE[cache_key] = None
+        return []
+
+    items = data.get("items", []) if isinstance(data, dict) else []
+    hits: list[dict] = []
+    for item in items:
+        full_name = item.get("full_name", "")
+        if full_name == target_repo:
+            continue  # exclude the target itself
+        owner = full_name.split("/", 1)[0] if "/" in full_name else ""
+        if owner not in _SIBLING_LIB_ORGS:
+            continue
+        stars = item.get("stargazers_count", 0)
+        desc = (item.get("description") or "").strip()[:200]
+        hits.append({
+            "full_name": full_name,
+            "stars": stars,
+            "description": desc,
+            "why_relevant": f"{owner} is a well-known ML-library org; "
+                            f"repo matched paper title + arxiv id search",
+        })
+        if len(hits) >= 5:
+            break
+
+    _SIBLING_IMPL_CACHE[cache_key] = hits
+    return hits
 
 
 _SIBLING_CLAIM_RE = re.compile(
@@ -5581,14 +5676,114 @@ def write_research_invocation(
     else:
         prior_attempt_hint = "no prior-attempt branch is pinned; probe git history for any earlier attempts."
 
+    # Pre-fetched signals interpolated into the research prompt:
+    #  1. HF Hub paper index — canonical "does this paper have public
+    #     checkpoints / datasets / spaces" data via `_fetch_hf_paper_linkage`
+    #     (same source the Issue-downgrade path already uses).
+    #  2. Sibling implementations — GitHub repo search filtered to well-known
+    #     ML-library orgs. Presence of an adjacent-library implementation is
+    #     the strongest "this paper is worth engaging with" signal available
+    #     to the research phase.
+    #
+    # Both are pre-fetched deterministically in Python — Claude sees them as
+    # static context, doesn't spend a tool call to look them up. Empty blocks
+    # (paper not indexed / no sibling impls found) render as "(none)" rather
+    # than being omitted, so downstream reviewers of the prompt can tell the
+    # difference between "not looked up" and "looked up, no signal."
+    hf_linkage_block = _render_hf_linkage_block(rec.arxiv_id)
+    sibling_impls_block = _render_sibling_impls_block(
+        rec.arxiv_id, rec.paper_title, target.repo,
+    )
+
     (bundle / "RESEARCH_INVOCATION.md").write_text(
         _RESEARCH_INVOCATION_MD_TEMPLATE.format(
             paper_title=rec.paper_title or "(unknown title)",
             arxiv_id=rec.arxiv_id or "(unknown)",
             target_repo=target.repo,
             prior_attempt_hint=prior_attempt_hint,
+            hf_linkage_block=hf_linkage_block,
+            sibling_impls_block=sibling_impls_block,
         )
     )
+
+
+def _render_hf_linkage_block(arxiv_id: str) -> str:
+    """Render the HF-Hub-linkage context block for the research prompt.
+
+    Uses the existing ``_fetch_hf_paper_linkage`` helper. Returns a
+    single markdown section — always emits, even when no signal, so the
+    prompt structure is stable.
+    """
+    linkage = _fetch_hf_paper_linkage(arxiv_id)
+    if linkage is None:
+        return (
+            "**HF Hub linkage** — paper not indexed on huggingface.co/papers "
+            "(no signal about public checkpoints via this channel; if a "
+            "reference implementation exists, it must be reached via arxiv "
+            "citation or GitHub search)."
+        )
+    lines = [
+        "**HF Hub linkage** — paper indexed on "
+        f"huggingface.co/papers/{arxiv_id.strip().lower().replace('v', ' ').split()[0]}:",
+    ]
+    if linkage["linked_models"]:
+        top = linkage["linked_models"][:3]
+        lines.append(f"- **Linked models** ({len(linkage['linked_models'])} total):")
+        for m in top:
+            mid = m.get("id") or m.get("modelId") or "(unknown)"
+            lines.append(f"  - `{mid}`")
+    else:
+        lines.append("- Linked models: (none)")
+    if linkage["linked_datasets"]:
+        top = linkage["linked_datasets"][:2]
+        lines.append(f"- **Linked datasets** ({len(linkage['linked_datasets'])} total):")
+        for d in top:
+            did = d.get("id") or "(unknown)"
+            lines.append(f"  - `{did}`")
+    if linkage["linked_spaces"]:
+        lines.append(f"- Linked spaces: {len(linkage['linked_spaces'])} (see huggingface.co/papers page)")
+    lines.append(
+        "  \nIf a linked model exists, its model card + config typically "
+        "carry the canonical call-site pattern — cheaper to read than the "
+        "paper's PDF for implementation-mappable detail."
+    )
+    return "\n".join(lines)
+
+
+def _render_sibling_impls_block(
+    arxiv_id: str, paper_title: str, target_repo: str,
+) -> str:
+    """Render the sibling-implementation context block for the research prompt.
+
+    Uses ``_fetch_sibling_implementations``. Returns a single markdown
+    section; always emits, empty-signal renders as "(none found)".
+    """
+    hits = _fetch_sibling_implementations(arxiv_id, paper_title, target_repo)
+    if not hits:
+        return (
+            "**Sibling implementations in adjacent ML-library orgs** — "
+            "none found via GitHub repo search filtered to well-known ML-library "
+            "owners (huggingface, EleutherAI, allenai, microsoft, etc.). "
+            "Either this paper hasn't been adopted cross-library yet, or the "
+            "search terms didn't surface the implementation — consider a "
+            "search-method-shaped probe from the research phase if the paper "
+            "is well-known."
+        )
+    lines = [
+        "**Sibling implementations in adjacent ML-library orgs**:",
+    ]
+    for h in hits:
+        lines.append(
+            f"- **{h['full_name']}** ({h['stars']}★) — {h['description'] or '(no description)'}"
+        )
+    lines.append(
+        "  \nThese are strong coordination signals — if the same paper is "
+        "already implemented in an adjacent library, the target repo's PR "
+        "should acknowledge that (either build on the pattern or explicitly "
+        "cite the difference). Check the linked repos' README / relevant "
+        "modules before scoping."
+    )
+    return "\n".join(lines)
 
 
 def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, str]:
