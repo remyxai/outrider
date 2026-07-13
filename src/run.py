@@ -5048,6 +5048,399 @@ def _load_fork_repo_intel(workdir: Path) -> dict | None:
     return parsed
 
 
+def _repo_intel_iso_now() -> str:
+    """Timezone-aware UTC ISO-8601 timestamp for repo_intel entries.
+
+    Kept as a helper so tests can monkey-patch it deterministically.
+    """
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dominant_directory(paths: list[str]) -> str:
+    """Common directory prefix across a list of changed paths.
+
+    Filters out ``test/`` and ``tests/`` prefixes before scanning (the test
+    file is a byproduct, not the landing zone). Returns the DIR most
+    frequently touched, with a trailing slash. Empty string when no
+    non-test paths carry a directory.
+    """
+    if not paths:
+        return ""
+    src_paths = [
+        p for p in paths
+        if not p.startswith(("test/", "tests/"))
+    ]
+    scan = src_paths if src_paths else paths
+    dirs: list[str] = []
+    for p in scan:
+        if "/" not in p:
+            continue
+        # Trim to directory (strip filename)
+        d = p.rsplit("/", 1)[0] + "/"
+        dirs.append(d)
+    if not dirs:
+        return ""
+    from collections import Counter
+    return Counter(dirs).most_common(1)[0][0]
+
+
+_LANDING_SHAPE_PATTERNS: list[tuple[str, str]] = [
+    # Matching cue → shape_tag; scanned against a lowercased composite of
+    # honest_summary + call_site + reframed_insight
+    ("library-shape", "library-shape-public-api"),
+    ("public api", "library-shape-public-api"),
+    ("__all__", "library-shape-public-api"),
+    ("decorator", "decorator-hook"),
+    ("@tool", "decorator-hook"),
+    ("middleware", "middleware"),
+    ("callback", "callback"),
+    ("register_", "registry-add"),
+    ("registry", "registry-add"),
+]
+
+
+def _extract_shape_tags_from_review(self_review: dict) -> list[str]:
+    """Heuristic shape-tag inference from self_review content.
+
+    Scans honest_summary + call_site + reframed_insight for known cues
+    and returns matching shape tags. Empty list falls back to
+    ``["unclassified"]`` so the entry is still merge-able but reviewers
+    know to categorize by hand.
+    """
+    if not self_review:
+        return ["unclassified"]
+    corpus = " ".join([
+        (self_review.get("honest_summary") or ""),
+        (self_review.get("call_site") or ""),
+        (self_review.get("reframed_insight") or ""),
+    ]).lower()
+    tags: list[str] = []
+    for cue, tag in _LANDING_SHAPE_PATTERNS:
+        if cue in corpus and tag not in tags:
+            tags.append(tag)
+    return tags or ["unclassified"]
+
+
+_REJECTION_SHAPE_PATTERNS: list[tuple[str, str, str]] = [
+    # (cue_substring, shape_tag, reason_code) — scanned against lowercased
+    # preflight reasoning. First match wins; falls back to (None, None) so
+    # the observation lands untagged for human categorization.
+    ("survey", "survey-or-analysis-paper", "not_a_method_paper"),
+    ("classification framework", "survey-or-analysis-paper", "not_a_method_paper"),
+    ("not a method paper", "survey-or-analysis-paper", "not_a_method_paper"),
+    ("http-serving", "http-serving-framework", "domain_mismatch"),
+    ("http serving", "http-serving-framework", "domain_mismatch"),
+    ("reranking", "reranker-decision-layer", "no_public_middleware_surface"),
+    ("reranker", "reranker-decision-layer", "no_public_middleware_surface"),
+    ("benchmark harness", "benchmark-paper", "benchmark_shape"),
+    ("training infrastructure", "training-infra", "not_runtime_shape"),
+    ("distributed training", "training-infra", "not_runtime_shape"),
+]
+
+
+def _classify_rejection_shape(preflight_rationale: str) -> tuple[str | None, str | None]:
+    """Heuristic-classify a preflight rejection rationale into a
+    ``(shape_tag, reason_code)`` pair. Returns ``(None, None)`` when no
+    pattern matches — the observation still gets recorded, just untagged
+    for human review.
+    """
+    text = (preflight_rationale or "").lower()
+    for cue, tag, code in _REJECTION_SHAPE_PATTERNS:
+        if cue in text:
+            return tag, code
+    return None, None
+
+
+def _merge_landing_zone(intel: dict, path: str, shape_tags: list[str], entry: dict) -> bool:
+    """Idempotent merge of a confirmed landing-zone entry.
+
+    - If a zone with the same ``path`` exists: merge shape_tags (union),
+      update-or-append ``confirmed_by`` by arxiv, bump ``last_observed``.
+    - Otherwise: append a new zone.
+
+    Returns True if the intel dict was mutated.
+    """
+    if not path:
+        return False
+    zones = intel.setdefault("observed_landing_zones", [])
+    now = _repo_intel_iso_now()
+    entry = dict(entry)  # copy so caller's dict isn't mutated
+    entry.setdefault("timestamp", now)
+    arxiv = entry.get("arxiv")
+
+    for z in zones:
+        if z.get("path") == path:
+            existing_tags = set(z.get("shape_tags") or [])
+            merged = existing_tags | set(shape_tags)
+            merged.discard("unclassified") if len(merged) > 1 else None
+            z["shape_tags"] = sorted(merged)
+            confirmed = z.setdefault("confirmed_by", [])
+            for cb in confirmed:
+                if cb.get("arxiv") == arxiv:
+                    cb.update(entry)
+                    z["last_observed"] = now
+                    return True
+            confirmed.append(entry)
+            z["last_observed"] = now
+            return True
+
+    zones.append({
+        "path": path,
+        "shape_tags": sorted(set(shape_tags)),
+        "confirmed_by": [entry],
+        "last_observed": now,
+    })
+    return True
+
+
+def _merge_rejected_shape(
+    intel: dict,
+    shape_tag: str | None,
+    reason_code: str | None,
+    reason_summary: str,
+    arxiv: str,
+) -> bool:
+    """Idempotent merge of a rejected-shape observation.
+
+    Matches by ``shape_tag`` when present; otherwise groups by the first
+    80 chars of ``reason_summary`` (rough clustering for untagged
+    observations). Same-arxiv duplicates update the timestamp only.
+
+    Returns True if the intel dict was mutated.
+    """
+    if not arxiv:
+        return False
+    rejected = intel.setdefault("rejected_shapes", [])
+    now = _repo_intel_iso_now()
+    match_key = shape_tag or f"untagged:{(reason_summary or '')[:80].strip().lower()}"
+
+    for r in rejected:
+        r_key = r.get("shape_tag") or (
+            f"untagged:{(r.get('reason_summary') or '')[:80].strip().lower()}"
+        )
+        if r_key == match_key:
+            observed = r.setdefault("observed", [])
+            for o in observed:
+                if o.get("arxiv") == arxiv:
+                    o["timestamp"] = now
+                    return True
+            observed.append({"arxiv": arxiv, "timestamp": now})
+            return True
+
+    rejected.append({
+        "shape_tag": shape_tag,
+        "reason_code": reason_code,
+        "reason_summary": (reason_summary or "")[:400],
+        "observed": [{"arxiv": arxiv, "timestamp": now}],
+    })
+    return True
+
+
+def _fetch_branch_files_changed(target: "Target", branch: str) -> list[str]:
+    """List filenames touched by the branch tip's most-recent commit.
+
+    Uses the fork's HEAD commit metadata via the GitHub API — this is
+    the branch that Outrider just pushed, so the tip is our own bot
+    commit. Returns [] on any failure (never blocks the write path).
+    """
+    if not branch:
+        return []
+    token = _github_token()
+    if not token:
+        return []
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{target.repo}/commits/{branch}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "outrider-repo-intel",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return []
+    files = data.get("files") or []
+    return [f.get("filename", "") for f in files if f.get("filename")]
+
+
+def _put_fork_repo_intel(target: "Target", intel: dict) -> bool:
+    """Write the updated intel dict to ``.remyx/repo_intel.yaml`` on the
+    fork's main branch via the GitHub Contents API.
+
+    Retries once on 409 (concurrent modification) by re-fetching the
+    current SHA + re-attempting. Never raises; returns False on any
+    failure. The next dispatch's write catches the missed observation
+    (idempotent merge).
+    """
+    try:
+        import yaml
+    except ImportError:
+        log.warning("  ⚠ repo_intel write skipped: PyYAML unavailable")
+        return False
+
+    token = _github_token()
+    if not token:
+        log.warning("  ⚠ repo_intel write skipped: no GitHub token")
+        return False
+
+    body_yaml = yaml.safe_dump(intel, sort_keys=False, default_flow_style=False)
+    content_b64 = base64.b64encode(body_yaml.encode("utf-8")).decode("ascii")
+    url = f"https://api.github.com/repos/{target.repo}/contents/.remyx/repo_intel.yaml"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "outrider-repo-intel",
+    }
+
+    for attempt in range(3):
+        # Fetch current SHA (or accept "file does not exist" 404 to seed fresh)
+        sha: str | None = None
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                current = json.loads(resp.read())
+                sha = current.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                log.warning(f"  ⚠ repo_intel write: GET failed {e.code}; skipping")
+                return False
+        except (urllib.error.URLError, OSError):
+            log.warning("  ⚠ repo_intel write: GET network error; skipping")
+            return False
+
+        payload = {
+            "message": "chore(repo-intel): update from Outrider dispatch",
+            "content": content_b64,
+            "branch": "main",
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={**headers, "Content-Type": "application/json"},
+            method="PUT",
+        )
+        try:
+            urllib.request.urlopen(put_req, timeout=20)
+            log.info(
+                "  ✓ repo_intel: wrote %d bytes to %s main",
+                len(body_yaml), target.repo,
+            )
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 409 and attempt < 2:
+                log.info(
+                    "  → repo_intel write conflict on attempt %d; refetching + retrying",
+                    attempt + 1,
+                )
+                continue
+            log.warning(f"  ⚠ repo_intel write failed with {e.code}")
+            return False
+        except (urllib.error.URLError, OSError):
+            log.warning("  ⚠ repo_intel write network error")
+            return False
+    return False
+
+
+def _update_fork_repo_intel(
+    target: "Target", result: dict, workdir: Path,
+) -> None:
+    """Post-terminal-state hook: extract observations from ``result``,
+    merge into repo_intel, PUT back to the fork's main branch.
+
+    Fires only when ``INPUT_MAINTAIN_STATE`` is truthy. Silent no-op
+    otherwise. Never fails a run — any error is logged and swallowed
+    so the terminal state that already succeeded isn't disturbed.
+
+    Observations extracted:
+
+    - ``branch_pushed_no_pr`` / ``pr_opened_draft`` / ``pr_opened`` →
+      confirmed landing zone (path from files-changed; shape_tags from
+      self_review heuristics; confirmed_by entry with arxiv, mode,
+      branch/pr, call_site_specifics).
+    - ``lead_captured_no_issue`` / ``issue_opened_preflight`` →
+      rejected shape (shape_tag + reason_code from preflight rationale
+      pattern-match, else untagged; reason_summary carries the raw
+      rationale for human categorization).
+    """
+    if not (os.environ.get("INPUT_MAINTAIN_STATE") or "").strip().lower() in (
+        "true", "1", "yes",
+    ):
+        return
+
+    arxiv = result.get("arxiv") or ""
+    status = result.get("status") or ""
+    if not arxiv or not status:
+        return
+
+    intel = _load_fork_repo_intel(workdir) or {
+        "schema_version": 1,
+        "fork": target.repo,
+        "observed_landing_zones": [],
+        "rejected_shapes": [],
+        "coordination_signals": [],
+    }
+    mutated = False
+
+    if status in ("branch_pushed_no_pr", "pr_opened_draft", "pr_opened"):
+        self_review = result.get("self_review") or {}
+        mode = self_review.get("mode_cited", "")
+        branch = result.get("branch") or ""
+        pr_number = result.get("pr_number")
+        call_site_specifics = (self_review.get("call_site") or "")[:200]
+
+        files = _fetch_branch_files_changed(target, branch) if branch else []
+        path = _dominant_directory(files)
+        if not path:
+            # Fallback: parse a slash-form path out of call_site text
+            m = re.search(r"([\w./-]+/)[\w.-]+\.py", call_site_specifics)
+            if m:
+                path = m.group(1)
+
+        if path:
+            entry: dict = {"arxiv": arxiv, "mode": mode,
+                           "call_site_specifics": call_site_specifics}
+            if branch:
+                entry["branch"] = branch
+            if pr_number:
+                entry["pr"] = pr_number
+            shape_tags = _extract_shape_tags_from_review(self_review)
+            if _merge_landing_zone(intel, path, shape_tags, entry):
+                mutated = True
+                log.info(
+                    "  → repo_intel: landing zone recorded (path=%s, tags=%s, arxiv=%s)",
+                    path, shape_tags, arxiv,
+                )
+
+    elif status in ("lead_captured_no_issue", "issue_opened_preflight"):
+        # Preflight rationale often lives under different keys depending
+        # on which path routed here — check the common ones.
+        rationale = (
+            result.get("preflight_reasoning")
+            or result.get("preflight_rationale")
+            or (result.get("preflight") or {}).get("reasoning")
+            or (result.get("preflight") or {}).get("rationale")
+            or ""
+        )
+        shape_tag, reason_code = _classify_rejection_shape(rationale)
+        if _merge_rejected_shape(intel, shape_tag, reason_code, rationale, arxiv):
+            mutated = True
+            log.info(
+                "  → repo_intel: rejection recorded (shape=%s, arxiv=%s)",
+                shape_tag or "(untagged)", arxiv,
+            )
+
+    if not mutated:
+        return
+
+    intel["last_updated"] = _repo_intel_iso_now()
+    _put_fork_repo_intel(target, intel)
+
+
 def _render_repo_intel_for_selection(intel: dict | None) -> str:
     """Compact prompt-inline rendering of repo_intel for the selection pass.
 
@@ -9914,6 +10307,16 @@ def process_target(target: Target) -> dict:
         return result
 
     finally:
+        # Repo-intel write path — fires on every process_target exit
+        # (success or exception) so terminal states landed in `result`
+        # get merged into the fork's .remyx/repo_intel.yaml when
+        # INPUT_MAINTAIN_STATE is on. No-op otherwise. Never fails the
+        # run — errors logged and swallowed inside the helper.
+        try:
+            _update_fork_repo_intel(target, result, workdir)
+        except Exception:  # noqa: BLE001 — telemetry write never blocks the run
+            log.exception("  ⚠ repo_intel write hook raised; swallowed")
+
         # Clean up tmpdir unless DEBUG_KEEP_WORKDIR set
         if not os.environ.get("DEBUG_KEEP_WORKDIR"):
             shutil.rmtree(workdir, ignore_errors=True)
