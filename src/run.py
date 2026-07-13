@@ -7471,8 +7471,29 @@ def select_recommendation(
     ok, output, events = _run_claude_oneshot_streaming(
         workdir, prompt, timeout_s, max_turns=max_turns,
     )
+    # Retry-on-empty-output: observed in the wild that the Claude CLI
+    # occasionally returns ok=False with a truly empty output — a
+    # transient failure mode distinct from timeouts / CLI-gone /
+    # rate-limit-hit (which return ok=False with meaningful error
+    # text). Immediate re-invocation typically recovers. Retry only
+    # when the failure signal itself is empty; leave signaled failures
+    # (timeout messages, stderr echoes) to fall through as before —
+    # those are infra problems that don't benefit from a retry.
+    if not ok and not (output or "").strip():
+        log.warning(
+            "  selection call returned empty output (ok=False, no error "
+            "text); retrying once with reduced max-turns before falling "
+            "back to top-ranked candidate"
+        )
+        retry_ok, retry_output, retry_events = _run_claude_oneshot_streaming(
+            workdir, prompt, min(timeout_s, 600),
+            max_turns=max(10, max_turns // 2),
+        )
+        if retry_ok or (retry_output or "").strip():
+            ok, output, events = retry_ok, retry_output, retry_events
+            log.info("  selection: empty-output retry recovered")
     if not ok:
-        log.warning(f"  selection call failed: {output[:200]}; "
+        log.warning(f"  selection call failed: {output[:200] or '(empty)'}; "
                     f"falling back to top-ranked candidate")
         return None
     data = _extract_json_object(output)
@@ -9901,6 +9922,39 @@ def process_target(target: Target) -> dict:
                     "  ⚠ selection reasoning cites %d path(s) — 0 verified in workdir; possible confabulation",
                     len(path_check["cited"]),
                 )
+
+        # Duplicate-work enforcement — process_target-level guard that
+        # catches both agentic-selection picks AND fallback picks (when
+        # the selection Claude call fails and _fallback_candidate runs).
+        # A legitimate re-pick reaches here with result["selection_is_re_pick"]
+        # already set + a justification — those pass through. Everything
+        # else that picks a prior-dispatched arxiv gets coerced to
+        # skipped_arxiv_already_landed, preventing the fallback path from
+        # bypassing the intel-aware re-pick machinery.
+        _maintain_state = (
+            (os.environ.get("INPUT_MAINTAIN_STATE") or "").strip().lower()
+            in ("true", "1", "yes")
+        )
+        if _maintain_state and not result.get("selection_is_re_pick"):
+            _intel = _load_fork_repo_intel(workdir)
+            if _intel is not None:
+                _picked = _arxiv_versionless(rec.arxiv_id or "")
+                _dispatched = {
+                    _arxiv_versionless(d["arxiv"])
+                    for d in _extract_dispatched_arxivs(_intel)
+                    if d.get("arxiv")
+                }
+                if _picked and _picked in _dispatched:
+                    log.warning(
+                        "  ⚠ duplicate-work guard: picked arxiv %s already "
+                        "has a landing in .remyx/repo_intel.yaml on this fork "
+                        "(fallback path bypassed re-pick enforcement); "
+                        "skipping this dispatch",
+                        _picked,
+                    )
+                    result["status"] = "skipped_arxiv_already_landed"
+                    result["skipped_arxiv"] = _picked
+                    return result
 
         # 5. Spec bundle for the chosen candidate. Thread the selection
         # rationale through so pre-flight and the implementer evaluate the

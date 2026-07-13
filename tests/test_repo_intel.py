@@ -1267,6 +1267,70 @@ def test_remote_branch_exists_returns_false_without_token():
         assert run._remote_branch_exists(target, "some-branch") is False
 
 
+# --- process_target-level duplicate-work guard ---------------------------------
+#
+# Catches the fallback-path bypass: when select_recommendation fails
+# (Claude CLI error) and _fallback_candidate returns the top-ranked
+# candidate without going through the intel-aware selection prompt, this
+# guard checks the pick against repo_intel and skips duplicate-work
+# picks that the selection layer's re-pick enforcement never got to see.
+
+
+def test_select_recommendation_retries_on_empty_output(tmp_path, monkeypatch):
+    """When the Claude streaming call returns ok=False with empty output,
+    retry once before falling back. Recovers from transient CLI hiccups."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    call_count = {"n": 0}
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return False, "", []  # first attempt: empty failure
+        # Second attempt: recovers with valid JSON
+        return True, '{"chosen_index": 0, "reasoning": "picked on retry"}', []
+
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(c)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        result = run.select_recommendation(workdir, "pkg", candidates, target=target)
+    assert call_count["n"] == 2, "should have retried once on empty output"
+    assert result is not None
+    assert result["chosen_index"] == 0
+
+
+def test_select_recommendation_gives_up_after_retry(tmp_path, monkeypatch):
+    """Both attempts return empty → fall back to None (top-ranked fallback)."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    call_count = {"n": 0}
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        call_count["n"] += 1
+        return False, "", []
+
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(c)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        result = run.select_recommendation(workdir, "pkg", candidates, target=target)
+    assert call_count["n"] == 2  # tried once, retried once
+    assert result is None  # falls back
+
+
 def test_update_fork_repo_intel_swallows_exceptions(tmp_path, monkeypatch):
     """Any exception in the write path must not propagate — the terminal
     state that already succeeded shouldn't be disturbed."""
