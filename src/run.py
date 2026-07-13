@@ -12382,6 +12382,8 @@ def run_fidelity_audit(target: Target) -> dict:
     log.info(f"  → workdir: {workdir}")
 
     audit_anchor: str  # "reference" | "paper"
+    reference_confidence = "unknown"
+    reference_signals: dict = {}
     if reference_url:
         result["reference_url"] = reference_url
         ok, ref_dir, err = _clone_reference_repo(reference_url, workdir)
@@ -12390,6 +12392,49 @@ def run_fidelity_audit(target: Target) -> dict:
             result["error"] = err
             log.error(f"  ✗ {err}")
             return result
+
+        # Reference-impl sanity check (same tiering as the pre-PR gate).
+        # Extracts a paper title from the PR title for fallback matching;
+        # the arxiv ID match is the strong signal.
+        reference_confidence, reference_signals = _score_reference_confidence(
+            ref_dir, arxiv_id, title,
+        )
+        result["reference_confidence"] = reference_confidence
+        result["reference_signals"] = reference_signals
+        log.info(
+            f"  → reference-impl confidence: {reference_confidence} "
+            f"(readme_arxiv={reference_signals.get('readme_arxiv_id', False)}, "
+            f"citation_arxiv={reference_signals.get('citation_arxiv_id', False)}, "
+            f"code_arxiv={reference_signals.get('code_arxiv_id', False)}, "
+            f"title_tokens={reference_signals.get('title_tokens_matched', 0)})"
+        )
+        if reference_confidence == "low":
+            # Reference is a catalog mislink — skip the Claude one-shot and
+            # transition labels through so downstream chain phases proceed.
+            # Post an advisory PR comment so reviewers know the audit was
+            # skipped for a legitimate data-quality reason, not a fabrication.
+            result["status"] = "fidelity_skipped_reference_mismatch"
+            _add_pr_label(target, pr_number, FIDELITY_LABEL_DONE)
+            _remove_pr_label(target, pr_number, FIDELITY_LABEL_TRIGGER)
+            _append_to_step_summary(
+                "## Fidelity audit — skipped (reference-impl mismatch)\n\n"
+                f"The catalog reference (`{reference_url}`) shows no evidence "
+                f"of implementing arxiv:{arxiv_id} — no arxiv ID in the README, "
+                f"CITATION file, or top code files, and paper-title tokens "
+                f"below the medium-confidence threshold. Comparing the PR "
+                f"diff against this reference would produce false-positive "
+                f"fabrication flags. Skipping the audit; the PR is preserved "
+                f"as-is for reviewer inspection.\n\n"
+                f"*Catalog data-quality issue — the arxiv-id → github-url "
+                f"mapping should be corrected upstream.*"
+            )
+            log.info(
+                f"  ✓ {result['status']}: reference {reference_url} does not "
+                f"self-identify with arxiv:{arxiv_id}; audit skipped, PR "
+                f"preserved, labels transitioned"
+            )
+            return result
+
         try:
             pr_diff = _fetch_pr_diff(target, pr_number)
         except (urllib.error.HTTPError, urllib.error.URLError) as e:
@@ -12405,7 +12450,11 @@ def run_fidelity_audit(target: Target) -> dict:
             reference_root=ref_dir,
         )
         audit_anchor = "reference"
-        log.info(f"  → reference-anchored audit ({reference_url})")
+        log.info(
+            f"  → reference-anchored audit ({reference_url})"
+            + ("; advisory-only (medium confidence)"
+               if reference_confidence == "medium" else "")
+        )
     else:
         # Phase A degraded mode: no public reference impl available, but
         # we may still have the paper's title + abstract from arxiv. The
@@ -12460,13 +12509,31 @@ def run_fidelity_audit(target: Target) -> dict:
     # to upstream conventions.
     _append_to_step_summary(coverage_section)
 
-    needs_judgment = bool(matrix.get("needs_judgment", False))
-    if needs_judgment:
+    raw_needs_judgment = bool(matrix.get("needs_judgment", False))
+    # Advisory-mode: under medium-confidence reference the audit ran but
+    # its flag count is not authoritative — reference doesn't self-identify
+    # with the paper strongly enough to trust judgment as ground truth.
+    # Surface the coverage matrix + flag count in the run summary but
+    # don't apply the needs-judgment label that would gate reviewer flow.
+    advisory_only = (reference_confidence == "medium")
+    effective_needs_judgment = raw_needs_judgment and not advisory_only
+
+    if effective_needs_judgment:
         _add_pr_label(target, pr_number, FIDELITY_LABEL_NEEDS_JUDGMENT)
         result["status"] = (
             "fidelity_audited_paper_anchored_needs_judgment"
             if audit_anchor == "paper"
             else "fidelity_audited_needs_judgment"
+        )
+    elif advisory_only and raw_needs_judgment:
+        result["status"] = "fidelity_audited_advisory"
+        _append_to_step_summary(
+            "\n\n*Audit above is **advisory-only** — reference-impl "
+            f"self-identifies only weakly with arxiv:{arxiv_id} "
+            "(title-token match; no explicit arxiv ID in README/CITATION/"
+            "code). Flags surfaced for reviewer awareness but the "
+            "`needs-judgment` label is withheld to avoid blocking the "
+            "chain on a probably-mislinked reference.*"
         )
     else:
         result["status"] = (
@@ -12475,6 +12542,7 @@ def run_fidelity_audit(target: Target) -> dict:
             else "fidelity_audited"
         )
     result["audit_anchor"] = audit_anchor
+    result["advisory_only"] = advisory_only
 
     # Transition the trigger label → fidelity-done so the convention pass
     # workflow picks it up.
