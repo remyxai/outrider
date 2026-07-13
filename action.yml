@@ -404,9 +404,9 @@ runs:
         npm install -g @anthropic-ai/claude-code
         claude --version
 
-    - name: Install pytest + remyxai CLI (validation + selection-pass tool-use)
+    - name: Install pytest + remyxai CLI + pyyaml (validation + selection-pass tool-use + repo-intel loader)
       shell: bash
-      run: pip install pytest remyxai
+      run: pip install pytest remyxai pyyaml
 
     - name: Install poppler-utils (pdftotext for arxiv PDF license retry)
       shell: bash
