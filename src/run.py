@@ -3685,7 +3685,7 @@ __README__
 Themes Outrider has already surfaced recently (last __RECENT_N__ Issues)
 ------------------------------------------------------------------------
 __RECENT_ISSUES__
-
+__REPO_INTEL__
 Broad candidate pool currently being considered (__BROAD_N__ papers)
 --------------------------------------------------------------------
 __BROAD_BRIEF__
@@ -3698,7 +3698,14 @@ Your task
 2. Identify themes the repo's README + interest context implies the
    maintainer cares about, but that are absent or under-represented in
    the broad pool.
-3. **Bias your refine queries toward SIMPLIFY / REPLACE / ACCELERATE
+3. **When the fork has accumulated cross-run learning** (a "Cross-run
+   learning" section above), use it to steer refine queries: bias
+   toward extending confirmed landing zones (queries that surface
+   mechanisms that fit those paths' shapes); avoid searching for
+   rejected shapes unless a caveat clearly applies; and reserve some
+   query budget for the exploration bucket so novel-shape candidates
+   still enter the pool.
+4. **Bias your refine queries toward SIMPLIFY / REPLACE / ACCELERATE
    angles over ADD-ALONGSIDE angles.** Look specifically for:
      - Two-model or multi-step pipeline stages that could become one
      - Imported foundation models that have published successors
@@ -3711,11 +3718,11 @@ Your task
    only when the README or interest context explicitly names a missing
    capability — otherwise the repo's existing contracts already
    represent the highest-leverage surfaces to improve.
-4. For each under-represented theme that's a genuine fit, draft a single
+5. For each under-represented theme that's a genuine fit, draft a single
    keyword-style search query — 4-8 terms, no quotes, no boolean
    operators. The Remyx /search/assets backend is keyword-matched, so
    the strongest signal words should appear first.
-5. Output 1-3 queries (no more than 3). Quality beats quantity — if the
+6. Output 1-3 queries (no more than 3). Quality beats quantity — if the
    broad pool already covers everything the maintainer would care about,
    return zero queries with a one-line reasoning. If you propose a
    query, the reasoning must explain *what theme* it targets, *why* the
@@ -3778,6 +3785,35 @@ def audit_and_refine_pool(
     interest_block = (
         interest_context.strip() or "(no interest context recorded)"
     )
+
+    # Cross-run learning: fetch the fork's .remyx/repo_intel.yaml via
+    # the GitHub Contents API (no workdir yet — this runs upstream of
+    # prepare_workdir). Opt-in via INPUT_MAINTAIN_STATE. When present,
+    # inject a "Cross-run learning" section into the audit prompt so
+    # refine queries steer toward extending confirmed zones + avoiding
+    # rejected shapes + preserving the exploration budget.
+    intel_block = ""
+    maintain_state = (
+        (os.environ.get("INPUT_MAINTAIN_STATE") or "").strip().lower()
+        in ("true", "1", "yes")
+    )
+    if maintain_state:
+        intel = _load_fork_repo_intel_remote(target)
+        if intel is not None:
+            rendered = _render_repo_intel_for_selection(intel)
+            if rendered:
+                intel_block = (
+                    "\nCross-run learning accumulated on this fork\n"
+                    "-------------------------------------------\n"
+                    f"{rendered}"
+                )
+                log.info(
+                    "  → audit: threading repo_intel priors "
+                    "(%d zones, %d rejected shapes)",
+                    len(intel.get("observed_landing_zones") or []),
+                    len(intel.get("rejected_shapes") or []),
+                )
+
     prompt = (
         _AUDIT_PROMPT_TEMPLATE
         .replace("__REPO_FULLNAME__", target.repo)
@@ -3787,6 +3823,7 @@ def audit_and_refine_pool(
         .replace("__README__", readme_block)
         .replace("__RECENT_N__", str(len(recent_issues)))
         .replace("__RECENT_ISSUES__", recent_block)
+        .replace("__REPO_INTEL__", intel_block)
         .replace("__BROAD_N__", str(len(broad_candidates)))
         .replace("__BROAD_BRIEF__", _render_broad_brief(broad_candidates))
     )
@@ -4981,6 +5018,49 @@ def _load_environments_md(workdir: Path, max_bytes: int = 4096) -> str:
 # missing / malformed / unfetchable.
 
 _REPO_INTEL_SCHEMA_VERSION = 1
+
+
+def _load_fork_repo_intel_remote(target: "Target") -> dict | None:
+    """Fetch ``.remyx/repo_intel.yaml`` from the fork's main branch via the
+    GitHub Contents API — used by callers that don't have a cloned workdir
+    yet (e.g. the audit/refine pass, which runs before ``prepare_workdir``).
+
+    Same validation semantics as ``_load_fork_repo_intel``: returns a dict
+    with ``schema_version == 1`` or None on any failure (missing file,
+    malformed YAML, network error, PyYAML unavailable). Never raises.
+    """
+    token = _github_token()
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{target.repo}/contents/.remyx/repo_intel.yaml",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github.raw",
+                "User-Agent": "outrider-repo-intel",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        return None
+    if not content.strip():
+        return None
+    try:
+        import yaml
+    except ImportError:
+        log.warning("  ⚠ repo_intel remote load: PyYAML unavailable; skipping")
+        return None
+    try:
+        parsed = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("schema_version") != _REPO_INTEL_SCHEMA_VERSION:
+        return None
+    return parsed
 
 
 def _load_fork_repo_intel(workdir: Path) -> dict | None:

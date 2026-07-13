@@ -782,6 +782,137 @@ def test_update_fork_repo_intel_adds_new_zone_at_different_path(tmp_path, monkey
     assert paths == {"autogen/beta/tools/", "autogen/middleware/"}
 
 
+def test_load_fork_repo_intel_remote_returns_dict_on_valid_response():
+    """Remote loader hits GitHub Contents API + parses YAML from response."""
+    yaml_body = (
+        b"schema_version: 1\nfork: smellslikeml/ag2\n"
+        b"observed_landing_zones:\n"
+        b"  - path: autogen/beta/tools/\n"
+        b"    shape_tags: [library-shape-public-api]\n"
+    )
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return yaml_body
+
+    target = MagicMock(); target.repo = "smellslikeml/ag2"
+    with patch.object(run, "_github_token", return_value="ghs_x"), \
+         patch.object(run.urllib.request, "urlopen", return_value=_Resp()):
+        intel = run._load_fork_repo_intel_remote(target)
+    assert intel is not None
+    assert intel["schema_version"] == 1
+    assert intel["fork"] == "smellslikeml/ag2"
+
+
+def test_load_fork_repo_intel_remote_returns_none_on_404():
+    import urllib.error
+    target = MagicMock(); target.repo = "some/repo"
+    with patch.object(run, "_github_token", return_value="ghs_x"), \
+         patch.object(run.urllib.request, "urlopen",
+                      side_effect=urllib.error.HTTPError(
+                          "url", 404, "not found", {}, None)):
+        assert run._load_fork_repo_intel_remote(target) is None
+
+
+def test_load_fork_repo_intel_remote_returns_none_on_network_error():
+    import urllib.error
+    target = MagicMock(); target.repo = "some/repo"
+    with patch.object(run, "_github_token", return_value="ghs_x"), \
+         patch.object(run.urllib.request, "urlopen",
+                      side_effect=urllib.error.URLError("net down")):
+        assert run._load_fork_repo_intel_remote(target) is None
+
+
+def test_load_fork_repo_intel_remote_returns_none_when_no_token():
+    target = MagicMock(); target.repo = "some/repo"
+    with patch.object(run, "_github_token", return_value=""):
+        assert run._load_fork_repo_intel_remote(target) is None
+
+
+def test_load_fork_repo_intel_remote_returns_none_on_wrong_schema_version():
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"schema_version: 99\nfork: x\n"
+    target = MagicMock(); target.repo = "x/y"
+    with patch.object(run, "_github_token", return_value="ghs_x"), \
+         patch.object(run.urllib.request, "urlopen", return_value=_Resp()):
+        assert run._load_fork_repo_intel_remote(target) is None
+
+
+def test_audit_prompt_threads_repo_intel_when_maintain_state_on(monkeypatch):
+    """audit_and_refine_pool loads remote intel + injects into audit prompt
+    when maintain-state is on."""
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    intel = {
+        "schema_version": 1, "fork": "smellslikeml/ag2",
+        "observed_landing_zones": [
+            {"path": "autogen/beta/tools/",
+             "shape_tags": ["library-shape-public-api"],
+             "confirmed_by": [{"arxiv": "2607.07321v1", "mode": "Mode 2"}]},
+        ],
+        "rejected_shapes": [],
+    }
+    target = MagicMock(); target.repo = "smellslikeml/ag2"
+    target.claude_timeout_s = 900
+
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", tier="high", paper_abstract=""),
+        MagicMock(paper_title="b", arxiv_id="2", tier="high", paper_abstract=""),
+    ]
+
+    captured: dict = {}
+    def fake_oneshot(wd, prompt, timeout, max_turns=5):
+        captured["prompt"] = prompt
+        return True, '{"refine_queries": [], "reasoning": "no gaps"}'
+
+    with patch.object(run, "_recent_outrider_issue_titles", return_value=[]), \
+         patch.object(run, "_fetch_repo_readme", return_value="README"), \
+         patch.object(run, "_load_fork_repo_intel_remote", return_value=intel), \
+         patch.object(run, "_run_claude_oneshot", side_effect=fake_oneshot):
+        run.audit_and_refine_pool(
+            target, candidates,
+            interest_name="ag2", interest_context="", experiment_history="",
+        )
+    prompt = captured["prompt"]
+    assert "Cross-run learning" in prompt
+    assert "autogen/beta/tools/" in prompt
+    assert "library-shape-public-api" in prompt
+    # Placeholder must be substituted, not left in the prompt
+    assert "__REPO_INTEL__" not in prompt
+
+
+def test_audit_prompt_omits_repo_intel_when_maintain_state_off(monkeypatch):
+    monkeypatch.delenv("INPUT_MAINTAIN_STATE", raising=False)
+
+    target = MagicMock(); target.repo = "smellslikeml/ag2"
+    target.claude_timeout_s = 900
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", tier="high", paper_abstract=""),
+        MagicMock(paper_title="b", arxiv_id="2", tier="high", paper_abstract=""),
+    ]
+
+    captured: dict = {}
+    def fake_oneshot(wd, prompt, timeout, max_turns=5):
+        captured["prompt"] = prompt
+        return True, '{"refine_queries": [], "reasoning": "no gaps"}'
+
+    with patch.object(run, "_recent_outrider_issue_titles", return_value=[]), \
+         patch.object(run, "_fetch_repo_readme", return_value="README"), \
+         patch.object(run, "_load_fork_repo_intel_remote") as load_mock, \
+         patch.object(run, "_run_claude_oneshot", side_effect=fake_oneshot):
+        run.audit_and_refine_pool(
+            target, candidates,
+            interest_name="ag2", interest_context="", experiment_history="",
+        )
+    prompt = captured["prompt"]
+    # Placeholder substituted with empty string; no leftover token
+    assert "__REPO_INTEL__" not in prompt
+    assert "Cross-run learning" not in prompt
+    load_mock.assert_not_called()
+
+
 def test_update_fork_repo_intel_swallows_exceptions(tmp_path, monkeypatch):
     """Any exception in the write path must not propagate — the terminal
     state that already succeeded shouldn't be disturbed."""
