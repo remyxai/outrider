@@ -913,6 +913,243 @@ def test_audit_prompt_omits_repo_intel_when_maintain_state_off(monkeypatch):
     load_mock.assert_not_called()
 
 
+# --- REMYX-237: selection history awareness + collision-free branch naming ---
+
+def test_extract_dispatched_arxivs_empty_when_no_intel():
+    assert run._extract_dispatched_arxivs(None) == []
+    assert run._extract_dispatched_arxivs({}) == []
+
+
+def test_extract_dispatched_arxivs_flattens_confirmed_by():
+    intel = {
+        "observed_landing_zones": [
+            {"path": "a/", "confirmed_by": [
+                {"arxiv": "1", "mode": "Mode 2", "branch": "br1"},
+                {"arxiv": "2", "mode": "Mode 3", "pr": 14},
+            ]},
+            {"path": "b/", "confirmed_by": [{"arxiv": "3", "mode": "Mode 1"}]},
+        ],
+    }
+    out = run._extract_dispatched_arxivs(intel)
+    arxivs = [d["arxiv"] for d in out]
+    assert arxivs == ["1", "2", "3"]
+    # Anchor picks branch or PR appropriately
+    d1 = next(d for d in out if d["arxiv"] == "1")
+    assert d1["anchor"] == "branch:br1"
+    assert d1["path"] == "a/"
+    d2 = next(d for d in out if d["arxiv"] == "2")
+    assert d2["anchor"] == "PR #14"
+
+
+def test_render_already_dispatched_empty_when_no_intel():
+    assert run._render_already_dispatched_for_selection(None) == ""
+    assert run._render_already_dispatched_for_selection({}) == ""
+
+
+def test_render_already_dispatched_lists_arxivs_and_guidance():
+    intel = {
+        "observed_landing_zones": [
+            {"path": "autogen/beta/tools/", "confirmed_by": [
+                {"arxiv": "2607.07321v1", "mode": "Mode 2",
+                 "branch": "from-atomic-actions"}
+            ]},
+        ],
+    }
+    out = run._render_already_dispatched_for_selection(intel)
+    assert "Already-dispatched arxivs" in out
+    assert "2607.07321v1" in out
+    assert "autogen/beta/tools/" in out
+    assert "is_re_pick" in out
+    assert "re_pick_justification" in out
+    # "MATERIALLY\ncompound" — hard-wrapped across a line break; normalize whitespace
+    assert "materially" in out.lower() and "compound on the prior landing" in out.lower()
+
+
+def test_selection_prompt_threads_already_dispatched_when_maintain_state_on(
+    tmp_path, monkeypatch,
+):
+    """Selection prompt gets both the intel priors block AND the
+    already-dispatched section when the fork has prior landings."""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    (workdir / ".remyx").mkdir()
+    (workdir / ".remyx" / "repo_intel.yaml").write_text(
+        "schema_version: 1\nfork: x/y\n"
+        "observed_landing_zones:\n"
+        "  - path: pkg/mod/\n"
+        "    shape_tags: [library-shape-public-api]\n"
+        "    confirmed_by:\n"
+        "      - {arxiv: \"1111.11111v1\", mode: \"Mode 2\", branch: \"prev-branch\"}\n"
+    )
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="2222.22222v1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="1111.11111v1", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    captured = {}
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        captured["prompt"] = prompt
+        return True, '{"chosen_index": 0, "reasoning": "test"}', []
+
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+    target.pin_arxiv = ""; target.search_method = ""
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(candidates)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        run.select_recommendation(workdir, "pkg", candidates, target=target)
+
+    prompt = captured["prompt"]
+    assert "Already-dispatched arxivs" in prompt
+    assert "1111.11111v1" in prompt
+    assert "pkg/mod/" in prompt
+    # Confirms schema extension is present so the model knows to fill is_re_pick
+    assert "is_re_pick" in prompt
+
+
+def test_select_recommendation_coerces_repick_without_justification_to_skip(
+    tmp_path, monkeypatch,
+):
+    """Model returned is_re_pick=true but empty re_pick_justification —
+    treat as invalid duplicate-work attempt, coerce chosen_index=-1."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        return True, (
+            '{"chosen_index": 0, "reasoning": "picked this",'
+            ' "is_re_pick": true, "re_pick_justification": ""}'
+        ), []
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(c)"), \
+         patch.object(run, "_load_fork_repo_intel", return_value=None), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        result = run.select_recommendation(workdir, "pkg", candidates, target=target)
+    assert result is not None
+    assert result["chosen_index"] == -1
+
+
+def test_select_recommendation_accepts_repick_with_justification(
+    tmp_path, monkeypatch,
+):
+    """Model returned is_re_pick=true with non-empty justification — accept."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        return True, (
+            '{"chosen_index": 0, "reasoning": "picked this",'
+            ' "is_re_pick": true,'
+            ' "re_pick_justification": "prior landing was Mode 3 at path/A; this run targets Mode 2 at path/B"}'
+        ), []
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(c)"), \
+         patch.object(run, "_load_fork_repo_intel", return_value=None), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        result = run.select_recommendation(workdir, "pkg", candidates, target=target)
+    assert result is not None
+    assert result["chosen_index"] == 0
+    assert result["is_re_pick"] is True
+    assert "Mode 3 at path/A" in result["re_pick_justification"]
+
+
+# --- collision-free branch naming -----------------------------------------
+
+def test_apply_branch_collision_suffix_returns_unchanged_when_no_collision():
+    target = MagicMock(); target.repo = "x/y"
+    with patch.object(run, "_remote_branch_exists", return_value=False):
+        out = run._apply_branch_collision_suffix(target, "clean-slug")
+    assert out == "clean-slug"
+
+
+def test_apply_branch_collision_suffix_bumps_v2_on_collision():
+    target = MagicMock(); target.repo = "x/y"
+    # First call returns True (collision on base); v2 doesn't collide.
+    call_count = {"n": 0}
+    def fake(target_, branch):
+        call_count["n"] += 1
+        return branch == "slug"  # only base collides
+    with patch.object(run, "_remote_branch_exists", side_effect=fake):
+        out = run._apply_branch_collision_suffix(target, "slug")
+    assert out == "slug-v2"
+
+
+def test_apply_branch_collision_suffix_bumps_through_v3():
+    target = MagicMock(); target.repo = "x/y"
+    def fake(target_, branch):
+        return branch in ("slug", "slug-v2")  # v3 open
+    with patch.object(run, "_remote_branch_exists", side_effect=fake):
+        out = run._apply_branch_collision_suffix(target, "slug")
+    assert out == "slug-v3"
+
+
+def test_apply_branch_collision_suffix_falls_back_to_timestamp():
+    """When -v2..-vN all collide, fall back to date-stamped."""
+    target = MagicMock(); target.repo = "x/y"
+    with patch.object(run, "_remote_branch_exists", return_value=True):
+        out = run._apply_branch_collision_suffix(target, "slug", max_bumps=3)
+    # Fallback contains slug + a date stamp
+    assert out.startswith("slug-")
+    assert len(out) > len("slug-")
+    assert "v2" not in out and "v3" not in out
+
+
+def test_remote_branch_exists_returns_true_on_200():
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ref": "refs/heads/x"}'
+    target = MagicMock(); target.repo = "x/y"
+    with patch.object(run, "_github_token", return_value="t"), \
+         patch.object(run.urllib.request, "urlopen", return_value=_Resp()):
+        assert run._remote_branch_exists(target, "some-branch") is True
+
+
+def test_remote_branch_exists_returns_false_on_404():
+    import urllib.error
+    target = MagicMock(); target.repo = "x/y"
+    with patch.object(run, "_github_token", return_value="t"), \
+         patch.object(run.urllib.request, "urlopen",
+                      side_effect=urllib.error.HTTPError("u", 404, "not found", {}, None)):
+        assert run._remote_branch_exists(target, "some-branch") is False
+
+
+def test_remote_branch_exists_returns_false_on_network_error():
+    import urllib.error
+    target = MagicMock(); target.repo = "x/y"
+    with patch.object(run, "_github_token", return_value="t"), \
+         patch.object(run.urllib.request, "urlopen",
+                      side_effect=urllib.error.URLError("net down")):
+        assert run._remote_branch_exists(target, "some-branch") is False
+
+
+def test_remote_branch_exists_returns_false_without_token():
+    target = MagicMock(); target.repo = "x/y"
+    with patch.object(run, "_github_token", return_value=""):
+        assert run._remote_branch_exists(target, "some-branch") is False
+
+
 def test_update_fork_repo_intel_swallows_exceptions(tmp_path, monkeypatch):
     """Any exception in the write path must not propagate — the terminal
     state that already succeeded shouldn't be disturbed."""

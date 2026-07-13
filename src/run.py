@@ -1229,10 +1229,26 @@ fences, no prose before or after. Schema:
                               (verified via <path>)', or 'proposed as
                               replacement but I/O contract differs:
                               X vs Y'>"}
-  ]
+  ],
+  "is_re_pick": <boolean — set true ONLY when the chosen candidate has
+                  been dispatched before on this fork (see "Already-
+                  dispatched" section, when present, for the list).
+                  Default false; omit when the section is absent.>,
+  "re_pick_justification": "<REQUIRED when is_re_pick=true: name the
+                             specific way this new dispatch materially
+                             compounds on the prior landing. Valid
+                             reasons: different mode citation (e.g.
+                             prior was Mode 3, this is Mode 2);
+                             different call-site scope (prior at
+                             path/A, this at path/B); incorporates a
+                             coordination signal absent from prior
+                             (name it). Duplicate-work re-picks are
+                             not allowed — set chosen_index to a
+                             different candidate instead. Omit when
+                             is_re_pick is false or omitted.>"
 }
 
-__DISCHARGED_PAPERS__--- Candidates (highest relevance first) ---
+__DISCHARGED_PAPERS____ALREADY_DISPATCHED__--- Candidates (highest relevance first) ---
 
 __CANDIDATES__
 
@@ -1959,6 +1975,79 @@ def format_branch_name(rec: "Recommendation") -> str:
     if (os.environ.get("INPUT_START_FROM_REF") or "").strip():
         return f"{base}-refined"
     return base
+
+
+def _remote_branch_exists(target: "Target", branch: str) -> bool:
+    """Whether ``branch`` already exists on the fork's remote via
+    ``git ls-remote``-shaped GitHub API call.
+
+    Returns False on any network error — the collision-suffix logic
+    treats "unknown" as "no collision" so it doesn't over-suffix on
+    transient failures. The subsequent push either succeeds (no
+    collision existed) or fails cleanly (collision surfaces as a
+    non-fast-forward, which is the caller's problem to handle).
+    """
+    if not branch:
+        return False
+    token = _github_token()
+    if not token:
+        return False
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{target.repo}/git/ref/heads/{branch}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "outrider-collision-check",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        return False
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _apply_branch_collision_suffix(
+    target: "Target", branch: str, max_bumps: int = 20,
+) -> str:
+    """When ``branch`` already exists on the fork's remote, append
+    ``-v2``, ``-v3``, ... until an unused name is found. Preserves the
+    ``-refined`` convention: refinement runs (with the suffix already
+    baked in by ``format_branch_name``) still get ``-v2``, ``-v3`` on
+    top when repeated refinements land on the same base.
+
+    Falls back to a ``-YYYYMMDD`` timestamp suffix if ``-v20`` is still
+    colliding (astronomically unlikely; hedges against runaway).
+
+    Returns the collision-free branch name; equals ``branch`` unchanged
+    when no collision was detected.
+    """
+    if not _remote_branch_exists(target, branch):
+        return branch
+
+    for bump in range(2, max_bumps + 1):
+        candidate = f"{branch}-v{bump}"
+        if not _remote_branch_exists(target, candidate):
+            log.info(
+                "  → branch collision: '%s' exists on %s; using '%s'",
+                branch, target.repo, candidate,
+            )
+            return candidate
+
+    # Extreme fallback: date-stamped variant. Never expected to fire.
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    fallback = f"{branch}-{stamp}"
+    log.warning(
+        "  ⚠ branch collision: exhausted -v2..-v%d suffixes for '%s'; "
+        "using date-stamped fallback '%s'",
+        max_bumps, branch, fallback,
+    )
+    return fallback
 
 
 def strip_html(s: str) -> str:
@@ -5521,6 +5610,72 @@ def _update_fork_repo_intel(
     _put_fork_repo_intel(target, intel)
 
 
+def _extract_dispatched_arxivs(intel: dict | None) -> list[dict]:
+    """Flatten repo_intel's ``observed_landing_zones.confirmed_by`` into a
+    de-duplicated list of dispatched arxivs with their prior landing
+    metadata. Returns [] when intel is None or has no landings.
+
+    Each entry: ``{arxiv, path, mode, branch|pr, timestamp}``. Multiple
+    landings for the same arxiv (e.g. Mode 3 first, then Mode 2 refinement)
+    produce multiple entries so the selection Claude can see the full
+    prior scope for a re-pick justification.
+    """
+    if not intel:
+        return []
+    zones = intel.get("observed_landing_zones") or []
+    dispatched: list[dict] = []
+    for z in zones:
+        path = z.get("path", "?")
+        for cb in z.get("confirmed_by") or []:
+            entry = {
+                "arxiv": cb.get("arxiv", "?"),
+                "path": path,
+                "mode": cb.get("mode", "(unknown mode)"),
+                "timestamp": cb.get("timestamp", ""),
+            }
+            if cb.get("pr"):
+                entry["anchor"] = f"PR #{cb['pr']}"
+            elif cb.get("branch"):
+                entry["anchor"] = f"branch:{cb['branch']}"
+            else:
+                entry["anchor"] = ""
+            dispatched.append(entry)
+    return dispatched
+
+
+def _render_already_dispatched_for_selection(intel: dict | None) -> str:
+    """Render the "already-dispatched on this fork" prompt section for
+    the selection pass. Empty string when intel is None or has no
+    landings (the selection prompt then behaves as before).
+    """
+    dispatched = _extract_dispatched_arxivs(intel)
+    if not dispatched:
+        return ""
+    lines = [
+        "",
+        "**Already-dispatched arxivs on this fork** — a prior Outrider run",
+        "has already produced a branch or PR for each of the following. Do",
+        "NOT pick one of these unless the new dispatch would MATERIALLY",
+        "compound on the prior landing. Valid reasons to re-pick:",
+        "",
+        "  - Different mode citation (prior was Mode 3, new run targets Mode 2)",
+        "  - Different call-site scope (prior landed at path/A, new run at path/B)",
+        "  - Incorporates a coordination signal absent from the prior landing",
+        "",
+        "Set `is_re_pick: true` AND provide `re_pick_justification` when you",
+        "pick a prior-dispatched arxiv. Otherwise, prefer a novel candidate —",
+        "duplicate work wastes budget.",
+        "",
+    ]
+    for d in dispatched:
+        anchor = f" · {d['anchor']}" if d.get("anchor") else ""
+        lines.append(
+            f"  - arxiv:{d['arxiv']} — path `{d['path']}` · {d['mode']}{anchor}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _render_repo_intel_for_selection(intel: dict | None) -> str:
     """Compact prompt-inline rendering of repo_intel for the selection pass.
 
@@ -7245,15 +7400,19 @@ def select_recommendation(
         in ("true", "1", "yes")
     )
     intel_block = ""
+    already_dispatched_block = ""
     if maintain_state:
         intel = _load_fork_repo_intel(workdir)
         if intel is not None:
             intel_block = _render_repo_intel_for_selection(intel)
+            already_dispatched_block = _render_already_dispatched_for_selection(intel)
+            dispatched_count = len(_extract_dispatched_arxivs(intel))
             log.info(
                 "  → selection: threading repo_intel priors "
-                "(%d zones, %d rejected shapes)",
+                "(%d zones, %d rejected shapes, %d prior dispatches)",
                 len(intel.get("observed_landing_zones") or []),
                 len(intel.get("rejected_shapes") or []),
+                dispatched_count,
             )
 
     prompt = (
@@ -7270,6 +7429,7 @@ def select_recommendation(
         .replace("__LAYOUT__", layout)
         .replace("__ENVIRONMENT_HINT__", _render_environment_hint(env_body))
         .replace("__REPO_INTEL__", intel_block)
+        .replace("__ALREADY_DISPATCHED__", already_dispatched_block)
     )
     # Bound the agentic flow — selection is verification, not a full
     # implementation session. 25 turns covers a few `gh code-search` +
@@ -7446,6 +7606,31 @@ def select_recommendation(
             f"  selection: extension pick — direction signal: {tds[:100]!r}, "
             f"adjacent call site: {pcs[:80]!r}"
         )
+    # Re-pick justification check: when the agent picked an already-
+    # dispatched arxiv (see "Already-dispatched" section threaded into
+    # the prompt when maintain-state is on), it must set is_re_pick=true
+    # AND provide a non-empty re_pick_justification. Duplicate-work
+    # re-picks without justification get coerced to skip-by-verification
+    # (chosen_index = -1) so we don't waste an implementation session
+    # on redoing prior work.
+    is_re_pick = bool(data.get("is_re_pick"))
+    re_pick_just = (data.get("re_pick_justification") or "").strip()
+    if is_re_pick:
+        if not re_pick_just:
+            log.warning(
+                "  selection: is_re_pick=true but re_pick_justification "
+                "is empty; treating as duplicate-work attempt and falling "
+                "back to skip-by-verification"
+            )
+            data["chosen_index"] = -1
+            data["re_pick_justification"] = ""
+            return data
+        log.info(
+            "  selection: re-pick of prior-dispatched arxiv — justification: %r",
+            re_pick_just[:200],
+        )
+        data["re_pick_justification"] = re_pick_just
+
     # Code-override audit: when the chosen
     # candidate has no code link (compat <= 0.30) AND the agent
     # populated code_override_justification, validate the override is
@@ -9417,6 +9602,15 @@ def process_target(target: Target) -> dict:
                     result["selection_code_override_justification"] = (
                         selection["code_override_justification"]
                     )
+                # Re-pick telemetry — surface on the result dict so
+                # downstream analysis can tell which dispatches picked
+                # already-dispatched arxivs (with justification) apart
+                # from novel picks.
+                if selection.get("is_re_pick"):
+                    result["selection_is_re_pick"] = True
+                    result["selection_re_pick_justification"] = (
+                        selection.get("re_pick_justification", "")
+                    )
             if selection is not None and selection.get("chosen_index") == -1:
                 # Agentic selection rejected every candidate after verification
                 # (or, in coverage-gate enforce mode, an under-explored pick
@@ -9681,6 +9875,13 @@ def process_target(target: Target) -> dict:
         # rationale through so pre-flight and the implementer evaluate the
         # same scoped framing the selection pass reasoned about.
         branch = format_branch_name(rec)
+        # Collision-free branch naming: when the derived slug already
+        # exists on the fork (e.g. a prior dispatch of the same paper
+        # produced a branch that never got a PR), append -v2..-vN so
+        # this dispatch doesn't force-push over the earlier branch.
+        # Selection layer's re-pick justification is what legitimizes
+        # a re-pick in the first place; this handles the push side.
+        branch = _apply_branch_collision_suffix(target, branch)
         # 4.5. Research phase (opt-in via INPUT_STAGED_SYNTHESIS). Runs a
         # bounded research-only Claude Code invocation before the coding
         # session, producing web_findings.json in the briefing bundle dir.
