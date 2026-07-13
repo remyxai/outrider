@@ -7401,6 +7401,7 @@ def select_recommendation(
     )
     intel_block = ""
     already_dispatched_block = ""
+    intel: dict | None = None
     if maintain_state:
         intel = _load_fork_repo_intel(workdir)
         if intel is not None:
@@ -7606,21 +7607,51 @@ def select_recommendation(
             f"  selection: extension pick — direction signal: {tds[:100]!r}, "
             f"adjacent call site: {pcs[:80]!r}"
         )
-    # Re-pick justification check: when the agent picked an already-
-    # dispatched arxiv (see "Already-dispatched" section threaded into
-    # the prompt when maintain-state is on), it must set is_re_pick=true
-    # AND provide a non-empty re_pick_justification. Duplicate-work
-    # re-picks without justification get coerced to skip-by-verification
-    # (chosen_index = -1) so we don't waste an implementation session
-    # on redoing prior work.
+    # Re-pick enforcement: when the agent picked an arxiv that has
+    # already been dispatched on this fork (per the "Already-dispatched"
+    # section threaded into the prompt when maintain-state is on), it
+    # must set is_re_pick=true AND provide a non-empty re_pick_justification.
+    #
+    # Two-sided check:
+    #   1. Server-side detection — cross-reference the selected candidate's
+    #      arxiv (versionless-normalized) against the dispatched-arxivs list
+    #      extracted from repo_intel. If the pick IS a re-pick but the model
+    #      DIDN'T flag it, coerce is_re_pick=true so the justification check
+    #      below fires. This catches the case where the model saw the
+    #      Already-dispatched section but ignored it.
+    #   2. Justification check — if is_re_pick=true (either model-set or
+    #      server-flagged) without a non-empty re_pick_justification, coerce
+    #      chosen_index=-1 so the run skips rather than redoing prior work.
     is_re_pick = bool(data.get("is_re_pick"))
     re_pick_just = (data.get("re_pick_justification") or "").strip()
+    if not is_re_pick and 0 <= idx < len(candidates) and intel is not None:
+        # Server-side detection using the intel dict already loaded above
+        # (no second fetch). Falls through as no-op when maintain-state
+        # is off (intel is None).
+        picked_arxiv = _arxiv_versionless(candidates[idx].arxiv_id or "")
+        dispatched_arxivs = {
+            _arxiv_versionless(d["arxiv"])
+            for d in _extract_dispatched_arxivs(intel)
+            if d.get("arxiv")
+        }
+        if picked_arxiv and picked_arxiv in dispatched_arxivs:
+            log.warning(
+                "  selection: model picked already-dispatched arxiv %s "
+                "without setting is_re_pick=true; treating as unjustified "
+                "duplicate-work attempt",
+                picked_arxiv,
+            )
+            is_re_pick = True
+            data["is_re_pick"] = True
+            data["server_flagged_re_pick"] = True
+
     if is_re_pick:
         if not re_pick_just:
             log.warning(
-                "  selection: is_re_pick=true but re_pick_justification "
-                "is empty; treating as duplicate-work attempt and falling "
-                "back to skip-by-verification"
+                "  selection: is_re_pick without re_pick_justification "
+                "(server-flagged=%s); falling back to skip-by-verification "
+                "to avoid duplicate work",
+                data.get("server_flagged_re_pick", False),
             )
             data["chosen_index"] = -1
             data["re_pick_justification"] = ""

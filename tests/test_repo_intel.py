@@ -1042,6 +1042,123 @@ def test_select_recommendation_coerces_repick_without_justification_to_skip(
     assert result["chosen_index"] == -1
 
 
+def test_select_recommendation_server_flags_unflagged_repick(
+    tmp_path, monkeypatch,
+):
+    """Server-side re-pick enforcement: model picked a prior-dispatched
+    arxiv WITHOUT setting is_re_pick=true → server flags it AND coerces
+    to skip since no justification was provided. Prevents duplicate work
+    even when the model doesn't self-report."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    (workdir / ".remyx").mkdir()
+    # Fork has already dispatched arxiv "1111.11111v1" per intel.
+    (workdir / ".remyx" / "repo_intel.yaml").write_text(
+        "schema_version: 1\nfork: x/y\n"
+        "observed_landing_zones:\n"
+        "  - path: p/\n"
+        "    confirmed_by:\n"
+        "      - {arxiv: \"1111.11111v1\", mode: \"Mode 2\", branch: \"prev\"}\n"
+    )
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    candidates = [
+        # Candidate at index 0 is the ALREADY-DISPATCHED arxiv
+        MagicMock(paper_title="a", arxiv_id="1111.11111v1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2222.22222v1", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    # Model picks index 0 but does NOT set is_re_pick — this is the bug case
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        return True, (
+            '{"chosen_index": 0, "reasoning": "picked this",'
+            ' "integration_shape": "addition"}'
+        ), []
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(c)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        result = run.select_recommendation(workdir, "pkg", candidates, target=target)
+    # Server-side flagged the re-pick + coerced to skip
+    assert result is not None
+    assert result["chosen_index"] == -1
+    assert result.get("is_re_pick") is True
+    assert result.get("server_flagged_re_pick") is True
+
+
+def test_select_recommendation_server_side_check_respects_versionless(
+    tmp_path, monkeypatch,
+):
+    """Server-side detection normalizes arxiv IDs versionless — 2111.11111v1
+    and 2111.11111v2 refer to the same paper and should match."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    (workdir / ".remyx").mkdir()
+    (workdir / ".remyx" / "repo_intel.yaml").write_text(
+        "schema_version: 1\nfork: x/y\n"
+        "observed_landing_zones:\n"
+        "  - path: p/\n"
+        "    confirmed_by:\n"
+        "      - {arxiv: \"2111.11111v1\", mode: \"Mode 2\", branch: \"prev\"}\n"
+    )
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    candidates = [
+        # Same paper, different arxiv version — should still be flagged
+        MagicMock(paper_title="a", arxiv_id="2111.11111v2", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="9999.99999v1", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        return True, '{"chosen_index": 0, "reasoning": "picked"}', []
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(c)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        result = run.select_recommendation(workdir, "pkg", candidates, target=target)
+    assert result["chosen_index"] == -1
+    assert result.get("server_flagged_re_pick") is True
+
+
+def test_select_recommendation_novel_pick_passes_through(
+    tmp_path, monkeypatch,
+):
+    """Novel-arxiv pick is not flagged by the server-side check."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    (workdir / ".remyx").mkdir()
+    (workdir / ".remyx" / "repo_intel.yaml").write_text(
+        "schema_version: 1\nfork: x/y\n"
+        "observed_landing_zones:\n"
+        "  - path: p/\n"
+        "    confirmed_by:\n"
+        "      - {arxiv: \"1111.11111v1\", mode: \"Mode 2\", branch: \"prev\"}\n"
+    )
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="2222.22222v1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="3333.33333v1", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        return True, '{"chosen_index": 0, "reasoning": "picked"}', []
+    target = MagicMock()
+    target.repo = "x/y"; target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(c)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        result = run.select_recommendation(workdir, "pkg", candidates, target=target)
+    assert result["chosen_index"] == 0
+    assert not result.get("is_re_pick")
+    assert not result.get("server_flagged_re_pick")
+
+
 def test_select_recommendation_accepts_repick_with_justification(
     tmp_path, monkeypatch,
 ):
