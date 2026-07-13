@@ -913,7 +913,7 @@ def test_audit_prompt_omits_repo_intel_when_maintain_state_off(monkeypatch):
     load_mock.assert_not_called()
 
 
-# --- REMYX-237: selection history awareness + collision-free branch naming ---
+# --- selection history awareness + collision-free branch naming --------------
 
 def test_extract_dispatched_arxivs_empty_when_no_intel():
     assert run._extract_dispatched_arxivs(None) == []
