@@ -9926,35 +9926,62 @@ def process_target(target: Target) -> dict:
         # Duplicate-work enforcement — process_target-level guard that
         # catches both agentic-selection picks AND fallback picks (when
         # the selection Claude call fails and _fallback_candidate runs).
-        # A legitimate re-pick reaches here with result["selection_is_re_pick"]
-        # already set + a justification — those pass through. Everything
-        # else that picks a prior-dispatched arxiv gets coerced to
-        # skipped_arxiv_already_landed, preventing the fallback path from
-        # bypassing the intel-aware re-pick machinery.
+        #
+        # Bypass hierarchy (ordered — first match wins, guard doesn't fire):
+        #   1. INPUT_PIN_ARXIV set — user explicitly requested this paper
+        #   2. INPUT_START_FROM_REF set — refinement flow, compounding by design
+        #   3. INPUT_LEAD_CONTENT set — user/orchestrator provided scope for this run
+        #   4. selection_is_re_pick=true with justification — model self-flagged
+        #
+        # Otherwise, if picked arxiv is in observed_landing_zones, coerce
+        # to skipped_arxiv_already_landed. Prevents fallback path from
+        # bypassing intel-aware re-pick machinery on transient selection
+        # failures (observed z.ai empty-output cases).
         _maintain_state = (
             (os.environ.get("INPUT_MAINTAIN_STATE") or "").strip().lower()
             in ("true", "1", "yes")
         )
-        if _maintain_state and not result.get("selection_is_re_pick"):
-            _intel = _load_fork_repo_intel(workdir)
-            if _intel is not None:
-                _picked = _arxiv_versionless(rec.arxiv_id or "")
-                _dispatched = {
-                    _arxiv_versionless(d["arxiv"])
-                    for d in _extract_dispatched_arxivs(_intel)
-                    if d.get("arxiv")
-                }
-                if _picked and _picked in _dispatched:
-                    log.warning(
-                        "  ⚠ duplicate-work guard: picked arxiv %s already "
-                        "has a landing in .remyx/repo_intel.yaml on this fork "
-                        "(fallback path bypassed re-pick enforcement); "
-                        "skipping this dispatch",
-                        _picked,
-                    )
-                    result["status"] = "skipped_arxiv_already_landed"
-                    result["skipped_arxiv"] = _picked
-                    return result
+        if _maintain_state:
+            _pin_arxiv = (os.environ.get("INPUT_PIN_ARXIV") or "").strip()
+            _start_from_ref = (os.environ.get("INPUT_START_FROM_REF") or "").strip()
+            _lead_content = (os.environ.get("INPUT_LEAD_CONTENT") or "").strip()
+            _bypass_reason = None
+            if _pin_arxiv:
+                _bypass_reason = f"pin-arxiv={_pin_arxiv!r} explicitly set"
+            elif _start_from_ref:
+                _bypass_reason = f"start-from-ref={_start_from_ref!r} — refinement flow"
+            elif _lead_content:
+                _bypass_reason = "lead-content set — orchestrator provided scope"
+            elif result.get("selection_is_re_pick"):
+                _bypass_reason = "selection self-flagged is_re_pick with justification"
+
+            if not _bypass_reason:
+                _intel = _load_fork_repo_intel(workdir)
+                if _intel is not None:
+                    _picked = _arxiv_versionless(rec.arxiv_id or "")
+                    _dispatched = {
+                        _arxiv_versionless(d["arxiv"])
+                        for d in _extract_dispatched_arxivs(_intel)
+                        if d.get("arxiv")
+                    }
+                    if _picked and _picked in _dispatched:
+                        log.warning(
+                            "  ⚠ duplicate-work guard: picked arxiv %s "
+                            "already has a landing in .remyx/repo_intel.yaml "
+                            "on this fork (fallback path bypassed re-pick "
+                            "enforcement); skipping this dispatch",
+                            _picked,
+                        )
+                        result["status"] = "skipped_arxiv_already_landed"
+                        result["skipped_arxiv"] = _picked
+                        return result
+            else:
+                log.info(
+                    "  → duplicate-work guard bypassed: %s (proceeding with "
+                    "implementation regardless of prior landing)",
+                    _bypass_reason,
+                )
+                result["duplicate_work_guard_bypass_reason"] = _bypass_reason
 
         # 5. Spec bundle for the chosen candidate. Thread the selection
         # rationale through so pre-flight and the implementer evaluate the
