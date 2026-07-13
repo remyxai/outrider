@@ -263,6 +263,25 @@ inputs:
       Empty / 'false' (default) = classic single-invocation flow.
     required: false
     default: 'false'
+  maintain-state:
+    description: |
+      Opt-in per-fork cross-run learning. When 'true', Outrider reads
+      `.remyx/repo_intel.yaml` from the fork's main branch (if present)
+      and threads it into the coding session as REPO_INTEL.md. The file
+      carries confirmed landing zones (where prior branches landed
+      cleanly), rejected mechanism shapes (with the reasons they didn't
+      fit and caveats under which the rejection might not apply),
+      coordination signals, and exploration budget accumulated across
+      prior dispatches on this fork.
+
+      The coding session consults it before picking a call site so it
+      can extend confirmed landings instead of re-discovering them, and
+      avoid known-rejected shapes unless a caveat matches. Never fails
+      a run when the file is missing / malformed / unreadable.
+
+      Empty / 'false' (default) = classic flow without cross-run state.
+    required: false
+    default: 'false'
   linear-api-key:
     description: |
       Linear API key used by the tool-plane's Linear connector to resolve
@@ -499,6 +518,7 @@ runs:
         INPUT_START_FROM_REF: ${{ inputs.start-from-ref }}
         INPUT_LINEAR_API_KEY: ${{ inputs.linear-api-key }}
         INPUT_STAGED_SYNTHESIS: ${{ inputs.staged-synthesis }}
+        INPUT_MAINTAIN_STATE: ${{ inputs.maintain-state }}
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         # PR number to audit in fidelity mode (set from the workflow's
         # pull_request event payload; empty in recommend / weekly-summary).

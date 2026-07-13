@@ -485,6 +485,23 @@ _RESEARCH_FINDINGS_REF_TEMPLATE = """\
 """
 
 
+_REPO_INTEL_REF_TEMPLATE = """\
+  7. ``.remyx-recommendation/REPO_INTEL.md`` — cross-run learning accumulated on
+                                              this fork: confirmed landing zones
+                                              (where prior branches landed cleanly),
+                                              rejected mechanism shapes (with the
+                                              reasons they didn't fit and caveats
+                                              under which the rejection might not
+                                              apply), coordination signals, and
+                                              exploration budget. Consult before
+                                              picking a call site — extending a
+                                              confirmed landing zone is cheaper
+                                              than discovering a new one, and
+                                              proposing a rejected shape without
+                                              matching a caveat is a known cost.
+"""
+
+
 _INVOCATION_MD_TEMPLATE = """\
 ---
 type: agent_invocation
@@ -510,7 +527,7 @@ Read these files in order:
                                               + tests near the planned call
                                               site. Use these patterns
                                               without re-exploring them.
-{environment_file_ref}{research_findings_ref}
+{environment_file_ref}{research_findings_ref}{repo_intel_ref}
 
 SPEC.md names a PROPOSED CALL SITE under "How this maps onto your repo"
 (the file + function the selection pass judged most implementable). Start
@@ -4949,6 +4966,151 @@ def _load_environments_md(workdir: Path, max_bytes: int = 4096) -> str:
     return ""
 
 
+# ─── repo-intel: per-fork cross-run learning ───────────────────────────────
+#
+# `.remyx/repo_intel.yaml` on the fork's main branch carries cross-run
+# learning accumulated from prior Outrider dispatches: confirmed landing
+# zones (with the arxiv + mode that proved them), rejected mechanism
+# shapes (with reason codes + caveats under which the rejection might
+# not apply), coordination signals, and exploration budget. Threaded
+# into the coding session via REPO_INTEL.md so the agent can extend
+# confirmed landings instead of re-discovering them, and avoid known-
+# rejected shapes unless a caveat applies.
+#
+# Opt-in via INPUT_MAINTAIN_STATE — never fails a run when the file is
+# missing / malformed / unfetchable.
+
+_REPO_INTEL_SCHEMA_VERSION = 1
+
+
+def _load_fork_repo_intel(workdir: Path) -> dict | None:
+    """Fetch ``.remyx/repo_intel.yaml`` from the fork's ``origin/main`` via
+    ``git show``. Returns a validated dict (schema_version == 1) or None
+    when the file is absent, malformed, or unreadable — never raises.
+    """
+    if not workdir or not workdir.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "show", "origin/main:.remyx/repo_intel.yaml"],
+            cwd=workdir, capture_output=True, text=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        import yaml
+        parsed = yaml.safe_load(result.stdout)
+    except Exception:  # noqa: BLE001 — malformed YAML never blocks the run
+        log.warning("  ⚠ .remyx/repo_intel.yaml present but YAML parse failed; skipping")
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    version = parsed.get("schema_version")
+    if version != _REPO_INTEL_SCHEMA_VERSION:
+        log.warning(
+            "  ⚠ .remyx/repo_intel.yaml has schema_version=%r; expected %d; skipping",
+            version, _REPO_INTEL_SCHEMA_VERSION,
+        )
+        return None
+    return parsed
+
+
+def _render_repo_intel_md(intel: dict) -> str:
+    """Render a validated repo_intel dict as ``REPO_INTEL.md`` markdown."""
+    lines = [
+        "---",
+        "type: repo_intel",
+        f"schema_version: {intel.get('schema_version', 1)}",
+        f"fork: {intel.get('fork', '')}",
+        f"last_updated: {intel.get('last_updated', '')}",
+        "---",
+        "",
+        "# Cross-run learning for this fork",
+        "",
+        "This file records what has landed on this fork across prior Outrider",
+        "dispatches, what shapes have been rejected, and coordination signals",
+        "accumulated across runs. Consult it before picking a call site —",
+        "extending a confirmed landing zone is cheaper and less risky than",
+        "discovering a new one, and proposing a rejected shape without",
+        "matching a caveat is a known cost.",
+        "",
+    ]
+
+    zones = intel.get("observed_landing_zones") or []
+    if zones:
+        lines.append("## Confirmed landing zones — extend these where the mechanism fits")
+        lines.append("")
+        for z in zones:
+            path = z.get("path", "?")
+            tags = ", ".join(z.get("shape_tags") or []) or "(unspecified)"
+            lines.append(f"- **`{path}`** — shape: `{tags}`")
+            for cb in z.get("confirmed_by") or []:
+                arxiv = cb.get("arxiv", "?")
+                mode = cb.get("mode", "?")
+                anchor = cb.get("branch") or (f"PR #{cb['pr']}" if "pr" in cb else "?")
+                lines.append(f"  - `arxiv:{arxiv}` · {mode} · {anchor}")
+                specifics = cb.get("call_site_specifics")
+                if specifics:
+                    lines.append(f"    — {specifics}")
+        lines.append("")
+
+    rejected = intel.get("rejected_shapes") or []
+    if rejected:
+        lines.append("## Rejected shapes — avoid unless a caveat applies")
+        lines.append("")
+        for r in rejected:
+            tag = r.get("shape_tag", "?")
+            summary = r.get("reason_summary") or r.get("reason_code") or ""
+            lines.append(f"- **`{tag}`** — {summary}")
+            caveats = r.get("when_this_penalty_should_NOT_apply") or []
+            if caveats:
+                lines.append("  - This rejection does NOT apply if:")
+                for c in caveats:
+                    lines.append(f"    - {c}")
+            observed = r.get("observed") or []
+            if observed:
+                obs_str = ", ".join(
+                    f"`arxiv:{o.get('arxiv', '?')}`" for o in observed[:5]
+                )
+                lines.append(f"  - Observed on: {obs_str}")
+        lines.append("")
+
+    signals = intel.get("coordination_signals") or []
+    if signals:
+        lines.append("## Coordination signals — external context useful across dispatches")
+        lines.append("")
+        for s in signals:
+            src = s.get("source", "?")
+            topics = ", ".join(s.get("topic_tags") or [])
+            suffix = f" ({topics})" if topics else ""
+            lines.append(f"- {src}{suffix}")
+        lines.append("")
+
+    exp = intel.get("exploration_budget") or {}
+    frac = exp.get("novel_shape_fraction")
+    if frac:
+        lines.append(
+            f"## Exploration budget: ~{float(frac) * 100:.0f}% of dispatches "
+            "are allocated to novel shapes not yet in the observed map."
+        )
+        lines.append("")
+
+    modes = intel.get("mode_history") or {}
+    if modes:
+        totals = ", ".join(
+            f"{k.replace('_count', '').replace('mode_', 'Mode ')}={v}"
+            for k, v in modes.items() if k.startswith("mode_") and k.endswith("_count")
+        )
+        if totals:
+            lines.append(f"## Mode history: {totals}")
+            lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 # ─── selection reasoning path verification ──────────────────────────────────
 #
 # The selection agent sometimes cites paths in its reasoning that don't
@@ -5143,12 +5305,38 @@ def write_spec_bundle(
         if (workdir / BUNDLE_DIR_NAME / "web_findings.json").exists()
         else ""
     )
+
+    # Repo-intel: per-fork cross-run learning. Opt-in via INPUT_MAINTAIN_STATE
+    # — loads .remyx/repo_intel.yaml from the fork's main branch and renders
+    # it as REPO_INTEL.md for the coding session. Never fails the run when the
+    # file is missing / malformed / unreadable.
+    repo_intel_ref = ""
+    maintain_state = (
+        (os.environ.get("INPUT_MAINTAIN_STATE") or "").strip().lower()
+        in ("true", "1", "yes")
+    )
+    if maintain_state:
+        intel = _load_fork_repo_intel(workdir)
+        if intel is not None:
+            (bundle / "REPO_INTEL.md").write_text(_render_repo_intel_md(intel))
+            repo_intel_ref = _REPO_INTEL_REF_TEMPLATE
+            log.info(
+                "  ✓ repo_intel loaded: %d observed_landing_zones, "
+                "%d rejected_shapes, %d coordination_signals",
+                len(intel.get("observed_landing_zones") or []),
+                len(intel.get("rejected_shapes") or []),
+                len(intel.get("coordination_signals") or []),
+            )
+        else:
+            log.info("  → maintain-state=true but no .remyx/repo_intel.yaml on origin/main; continuing without")
+
     (bundle / "INVOCATION.md").write_text(_INVOCATION_MD_TEMPLATE.format(
         package=package,
         attribution_url=CANONICAL_ATTRIBUTION_URL,
         issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
         environment_file_ref=environment_file_ref,
         research_findings_ref=research_findings_ref,
+        repo_intel_ref=repo_intel_ref,
     ))
 
     # ORIENTATION.md — target repo's contributor guides, PR template, recent
@@ -8921,6 +9109,17 @@ def process_target(target: Target) -> dict:
             selection_note=result.get("selection_reasoning", ""),
             env_body=env_body,
         )
+
+        # Repo-intel telemetry — surface whether the fork's
+        # .remyx/repo_intel.yaml was loaded into the coding session so
+        # A/B validation runs can measure adaptive-behavior deltas
+        # against dispatches without maintain-state.
+        _repo_intel_path = workdir / BUNDLE_DIR_NAME / "REPO_INTEL.md"
+        if _repo_intel_path.exists():
+            result["repo_intel_loaded"] = True
+            result["repo_intel_bytes"] = _repo_intel_path.stat().st_size
+        else:
+            result["repo_intel_loaded"] = False
 
         # 5.5. Pre-flight Issue routing (§6). Cheap Claude pass that
         # decides PR vs Issue before we spend the implementation budget.
