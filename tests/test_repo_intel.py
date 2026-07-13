@@ -29,7 +29,8 @@ def _fake_git_show(stdout: str, returncode: int = 0):
     )
 
 
-def test_load_fork_repo_intel_returns_dict_on_valid_yaml(tmp_path):
+def test_load_fork_repo_intel_reads_directly_from_workdir_first(tmp_path):
+    # Under actions/checkout@v4 the workdir IS main HEAD — file is on disk directly.
     yaml_body = """\
 schema_version: 1
 fork: smellslikeml/ag2
@@ -40,13 +41,25 @@ observed_landing_zones:
       - {arxiv: "2607.07321v1", mode: "Mode 2", branch: "from-atomic-actions-..."}
 rejected_shapes: []
 """
-    with patch.object(run.subprocess, "run",
-                      return_value=_fake_git_show(yaml_body)):
+    (tmp_path / ".remyx").mkdir()
+    (tmp_path / ".remyx" / "repo_intel.yaml").write_text(yaml_body)
+    # git subprocess should NOT be called when direct read succeeds
+    with patch.object(run.subprocess, "run", side_effect=AssertionError("git subprocess called")):
         intel = run._load_fork_repo_intel(tmp_path)
     assert intel is not None
     assert intel["schema_version"] == 1
     assert intel["fork"] == "smellslikeml/ag2"
     assert len(intel["observed_landing_zones"]) == 1
+
+
+def test_load_fork_repo_intel_falls_back_to_git_show_when_file_absent(tmp_path):
+    # Filesystem miss → git show fallback (for bare-clone or non-main-HEAD setups)
+    yaml_body = "schema_version: 1\nfork: smellslikeml/ag2\n"
+    with patch.object(run.subprocess, "run",
+                      return_value=_fake_git_show(yaml_body)):
+        intel = run._load_fork_repo_intel(tmp_path)
+    assert intel is not None
+    assert intel["fork"] == "smellslikeml/ag2"
 
 
 def test_load_fork_repo_intel_returns_none_when_file_absent(tmp_path):
@@ -55,6 +68,18 @@ def test_load_fork_repo_intel_returns_none_when_file_absent(tmp_path):
                       return_value=_fake_git_show("", returncode=128)):
         intel = run._load_fork_repo_intel(tmp_path)
     assert intel is None
+
+
+def test_load_fork_repo_intel_direct_read_falls_back_when_file_empty(tmp_path):
+    # File exists but is empty — should fall back to git show
+    (tmp_path / ".remyx").mkdir()
+    (tmp_path / ".remyx" / "repo_intel.yaml").write_text("")
+    yaml_body = "schema_version: 1\nfork: x\n"
+    with patch.object(run.subprocess, "run",
+                      return_value=_fake_git_show(yaml_body)):
+        intel = run._load_fork_repo_intel(tmp_path)
+    assert intel is not None
+    assert intel["fork"] == "x"
 
 
 def test_load_fork_repo_intel_returns_none_on_empty_stdout(tmp_path):

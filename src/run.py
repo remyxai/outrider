@@ -4984,25 +4984,45 @@ _REPO_INTEL_SCHEMA_VERSION = 1
 
 
 def _load_fork_repo_intel(workdir: Path) -> dict | None:
-    """Fetch ``.remyx/repo_intel.yaml`` from the fork's ``origin/main`` via
-    ``git show``. Returns a validated dict (schema_version == 1) or None
-    when the file is absent, malformed, or unreadable — never raises.
+    """Load ``.remyx/repo_intel.yaml`` from the fork.
+
+    Tries a direct filesystem read of ``<workdir>/.remyx/repo_intel.yaml``
+    first — under ``actions/checkout@v4`` the workdir is checked out at
+    main's HEAD, so the file is present in the tree if the fork owner
+    committed it. Falls back to ``git show origin/main:.remyx/repo_intel.yaml``
+    for edge cases (workdir on a non-main branch, or a bare-clone setup).
+
+    Returns a validated dict (schema_version == 1) or None when the file
+    is absent, malformed, or unreadable — never raises.
     """
     if not workdir or not workdir.exists():
         return None
-    try:
-        result = subprocess.run(
-            ["git", "show", "origin/main:.remyx/repo_intel.yaml"],
-            cwd=workdir, capture_output=True, text=True,
-            timeout=30,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
+
+    content: str = ""
+    intel_path = workdir / ".remyx" / "repo_intel.yaml"
+    if intel_path.is_file():
+        try:
+            content = intel_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            content = ""
+
+    if not content.strip():
+        # Fallback: try git show origin/main (bare-clone or non-main-HEAD workdirs)
+        try:
+            result = subprocess.run(
+                ["git", "show", "origin/main:.remyx/repo_intel.yaml"],
+                cwd=workdir, capture_output=True, text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        content = result.stdout
+
     try:
         import yaml
-        parsed = yaml.safe_load(result.stdout)
+        parsed = yaml.safe_load(content)
     except Exception:  # noqa: BLE001 — malformed YAML never blocks the run
         log.warning("  ⚠ .remyx/repo_intel.yaml present but YAML parse failed; skipping")
         return None
