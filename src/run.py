@@ -922,7 +922,7 @@ iteratively. For your most promising candidate(s):
     extends (`gh issue list --repo <repo> --state open --search "..."`
     or `gh issue view <n> --repo <repo>` for specific Issues).
 
-__ENVIRONMENT_HINT__**Four legitimate integration shapes — classify each candidate you
+__ENVIRONMENT_HINT____REPO_INTEL__**Four legitimate integration shapes — classify each candidate you
 consider.** A candidate that does NOT fit one of these four shapes is
 a structural mismatch and should be rejected.
 
@@ -5048,6 +5048,77 @@ def _load_fork_repo_intel(workdir: Path) -> dict | None:
     return parsed
 
 
+def _render_repo_intel_for_selection(intel: dict | None) -> str:
+    """Compact prompt-inline rendering of repo_intel for the selection pass.
+
+    Terser than ``_render_repo_intel_md`` — the selection prompt is long
+    already; this block adds just enough structure for Claude to reason
+    about landing-zone priors + rejected-shape caveats + exploration
+    budget without ballooning the token budget.
+
+    Returns "" when intel is None or empty; the selection prompt uses the
+    empty-string form as a no-op — the ``__REPO_INTEL__`` placeholder is
+    always present in the template, but resolves to nothing when the
+    fork has no cross-run learning yet.
+    """
+    if not intel:
+        return ""
+
+    lines: list[str] = [
+        "",
+        "**This fork has accumulated cross-run learning from prior Outrider",
+        "dispatches.** Use it as PRIORS (not filters) when picking a candidate —",
+        "exploration budget is respected.",
+        "",
+    ]
+
+    zones = intel.get("observed_landing_zones") or []
+    if zones:
+        lines.append("**Confirmed landing zones** — extending these = lower risk:")
+        for z in zones:
+            path = z.get("path", "?")
+            tags = ", ".join(z.get("shape_tags") or []) or "(unspecified)"
+            recent = z.get("confirmed_by") or []
+            recent_str = "; ".join(
+                f"arxiv:{cb.get('arxiv', '?')} ({cb.get('mode', '?')})"
+                for cb in recent[:3]
+            )
+            lines.append(f"- `{path}` — shape: {tags}"
+                         + (f"; recent: {recent_str}" if recent_str else ""))
+        lines.append("")
+
+    rejected = intel.get("rejected_shapes") or []
+    if rejected:
+        lines.append("**Rejected shapes** — avoid unless a caveat applies:")
+        for r in rejected:
+            tag = r.get("shape_tag", "?")
+            summary = (r.get("reason_summary") or r.get("reason_code") or "").strip()
+            lines.append(f"- `{tag}` — {summary}")
+            caveats = r.get("when_this_penalty_should_NOT_apply") or []
+            for c in caveats[:3]:
+                lines.append(f"  - Caveat: {c}")
+        lines.append("")
+
+    exp = intel.get("exploration_budget") or {}
+    frac = exp.get("novel_shape_fraction")
+    if frac:
+        lines.append(
+            f"**Exploration budget**: ~{float(frac) * 100:.0f}% of dispatches "
+            "allocated to novel shapes. Bias toward confirmed zones for the "
+            "remainder but don't hard-filter novel candidates — noting "
+            "novel picks in your reasoning is fine."
+        )
+        lines.append("")
+
+    lines.append(
+        "When picking, note in your `reasoning` field whether the pick "
+        "aligns with a confirmed zone, is a novel-shape exploration, or "
+        "exercises a rejected-shape caveat."
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _render_repo_intel_md(intel: dict) -> str:
     """Render a validated repo_intel dict as ``REPO_INTEL.md`` markdown."""
     lines = [
@@ -6691,6 +6762,27 @@ def select_recommendation(
     repo_fullname = target.repo if target is not None else "<unknown>"
     issues = discharged_issues or []
     discharged_index = _discharged_index(issues)
+
+    # Cross-run learning prior: load .remyx/repo_intel.yaml if maintain-state
+    # is on. Injected inline into the selection prompt as compact priors on
+    # landing zones + rejected shapes + exploration budget. Empty string
+    # when maintain-state is off or the fork has no accumulated learning.
+    maintain_state = (
+        (os.environ.get("INPUT_MAINTAIN_STATE") or "").strip().lower()
+        in ("true", "1", "yes")
+    )
+    intel_block = ""
+    if maintain_state:
+        intel = _load_fork_repo_intel(workdir)
+        if intel is not None:
+            intel_block = _render_repo_intel_for_selection(intel)
+            log.info(
+                "  → selection: threading repo_intel priors "
+                "(%d zones, %d rejected shapes)",
+                len(intel.get("observed_landing_zones") or []),
+                len(intel.get("rejected_shapes") or []),
+            )
+
     prompt = (
         _SELECTION_PROMPT_TEMPLATE
         .replace("__REPO_FULLNAME__", repo_fullname)
@@ -6704,6 +6796,7 @@ def select_recommendation(
         )
         .replace("__LAYOUT__", layout)
         .replace("__ENVIRONMENT_HINT__", _render_environment_hint(env_body))
+        .replace("__REPO_INTEL__", intel_block)
     )
     # Bound the agentic flow — selection is verification, not a full
     # implementation session. 25 turns covers a few `gh code-search` +

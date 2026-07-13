@@ -321,6 +321,175 @@ def test_write_spec_bundle_accepts_all_maintain_state_truthy_values(tmp_path, mo
         )
 
 
+# --- _render_repo_intel_for_selection --------------------------------------
+
+def test_render_repo_intel_for_selection_returns_empty_when_none():
+    assert run._render_repo_intel_for_selection(None) == ""
+    assert run._render_repo_intel_for_selection({}) == ""
+
+
+def test_render_repo_intel_for_selection_includes_confirmed_zones():
+    intel = {
+        "observed_landing_zones": [
+            {"path": "autogen/beta/tools/",
+             "shape_tags": ["library-shape-public-api", "decorator-hook"],
+             "confirmed_by": [
+                 {"arxiv": "2607.07321v1", "mode": "Mode 2"},
+                 {"arxiv": "2503.14432v2", "mode": "Mode 3"},
+             ]},
+        ],
+    }
+    out = run._render_repo_intel_for_selection(intel)
+    assert "autogen/beta/tools/" in out
+    assert "library-shape-public-api" in out
+    assert "2607.07321v1" in out
+    assert "PRIORS (not filters)" in out
+
+
+def test_render_repo_intel_for_selection_includes_rejected_with_caveats():
+    intel = {
+        "rejected_shapes": [
+            {"shape_tag": "reranker-decision-layer",
+             "reason_code": "no_public_middleware_surface",
+             "reason_summary": "reranking operates on inputs from another layer",
+             "when_this_penalty_should_NOT_apply": [
+                 "candidate proposes to ADD a public middleware surface",
+             ]},
+        ],
+    }
+    out = run._render_repo_intel_for_selection(intel)
+    assert "reranker-decision-layer" in out
+    assert "reranking operates on inputs" in out
+    assert "Caveat: candidate proposes to ADD" in out
+
+
+def test_render_repo_intel_for_selection_includes_exploration_budget():
+    intel = {"exploration_budget": {"novel_shape_fraction": 0.25}}
+    out = run._render_repo_intel_for_selection(intel)
+    assert "25%" in out
+    assert "novel shapes" in out
+    assert "don't hard-filter" in out
+
+
+# --- select_recommendation integration --------------------------------------
+
+def test_selection_prompt_threads_repo_intel_when_maintain_state_on(tmp_path, monkeypatch):
+    """Selection prompt gets __REPO_INTEL__ populated when maintain-state=true
+    AND fork has repo_intel.yaml. Verifies the wire-in from _load_fork_repo_intel
+    into the selection prompt template."""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    (workdir / ".remyx").mkdir()
+    (workdir / ".remyx" / "repo_intel.yaml").write_text(
+        "schema_version: 1\nfork: smellslikeml/ag2\n"
+        "observed_landing_zones:\n"
+        "  - path: autogen/beta/tools/\n"
+        "    shape_tags: [library-shape-public-api]\n"
+        "    confirmed_by:\n"
+        "      - {arxiv: \"2607.07321v1\", mode: \"Mode 2\"}\n"
+    )
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+
+    captured: dict = {}
+
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        captured["prompt"] = prompt
+        # Return a valid JSON response so selection completes
+        return True, '{"chosen_index": 0, "reasoning": "test"}', []
+
+    target = MagicMock()
+    target.repo = "org/repo"
+    target.claude_timeout_s = 480
+    target.pin_arxiv = ""
+    target.search_method = ""
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(candidates)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        run.select_recommendation(workdir, "pkg", candidates, target=target)
+
+    prompt = captured["prompt"]
+    assert "autogen/beta/tools/" in prompt, "repo_intel confirmed-zone should thread into prompt"
+    assert "library-shape-public-api" in prompt
+    assert "arxiv:2607.07321v1" in prompt
+    assert "PRIORS (not filters)" in prompt
+
+
+def test_selection_prompt_omits_repo_intel_when_maintain_state_off(tmp_path, monkeypatch):
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    monkeypatch.delenv("INPUT_MAINTAIN_STATE", raising=False)
+
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    captured: dict = {}
+
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        captured["prompt"] = prompt
+        return True, '{"chosen_index": 0, "reasoning": "test"}', []
+
+    target = MagicMock()
+    target.repo = "org/repo"
+    target.claude_timeout_s = 480
+    target.pin_arxiv = ""
+    target.search_method = ""
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(candidates)"), \
+         patch.object(run, "_load_fork_repo_intel") as load_mock, \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        run.select_recommendation(workdir, "pkg", candidates, target=target)
+    prompt = captured["prompt"]
+    # No repo_intel block should appear
+    assert "PRIORS (not filters)" not in prompt
+    # Loader should not have been called
+    load_mock.assert_not_called()
+    # Template placeholder should be fully substituted (no leftover token)
+    assert "__REPO_INTEL__" not in prompt
+
+
+def test_selection_prompt_omits_repo_intel_when_maintain_state_on_but_no_yaml(tmp_path, monkeypatch):
+    """maintain-state=true but no .remyx/repo_intel.yaml → intel_block stays empty,
+    selection prompt runs unchanged."""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
+
+    candidates = [
+        MagicMock(paper_title="a", arxiv_id="1", relevance_score=0.9,
+                  paper_abstract="", reasoning="", tier="high"),
+        MagicMock(paper_title="b", arxiv_id="2", relevance_score=0.85,
+                  paper_abstract="", reasoning="", tier="high"),
+    ]
+    captured: dict = {}
+    def fake_streaming(wd, prompt, timeout, max_turns=25):
+        captured["prompt"] = prompt
+        return True, '{"chosen_index": 0, "reasoning": "test"}', []
+
+    target = MagicMock()
+    target.repo = "org/repo"
+    target.claude_timeout_s = 480
+
+    with patch.object(run, "_repo_layout_manifest", return_value="(layout)"), \
+         patch.object(run, "_render_candidate_brief", return_value="(candidates)"), \
+         patch.object(run, "_run_claude_oneshot_streaming", side_effect=fake_streaming):
+        run.select_recommendation(workdir, "pkg", candidates, target=target)
+    prompt = captured["prompt"]
+    assert "PRIORS (not filters)" not in prompt
+    assert "__REPO_INTEL__" not in prompt
+
+
 def test_write_spec_bundle_treats_falsy_maintain_state_as_off(tmp_path, monkeypatch):
     for val in ("false", "FALSE", "0", "no", ""):
         workdir = tmp_path / f"wd-off-{val or 'empty'}"
