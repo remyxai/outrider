@@ -5000,22 +5000,34 @@ def _load_fork_repo_intel(workdir: Path) -> dict | None:
 
     content: str = ""
     intel_path = workdir / ".remyx" / "repo_intel.yaml"
+    log.info(
+        "  → repo_intel probe: workdir=%s exists=%s intel_path_exists=%s intel_path_is_file=%s",
+        workdir, workdir.exists(), intel_path.exists(), intel_path.is_file() if intel_path.exists() else False,
+    )
     if intel_path.is_file():
         try:
             content = intel_path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+            log.info("  → repo_intel direct read: %d bytes", len(content))
+        except OSError as e:
+            log.warning("  ⚠ repo_intel direct read OSError: %s", e)
             content = ""
 
     if not content.strip():
         # Fallback: try git show origin/main (bare-clone or non-main-HEAD workdirs)
+        log.info("  → repo_intel: direct read empty; trying git-show origin/main")
         try:
             result = subprocess.run(
                 ["git", "show", "origin/main:.remyx/repo_intel.yaml"],
                 cwd=workdir, capture_output=True, text=True,
                 timeout=30,
             )
-        except (subprocess.TimeoutExpired, OSError):
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("  ⚠ repo_intel git-show failed: %s", e)
             return None
+        log.info(
+            "  → repo_intel git-show: rc=%s stdout=%d bytes stderr=%r",
+            result.returncode, len(result.stdout or ""), (result.stderr or "")[:200],
+        )
         if result.returncode != 0 or not result.stdout.strip():
             return None
         content = result.stdout
