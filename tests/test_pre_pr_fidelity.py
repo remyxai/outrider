@@ -83,19 +83,18 @@ def test_pre_pr_fidelity_returns_needs_judgment_when_matrix_flags(tmp_path):
         "needs_judgment": True,
     }
     with patch.object(run, "_extract_reference_url_from_pr_body",
-                      return_value=("2606.30560v1", "https://github.com/x/y")):
-        with patch.object(run, "_clone_reference_repo",
-                          return_value=(True, tmp_path / "ref", "")):
-            with patch.object(run, "_local_git_diff", return_value="fake diff"):
-                with patch.object(run, "_run_claude_oneshot",
-                                  return_value=(True, "{...}")):
-                    with patch.object(run, "_extract_json_object",
-                                      return_value=fake_matrix):
-                        with patch.object(run, "_render_coverage_matrix",
-                                          return_value="## Coverage\n..."):
-                            verdict = run._run_pre_pr_fidelity_check(
-                                rec, target, tmp_path, "T", "B", "main",
-                            )
+                      return_value=("2606.30560v1", "https://github.com/x/y")), \
+         patch.object(run, "_clone_reference_repo",
+                      return_value=(True, tmp_path / "ref", "")), \
+         patch.object(run, "_score_reference_confidence",
+                      return_value=("high", {})), \
+         patch.object(run, "_local_git_diff", return_value="fake diff"), \
+         patch.object(run, "_run_claude_oneshot", return_value=(True, "{...}")), \
+         patch.object(run, "_extract_json_object", return_value=fake_matrix), \
+         patch.object(run, "_render_coverage_matrix", return_value="## Coverage\n..."):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, target, tmp_path, "T", "B", "main",
+        )
     assert verdict["needs_judgment"] is True
     assert verdict["items_count"] == 1
     assert verdict["status"] == "pre_pr_fidelity_needs_judgment"
@@ -107,19 +106,18 @@ def test_pre_pr_fidelity_returns_clean_when_matrix_not_flagged(tmp_path):
     target = _make_target()
     fake_matrix = {"items": [{"name": "x", "status": "covered"}], "needs_judgment": False}
     with patch.object(run, "_extract_reference_url_from_pr_body",
-                      return_value=("2606.30560v1", "https://github.com/x/y")):
-        with patch.object(run, "_clone_reference_repo",
-                          return_value=(True, tmp_path / "ref", "")):
-            with patch.object(run, "_local_git_diff", return_value="fake diff"):
-                with patch.object(run, "_run_claude_oneshot",
-                                  return_value=(True, "{...}")):
-                    with patch.object(run, "_extract_json_object",
-                                      return_value=fake_matrix):
-                        with patch.object(run, "_render_coverage_matrix",
-                                          return_value=""):
-                            verdict = run._run_pre_pr_fidelity_check(
-                                rec, target, tmp_path, "T", "B", "main",
-                            )
+                      return_value=("2606.30560v1", "https://github.com/x/y")), \
+         patch.object(run, "_clone_reference_repo",
+                      return_value=(True, tmp_path / "ref", "")), \
+         patch.object(run, "_score_reference_confidence",
+                      return_value=("high", {})), \
+         patch.object(run, "_local_git_diff", return_value="fake diff"), \
+         patch.object(run, "_run_claude_oneshot", return_value=(True, "{...}")), \
+         patch.object(run, "_extract_json_object", return_value=fake_matrix), \
+         patch.object(run, "_render_coverage_matrix", return_value=""):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, target, tmp_path, "T", "B", "main",
+        )
     assert verdict["needs_judgment"] is False
     assert verdict["status"] == "pre_pr_fidelity_clean"
 
@@ -142,13 +140,15 @@ def test_pre_pr_fidelity_degrades_when_diff_empty(tmp_path):
     rec = _make_rec()
     target = _make_target()
     with patch.object(run, "_extract_reference_url_from_pr_body",
-                      return_value=("2606.30560v1", "https://github.com/x/y")):
-        with patch.object(run, "_clone_reference_repo",
-                          return_value=(True, tmp_path / "ref", "")):
-            with patch.object(run, "_local_git_diff", return_value=""):
-                verdict = run._run_pre_pr_fidelity_check(
-                    rec, target, tmp_path, "T", "B", "main",
-                )
+                      return_value=("2606.30560v1", "https://github.com/x/y")), \
+         patch.object(run, "_clone_reference_repo",
+                      return_value=(True, tmp_path / "ref", "")), \
+         patch.object(run, "_score_reference_confidence",
+                      return_value=("high", {})), \
+         patch.object(run, "_local_git_diff", return_value=""):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, target, tmp_path, "T", "B", "main",
+        )
     assert verdict["needs_judgment"] is False
     assert verdict["status"] == "pre_pr_fidelity_failed_no_diff"
 
@@ -157,16 +157,17 @@ def test_pre_pr_fidelity_degrades_when_claude_returns_unparseable(tmp_path):
     rec = _make_rec()
     target = _make_target()
     with patch.object(run, "_extract_reference_url_from_pr_body",
-                      return_value=("2606.30560v1", "https://github.com/x/y")):
-        with patch.object(run, "_clone_reference_repo",
-                          return_value=(True, tmp_path / "ref", "")):
-            with patch.object(run, "_local_git_diff", return_value="diff"):
-                with patch.object(run, "_run_claude_oneshot",
-                                  return_value=(True, "garbage")):
-                    with patch.object(run, "_extract_json_object", return_value=None):
-                        verdict = run._run_pre_pr_fidelity_check(
-                            rec, target, tmp_path, "T", "B", "main",
-                        )
+                      return_value=("2606.30560v1", "https://github.com/x/y")), \
+         patch.object(run, "_clone_reference_repo",
+                      return_value=(True, tmp_path / "ref", "")), \
+         patch.object(run, "_score_reference_confidence",
+                      return_value=("high", {})), \
+         patch.object(run, "_local_git_diff", return_value="diff"), \
+         patch.object(run, "_run_claude_oneshot", return_value=(True, "garbage")), \
+         patch.object(run, "_extract_json_object", return_value=None):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, target, tmp_path, "T", "B", "main",
+        )
     assert verdict["needs_judgment"] is False
     assert verdict["status"] == "pre_pr_fidelity_failed_claude"
 
@@ -487,3 +488,334 @@ def test_process_target_source_passes_self_review_to_both_fidelity_calls():
             "mode context from the first-pass check. Bug: without self_review, "
             "the check defaults to Mode 1 with no substitutions honored."
         )
+
+
+# --- reference-impl confidence scoring (Option A + B) -----------------------
+#
+# Motivating case: paper 2503.14432v2 (PLAY2PROMPT) had a Remyx catalog
+# reference URL of `microsoft/JARVIS`, but that repo self-identifies with
+# arxiv 2303.17580 (HuggingGPT). Comparing PLAY2PROMPT code against
+# HuggingGPT flagged every legitimate feature as fabrication and triggered
+# a false-positive `skipped_fidelity_fabrication_after_patch`.
+# See https://linear.app/remyx/issue/REMYX-234 comment thread for the
+# investigation write-up.
+
+def test_arxiv_bare_id_strips_v_suffix():
+    assert run._arxiv_bare_id("2503.14432v2") == "2503.14432"
+    assert run._arxiv_bare_id("2606.30560v1") == "2606.30560"
+    assert run._arxiv_bare_id("  2503.14432V3  ") == "2503.14432"
+    assert run._arxiv_bare_id("2503.14432") == "2503.14432"
+    assert run._arxiv_bare_id("") == ""
+    assert run._arxiv_bare_id(None) == ""
+
+
+def test_arxiv_id_signals_in_text_finds_bare_and_v_suffixed_forms():
+    text = "Reference implementation of 2503.14432 (accepted at NAACL)."
+    assert run._arxiv_id_signals_in_text(text, "2503.14432v2") is True
+
+    text2 = "See paper at arxiv.org/abs/2503.14432v2 for details."
+    assert run._arxiv_id_signals_in_text(text2, "2503.14432") is True
+
+    text3 = "https://arxiv.org/pdf/2503.14432 is the preprint URL."
+    assert run._arxiv_id_signals_in_text(text3, "2503.14432v2") is True
+
+
+def test_arxiv_id_signals_in_text_ignores_unrelated_ids():
+    text = "See our paper arxiv:2303.17580 (JARVIS/HuggingGPT)."
+    assert run._arxiv_id_signals_in_text(text, "2503.14432v2") is False
+
+
+def test_arxiv_id_signals_in_text_returns_false_on_empty():
+    assert run._arxiv_id_signals_in_text("", "2503.14432") is False
+    assert run._arxiv_id_signals_in_text("some text", "") is False
+    assert run._arxiv_id_signals_in_text(None, "2503.14432") is False
+
+
+def _write_ref_repo(root: Path, *, readme: str = "", citation: str = "",
+                    py_files: dict[str, str] | None = None) -> Path:
+    """Build a fake reference-repo directory for confidence-scoring tests."""
+    root.mkdir(parents=True, exist_ok=True)
+    if readme:
+        (root / "README.md").write_text(readme, encoding="utf-8")
+    if citation:
+        (root / "CITATION.cff").write_text(citation, encoding="utf-8")
+    for name, body in (py_files or {}).items():
+        p = root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+    return root
+
+
+def test_score_reference_confidence_high_on_readme_arxiv(tmp_path):
+    ref = _write_ref_repo(
+        tmp_path / "ref",
+        readme="# PLAY2PROMPT\n\n[arXiv:2503.14432](https://arxiv.org/abs/2503.14432)",
+    )
+    tier, signals = run._score_reference_confidence(
+        ref, "2503.14432v2", "PLAY2PROMPT: Zero-shot Tool Instruction Optimization",
+    )
+    assert tier == "high"
+    assert signals["readme_arxiv_id"] is True
+
+
+def test_score_reference_confidence_high_on_citation_cff(tmp_path):
+    ref = _write_ref_repo(
+        tmp_path / "ref",
+        readme="# Unrelated title",
+        citation="cff-version: 1.2.0\nidentifiers:\n  - value: '2503.14432'\n    type: other\n",
+    )
+    tier, signals = run._score_reference_confidence(
+        ref, "2503.14432v2", "some paper title",
+    )
+    assert tier == "high"
+    assert signals["citation_arxiv_id"] is True
+
+
+def test_score_reference_confidence_high_on_code_file_arxiv_mention(tmp_path):
+    ref = _write_ref_repo(
+        tmp_path / "ref",
+        readme="# A repo with no citation",
+        py_files={
+            "src/main.py": "# Implementation of arxiv 2503.14432v2\n" + ("x = 1\n" * 200),
+        },
+    )
+    tier, signals = run._score_reference_confidence(
+        ref, "2503.14432v2", "paper title",
+    )
+    assert tier == "high"
+    assert signals["code_arxiv_id"] is True
+
+
+def test_score_reference_confidence_medium_on_title_tokens_only(tmp_path):
+    ref = _write_ref_repo(
+        tmp_path / "ref",
+        readme=(
+            "# Zero-shot Tool Instruction Optimization\n\n"
+            "This repository provides zero-shot instruction optimization for tool play."
+        ),
+    )
+    tier, signals = run._score_reference_confidence(
+        ref, "2503.14432v2", "PLAY2PROMPT: Zero-shot Tool Instruction Optimization for LLM Agents via Tool Play",
+    )
+    assert tier == "medium"
+    assert signals["readme_title_tokens"] is True
+    assert signals["title_tokens_matched"] >= 3
+
+
+def test_score_reference_confidence_low_on_jarvis_case(tmp_path):
+    # The exact regression: JARVIS README self-identifies with 2303.17580,
+    # not 2503.14432. Our sanity check must return "low" here.
+    ref = _write_ref_repo(
+        tmp_path / "ref",
+        readme=(
+            "# JARVIS\n\n"
+            "[arXiv:2303.17580](https://arxiv.org/abs/2303.17580)\n\n"
+            "The mission of JARVIS is to explore AGI and deliver research."
+        ),
+    )
+    tier, signals = run._score_reference_confidence(
+        ref, "2503.14432v2", "PLAY2PROMPT: Zero-shot Tool Instruction Optimization for LLM Agents via Tool Play",
+    )
+    assert tier == "low"
+    assert signals["readme_arxiv_id"] is False
+    assert signals["readme_title_tokens"] is False
+
+
+def test_score_reference_confidence_low_on_missing_dir(tmp_path):
+    tier, signals = run._score_reference_confidence(
+        tmp_path / "does-not-exist", "2503.14432v2", "some title",
+    )
+    assert tier == "low"
+
+
+def test_score_reference_confidence_low_on_empty_arxiv_id(tmp_path):
+    ref = _write_ref_repo(tmp_path / "ref", readme="anything")
+    tier, _ = run._score_reference_confidence(ref, "", "title")
+    assert tier == "low"
+
+
+def test_score_reference_confidence_stopwords_do_not_produce_medium(tmp_path):
+    # A README that just uses generic ML vocabulary should NOT hit the
+    # ≥3 title-token threshold — stopwords are filtered out first.
+    ref = _write_ref_repo(
+        tmp_path / "ref",
+        readme="# A large language model framework paper with novel approach",
+    )
+    tier, _ = run._score_reference_confidence(
+        ref, "2503.14432", "Large Language Model Framework Paper With Novel Approach",
+    )
+    assert tier == "low"
+
+
+# --- _sniff_reference_confidence_remote (Option B) --------------------------
+
+def _fake_urlopen(readme_bytes: bytes, status: int = 200):
+    """Build a fake urllib.urlopen context manager returning the given bytes."""
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return readme_bytes
+    return _Resp()
+
+
+def test_sniff_reference_confidence_remote_high_on_arxiv_id():
+    readme = b"# PLAY2PROMPT\n\nSee arxiv 2503.14432 for the paper."
+    with patch.object(run.urllib.request, "urlopen", return_value=_fake_urlopen(readme)):
+        tier, signals = run._sniff_reference_confidence_remote(
+            "https://github.com/somebody/play2prompt",
+            "2503.14432v2",
+            "PLAY2PROMPT: Zero-shot Tool Instruction Optimization",
+        )
+    assert tier == "high"
+    assert signals["readme_arxiv_id"] is True
+
+
+def test_sniff_reference_confidence_remote_medium_on_title_tokens():
+    readme = b"# Zero-shot Tool Instruction Optimization\n\nRepo for zero-shot optimization tooling."
+    with patch.object(run.urllib.request, "urlopen", return_value=_fake_urlopen(readme)):
+        tier, signals = run._sniff_reference_confidence_remote(
+            "https://github.com/some/repo",
+            "2503.14432v2",
+            "PLAY2PROMPT: Zero-shot Tool Instruction Optimization for LLM Agents via Tool Play",
+        )
+    assert tier == "medium"
+    assert signals["readme_title_tokens"] is True
+
+
+def test_sniff_reference_confidence_remote_low_on_unrelated_readme():
+    readme = b"# JARVIS\n\n[arXiv:2303.17580]\n\nMission of JARVIS: explore AGI."
+    with patch.object(run.urllib.request, "urlopen", return_value=_fake_urlopen(readme)):
+        tier, _ = run._sniff_reference_confidence_remote(
+            "https://github.com/microsoft/JARVIS",
+            "2503.14432v2",
+            "PLAY2PROMPT: Zero-shot Tool Instruction Optimization for LLM Agents via Tool Play",
+        )
+    assert tier == "low"
+
+
+def test_sniff_reference_confidence_remote_unknown_on_bad_url():
+    tier, _ = run._sniff_reference_confidence_remote(
+        "not a url at all", "2503.14432", "title",
+    )
+    assert tier == "unknown"
+
+
+def test_sniff_reference_confidence_remote_unknown_on_network_error():
+    import urllib.error
+    with patch.object(run.urllib.request, "urlopen",
+                      side_effect=urllib.error.URLError("network down")):
+        tier, _ = run._sniff_reference_confidence_remote(
+            "https://github.com/some/repo", "2503.14432", "title",
+        )
+    assert tier == "unknown"
+
+
+def test_sniff_reference_confidence_remote_strips_git_suffix():
+    readme = b"# repo\nSee 2503.14432 for the paper."
+    captured_url: dict = {}
+    def fake_urlopen(req, timeout=None):
+        captured_url["url"] = req.full_url
+        return _fake_urlopen(readme)
+    with patch.object(run.urllib.request, "urlopen", side_effect=fake_urlopen):
+        run._sniff_reference_confidence_remote(
+            "https://github.com/some/repo.git", "2503.14432", "title",
+        )
+    # .git suffix stripped so the /readme endpoint resolves
+    assert "some/repo/readme" in captured_url["url"]
+    assert ".git" not in captured_url["url"].split("/repos/")[1].split("/")[1]
+
+
+# --- _run_pre_pr_fidelity_check integration ---------------------------------
+
+def test_pre_pr_fidelity_soft_skips_on_low_confidence_reference(tmp_path):
+    """The JARVIS regression: low-confidence reference triggers a soft-skip
+    with `pre_pr_fidelity_reference_mismatch` and does NOT invoke the
+    expensive fidelity Claude one-shot."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    ref_dir = tmp_path / "wd/reference"; ref_dir.mkdir()
+    (ref_dir / "README.md").write_text(
+        "# JARVIS\n\n[arXiv:2303.17580]\n\nMission of JARVIS: explore AGI.\n",
+        encoding="utf-8",
+    )
+    rec = _make_rec("2503.14432v2")
+    rec.paper_title = "PLAY2PROMPT: Zero-shot Tool Instruction Optimization for LLM Agents via Tool Play"
+
+    with patch.object(run, "_extract_reference_url_from_pr_body",
+                      return_value=("", "https://github.com/microsoft/JARVIS")), \
+         patch.object(run, "_clone_reference_repo",
+                      return_value=(True, ref_dir, "")), \
+         patch.object(run, "_run_claude_oneshot") as claude_mock:
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, _make_target(), workdir, "PR title", "PR body",
+            base_branch="main", self_review={"mode_cited": "Mode 2 (adapted port)"},
+        )
+
+    assert verdict["status"] == "pre_pr_fidelity_reference_mismatch"
+    assert verdict["reference_confidence"] == "low"
+    assert verdict["needs_judgment"] is False
+    # Critical: Claude one-shot must NOT be invoked when reference is low-confidence
+    claude_mock.assert_not_called()
+
+
+def test_pre_pr_fidelity_advisory_on_medium_confidence_reference(tmp_path):
+    """Medium-confidence reference: fidelity runs but reports advisory-only.
+    Even if the Claude one-shot flags items, needs_judgment must stay False
+    so publication proceeds."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    ref_dir = tmp_path / "wd/reference"; ref_dir.mkdir()
+    (ref_dir / "README.md").write_text(
+        "# Zero-shot Tool Instruction Optimization\n\n"
+        "Repository for zero-shot instruction optimization on tool play.",
+        encoding="utf-8",
+    )
+    rec = _make_rec("2503.14432v2")
+    rec.paper_title = "PLAY2PROMPT: Zero-shot Tool Instruction Optimization for LLM Agents via Tool Play"
+
+    with patch.object(run, "_extract_reference_url_from_pr_body",
+                      return_value=("", "https://github.com/some/repo")), \
+         patch.object(run, "_clone_reference_repo",
+                      return_value=(True, ref_dir, "")), \
+         patch.object(run, "_local_git_diff", return_value="diff --git a/x b/x\n+a\n"), \
+         patch.object(run, "_run_claude_oneshot",
+                      return_value=(True, '{"items":[{"status":"deviation","description":"x"}],"needs_judgment":true}')):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, _make_target(), workdir, "PR title", "PR body",
+            base_branch="main", self_review={"mode_cited": "Mode 2 (adapted port)"},
+        )
+
+    assert verdict["reference_confidence"] == "medium"
+    assert verdict["advisory_only"] is True
+    assert verdict["status"] == "pre_pr_fidelity_advisory"
+    # Flags surfaced but non-blocking:
+    assert verdict["items_count"] == 1
+    assert verdict["needs_judgment"] is False
+
+
+def test_pre_pr_fidelity_full_gate_on_high_confidence_reference(tmp_path):
+    """High-confidence reference (arxiv ID in README): fidelity gate runs
+    normally and needs_judgment is preserved from the Claude verdict."""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    ref_dir = tmp_path / "wd/reference"; ref_dir.mkdir()
+    (ref_dir / "README.md").write_text(
+        "# PLAY2PROMPT\n\n[arXiv:2503.14432](https://arxiv.org/abs/2503.14432)",
+        encoding="utf-8",
+    )
+    rec = _make_rec("2503.14432v2")
+    rec.paper_title = "PLAY2PROMPT"
+
+    with patch.object(run, "_extract_reference_url_from_pr_body",
+                      return_value=("", "https://github.com/real/play2prompt")), \
+         patch.object(run, "_clone_reference_repo",
+                      return_value=(True, ref_dir, "")), \
+         patch.object(run, "_local_git_diff", return_value="diff --git a/x b/x\n+a\n"), \
+         patch.object(run, "_run_claude_oneshot",
+                      return_value=(True, '{"items":[{"status":"deviation","description":"x"}],"needs_judgment":true}')):
+        verdict = run._run_pre_pr_fidelity_check(
+            rec, _make_target(), workdir, "PR title", "PR body",
+            base_branch="main", self_review={"mode_cited": "Mode 2 (adapted port)"},
+        )
+
+    assert verdict["reference_confidence"] == "high"
+    assert verdict["advisory_only"] is False
+    assert verdict["status"] == "pre_pr_fidelity_needs_judgment"
+    assert verdict["needs_judgment"] is True

@@ -8856,6 +8856,30 @@ def process_target(target: Target) -> dict:
         _record_verdict_fields(result, rec)
         log.info(f"  ✓ selected: [{rec.tier}] {rec.paper_title}")
 
+        # Catalog-reference-confidence probe (fires on every run, not just
+        # runs where the fidelity gate itself fires). Cheap GitHub Contents
+        # API sniff of the linked repo's README — emits confidence tier +
+        # signals into the run summary so catalog data-quality issues
+        # (paper-to-github mislinks like 2503.14432v2 → microsoft/JARVIS)
+        # can be tracked in aggregate independent of Mode / publish setting.
+        if rec.paper_github_url:
+            try:
+                cat_conf, cat_signals = _sniff_reference_confidence_remote(
+                    rec.paper_github_url, rec.arxiv_id, rec.paper_title,
+                )
+            except Exception as e:  # noqa: BLE001 — telemetry never fails a run
+                log.warning(f"  ⚠ catalog reference sniff raised: {e}")
+                cat_conf, cat_signals = "unknown", {}
+            result["catalog_reference_confidence"] = cat_conf
+            result["catalog_reference_signals"] = cat_signals
+            log.info(
+                f"  → catalog-reference-confidence: {cat_conf} "
+                f"(paper_github_url={rec.paper_github_url})"
+            )
+        else:
+            result["catalog_reference_confidence"] = "no_reference"
+            result["catalog_reference_signals"] = {}
+
         # Confabulation check on selection reasoning (see comment in the
         # skipped-by-verification branch). Runs while workdir is still
         # available; step-summary renderer picks it up.
@@ -11095,6 +11119,178 @@ def _extract_reference_url_from_pr_body(
     return arxiv_id, ""
 
 
+_REFERENCE_TITLE_STOPWORDS = frozenset({
+    "paper", "with", "from", "this", "that", "into", "using", "based",
+    "large", "small", "model", "models", "language", "learning", "framework",
+    "system", "systems", "approach", "method", "methods", "study", "novel",
+    "efficient", "effective", "better", "generic", "general",
+})
+
+
+def _arxiv_bare_id(arxiv_id: str) -> str:
+    """Strip the version suffix from an arxiv ID (``2503.14432v2`` → ``2503.14432``)."""
+    if not arxiv_id:
+        return ""
+    return arxiv_id.strip().lower().split("v")[0]
+
+
+def _arxiv_id_signals_in_text(text: str, arxiv_id: str) -> bool:
+    """Whether ``text`` mentions ``arxiv_id`` via bare/v-suffixed form or an arxiv URL."""
+    if not text or not arxiv_id:
+        return False
+    bare = _arxiv_bare_id(arxiv_id)
+    if not bare:
+        return False
+    pattern = rf"(?:arxiv\.org/(?:abs|pdf)/)?{re.escape(bare)}(?:v\d+)?\b"
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+
+def _score_reference_confidence(
+    ref_dir: Path,
+    arxiv_id: str,
+    paper_title: str,
+) -> tuple[str, dict]:
+    """Score whether the cloned reference repo actually implements the paper.
+
+    Returns ``(tier, signals)`` where tier is one of:
+
+    - ``"high"``: arxiv ID appears in README, CITATION file, or the top-3
+      largest .py files. Fidelity gate runs strict.
+    - ``"medium"``: paper-title tokens (≥3 unique ≥4-char non-stopwords)
+      appear in the README. Fidelity gate runs but reports advisory-only.
+    - ``"low"``: no signals — likely a catalog mislink. Fidelity soft-skips
+      as ``pre_pr_fidelity_reference_mismatch`` and the publication proceeds.
+
+    Motivating case: paper ``2503.14432v2`` (PLAY2PROMPT) had a catalog
+    reference of ``microsoft/JARVIS``, but that repo self-identifies with
+    arxiv ``2303.17580`` (HuggingGPT). Comparing PLAY2PROMPT code against
+    HuggingGPT flagged every legitimate feature as fabrication and drove
+    a false-positive ``skipped_fidelity_fabrication_after_patch``.
+    """
+    signals: dict = {
+        "readme_arxiv_id": False,
+        "citation_arxiv_id": False,
+        "code_arxiv_id": False,
+        "readme_title_tokens": False,
+        "title_tokens_matched": 0,
+    }
+    if not ref_dir or not ref_dir.exists() or not arxiv_id:
+        return "low", signals
+
+    readme_text = ""
+    for candidate in ("README.md", "README.rst", "README.txt", "readme.md", "Readme.md", "README"):
+        readme_path = ref_dir / candidate
+        if readme_path.exists() and readme_path.is_file():
+            try:
+                readme_text = readme_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                readme_text = ""
+            break
+
+    if readme_text and _arxiv_id_signals_in_text(readme_text, arxiv_id):
+        signals["readme_arxiv_id"] = True
+
+    for candidate in ("CITATION.cff", "CITATION.bib", "CITATION", "citation.cff", "citation.bib"):
+        cite_path = ref_dir / candidate
+        if cite_path.exists() and cite_path.is_file():
+            try:
+                cite_text = cite_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                cite_text = ""
+            if cite_text and _arxiv_id_signals_in_text(cite_text, arxiv_id):
+                signals["citation_arxiv_id"] = True
+                break
+
+    try:
+        py_files = sorted(
+            (p for p in ref_dir.rglob("*.py")
+             if p.is_file() and ".git" not in p.parts),
+            key=lambda p: p.stat().st_size,
+            reverse=True,
+        )[:3]
+        for py_path in py_files:
+            try:
+                py_text = py_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if _arxiv_id_signals_in_text(py_text, arxiv_id):
+                signals["code_arxiv_id"] = True
+                break
+    except OSError:
+        pass
+
+    if signals["readme_arxiv_id"] or signals["citation_arxiv_id"] or signals["code_arxiv_id"]:
+        return "high", signals
+
+    if readme_text and paper_title:
+        tokens = {w for w in _title_words(paper_title) if w not in _REFERENCE_TITLE_STOPWORDS}
+        readme_lower = readme_text.lower()
+        matched = sum(1 for tok in tokens if tok in readme_lower)
+        signals["title_tokens_matched"] = matched
+        if matched >= 3:
+            signals["readme_title_tokens"] = True
+            return "medium", signals
+
+    return "low", signals
+
+
+def _sniff_reference_confidence_remote(
+    github_url: str,
+    arxiv_id: str,
+    paper_title: str,
+    timeout_s: float = 10.0,
+) -> tuple[str, dict]:
+    """Cheap GitHub-Contents-API sniff without a full clone.
+
+    Companion to ``_score_reference_confidence``, used to emit
+    ``catalog_reference_confidence`` on every run summary — even runs where
+    the fidelity gate never fires (Mode 3, publish=branch, no reference
+    URL). Fetches only the repository's default README; falls back to
+    ``"unknown"`` on any network/parse failure.
+    """
+    signals: dict = {
+        "readme_arxiv_id": False,
+        "readme_title_tokens": False,
+        "title_tokens_matched": 0,
+    }
+    if not github_url or "github.com/" not in github_url:
+        return "unknown", signals
+    match = re.match(r"https?://github\.com/([^/#?]+/[^/#?]+)", github_url)
+    if not match:
+        return "unknown", signals
+    slug = match.group(1).rstrip("/")
+    if slug.endswith(".git"):
+        slug = slug[:-4]
+
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{slug}/readme",
+            headers={"Accept": "application/vnd.github.raw",
+                     "User-Agent": "outrider-reference-sniff"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            readme_text = resp.read().decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        return "unknown", signals
+
+    if not readme_text:
+        return "low", signals
+
+    if _arxiv_id_signals_in_text(readme_text, arxiv_id):
+        signals["readme_arxiv_id"] = True
+        return "high", signals
+
+    if paper_title:
+        tokens = {w for w in _title_words(paper_title) if w not in _REFERENCE_TITLE_STOPWORDS}
+        matched = sum(1 for tok in tokens if tok in readme_text.lower())
+        signals["title_tokens_matched"] = matched
+        if matched >= 3:
+            signals["readme_title_tokens"] = True
+            return "medium", signals
+
+    return "low", signals
+
+
 def _clone_reference_repo(url: str, workdir: Path) -> tuple[bool, Path | None, str]:
     """Shallow-clone ``url`` into ``workdir/reference``. Returns
     (success, path, error_message). The clone is depth-1 since the audit
@@ -11426,6 +11622,41 @@ def _run_pre_pr_fidelity_check(
         log.warning(f"  ⚠ pre-PR fidelity clone failed: {err}")
         return verdict
 
+    # Reference-impl sanity check: does the cloned repo actually self-identify
+    # as an implementation of this paper? When a catalog mislink points at an
+    # unrelated repo (observed: 2503.14432v2 → microsoft/JARVIS, which
+    # self-identifies with arxiv 2303.17580), a full fidelity comparison
+    # against the wrong code flags every legitimate feature as fabrication.
+    confidence, ref_signals = _score_reference_confidence(
+        ref_dir, rec.arxiv_id, rec.paper_title,
+    )
+    verdict["reference_confidence"] = confidence
+    verdict["reference_signals"] = ref_signals
+    log.info(
+        f"  → reference-impl confidence: {confidence} "
+        f"(readme_arxiv={ref_signals.get('readme_arxiv_id', False)}, "
+        f"citation_arxiv={ref_signals.get('citation_arxiv_id', False)}, "
+        f"code_arxiv={ref_signals.get('code_arxiv_id', False)}, "
+        f"title_tokens={ref_signals.get('title_tokens_matched', 0)})"
+    )
+    if confidence == "low":
+        verdict["status"] = "pre_pr_fidelity_reference_mismatch"
+        log.warning(
+            f"  ⚠ pre-PR fidelity: reference {reference_url} shows no "
+            f"evidence of implementing arxiv:{rec.arxiv_id}; soft-skipping "
+            f"the fidelity gate (publication proceeds; catalog data-quality "
+            f"issue surfaced in telemetry)"
+        )
+        return verdict
+
+    advisory_only = (confidence == "medium")
+    if advisory_only:
+        log.info(
+            f"  → pre-PR fidelity: medium-confidence reference "
+            f"(title-token match only); running in advisory mode "
+            f"(flags surfaced but non-blocking)"
+        )
+
     diff = _local_git_diff(workdir, base_branch)
     if not diff:
         verdict["status"] = "pre_pr_fidelity_failed_no_diff"
@@ -11467,21 +11698,34 @@ def _run_pre_pr_fidelity_check(
         return verdict
 
     coverage_section = _render_coverage_matrix(matrix, audit_anchor="reference")
-    needs_judgment = bool(matrix.get("needs_judgment", False))
+    raw_needs_judgment = bool(matrix.get("needs_judgment", False))
+
+    # Advisory-mode: under medium-confidence reference, flags are surfaced
+    # to the team but don't block publication — the reference is likely the
+    # right paper (title tokens match) but doesn't self-identify strongly
+    # enough to trust the flag count as ground truth.
+    effective_needs_judgment = raw_needs_judgment and not advisory_only
+
+    if advisory_only and raw_needs_judgment:
+        status = "pre_pr_fidelity_advisory"
+    elif effective_needs_judgment:
+        status = "pre_pr_fidelity_needs_judgment"
+    else:
+        status = "pre_pr_fidelity_clean"
 
     verdict.update({
-        "needs_judgment": needs_judgment,
+        "needs_judgment": effective_needs_judgment,
         "items_count": len(matrix.get("items", [])),
         "coverage_section": coverage_section,
         "matrix": matrix,
-        "status": (
-            "pre_pr_fidelity_needs_judgment" if needs_judgment
-            else "pre_pr_fidelity_clean"
-        ),
+        "advisory_only": advisory_only,
+        "status": status,
     })
     log.info(
         f"  ✓ pre-PR fidelity: {verdict['items_count']} items, "
-        f"needs_judgment={needs_judgment}"
+        f"needs_judgment={effective_needs_judgment}"
+        + (f" (advisory-only; raw flag count was {matrix.get('items', [])})"
+           if advisory_only and raw_needs_judgment else "")
     )
     return verdict
 
