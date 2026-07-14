@@ -52,7 +52,19 @@ def test_source_anywhere_is_editable():
     assert _decision("scripts/run_thing.py") == "allowed"
 
 
-def test_build_and_ci_files_blocked_by_role_anywhere():
+def test_only_workflow_files_blocked_by_default():
+    # Fixed default block covers `.github/workflows/**` — the one path
+    # class where agent-authored edits could silently expand this run's
+    # own future agency on the fork (permissions, interest-id, secrets).
+    assert _decision(".github/workflows/ci.yml") == "blocked"
+    assert _decision(".github/workflows/outrider.yml") == "blocked"
+
+    # Everything else that used to be role-blocked (Dockerfiles,
+    # dependency manifests, shell scripts, lockfiles) is now ALLOWED —
+    # human review is the safety layer for those, and treating them as
+    # role-blocked generated false negatives across every fork we
+    # touched (uv.lock churn during dep add, requirements.txt updates
+    # for new modules, .gitignore additions for training pipelines).
     for p in [
         "Dockerfile",
         "docker/eval_stage/Dockerfile",
@@ -64,20 +76,30 @@ def test_build_and_ci_files_blocked_by_role_anywhere():
         "setup.py",
         "pyproject.toml",
         "poetry.lock",
-        ".github/workflows/ci.yml",
+        "uv.lock",
+        ".gitignore",
+        ".github/dependabot.yml",  # non-workflow file under .github/
     ]:
-        assert _decision(p) == "blocked", p
+        assert _decision(p) == "allowed", p
 
 
-def test_github_block_overrides_python_allow():
-    # A .py under .github must stay blocked even though *.py is allowlisted.
-    assert _decision(".github/scripts/helper.py") == "blocked"
+def test_workflow_block_still_overrides_python_allow():
+    # A .py under .github/workflows/ must stay blocked even though the
+    # default allowlist matches everything.
+    assert _decision(".github/workflows/scripts/helper.py") == "blocked"
+    # But .py under .github/ that is not a workflow file is no longer
+    # blocked — the old blanket `.github/**` block was too broad.
+    assert _decision(".github/scripts/helper.py") == "allowed"
 
 
-def test_prod_yaml_not_editable_via_allowlist():
-    # Not blocked by directory anymore, but not allowlisted either.
-    assert _decision("pipelines/spatialvqa.yaml") == "rejected"
-    assert _decision("config/settings.yaml") == "rejected"
+def test_config_yaml_now_editable_by_default():
+    # Under the permissive default, config YAML is allowed. The old
+    # allowlist rejected these as top-N false negatives (lm-eval task
+    # registrations, ultralytics model configs, method_comparison
+    # experiment specs).
+    assert _decision("pipelines/spatialvqa.yaml") == "allowed"
+    assert _decision("config/settings.yaml") == "allowed"
+    assert _decision("lm_eval/tasks/holmes/holmes.yaml") == "allowed"
 
 
 # ── 2. AST helpers + invocation check ──────────────────────────────────────

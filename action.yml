@@ -144,10 +144,25 @@ inputs:
     default: '7'
   guardrails-allowlist:
     description: |
-      Comma-separated extra path globs Claude Code may touch, ADDED ON TOP
-      OF the defaults (`*.py`, `.remyx-recommendation/**`, `**/*.md`).
-      Extends the defaults — it does not replace them. Matching is
-      case-insensitive. Most repos won't need this.
+      DEPRECATED (v1.7.24) — no-op. Path allowlisting is permissive-by-
+      default; the coordination-issue + PR-review + integration-check
+      layers replace the narrow allowlist that earlier versions used.
+      Setting this input logs a deprecation warning and is otherwise
+      ignored. Removal planned in v2. Use `guardrails-blocklist` if you
+      need explicit file protection.
+    required: false
+    default: ''
+  guardrails-blocklist:
+    description: |
+      Comma-separated path globs the coding agent must NOT touch, ADDED
+      ON TOP OF the fixed default block (`.github/workflows/**`, which
+      guards against agent-authored edits that would silently expand
+      this run's own future agency). Empty by default — the standard
+      operating model relies on human review + coordination-issue-first
+      policy for legitimacy checks, not on path pattern matching. Set
+      this for defense-in-depth on teams with policy requirements —
+      e.g. `secrets/**`, `*.lock`, or `Dockerfile*`. Matches take
+      precedence over the (now-permissive) allowlist.
     required: false
     default: ''
   test-integration-policy:
@@ -192,12 +207,16 @@ inputs:
   claude-timeout:
     description: |
       Wall-clock seconds for the Claude Code agent calls (preflight
-      routing + implementation). Large repos can exceed the old 600s;
-      default is 900. Bump it for very large codebases or slower non-
-      default backends; lower it to cap cost. Both stages share the
-      same ceiling so a single knob covers per-dispatch budget tuning.
+      routing + implementation). Default raised to 1500s in v1.7.24
+      (previously 900s) — GLM sessions with staged-synthesis routinely
+      reach 15-20 min, and users triggering runs without prior tuning
+      were hitting the old 15-min ceiling. Opus refinement sits
+      comfortably under 25 min at the new default. Both stages share
+      the same ceiling so a single knob covers per-dispatch budget
+      tuning. Bump for very large codebases or slower non-default
+      backends; lower to cap cost.
     required: false
-    default: '900'
+    default: '1500'
   lead-content:
     description: |
       Optional scoped implementation spec (verbatim LEAD content from a
@@ -509,6 +528,7 @@ runs:
         INPUT_DRAFT_MODE: ${{ inputs.draft-mode }}
         INPUT_RATE_LIMIT_DAYS: ${{ inputs.rate-limit-days }}
         INPUT_GUARDRAILS_ALLOWLIST: ${{ inputs.guardrails-allowlist }}
+        INPUT_GUARDRAILS_BLOCKLIST: ${{ inputs.guardrails-blocklist }}
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}

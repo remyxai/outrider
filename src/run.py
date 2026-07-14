@@ -104,27 +104,24 @@ RELEVANCE_TIER_FLOOR = {
 
 TIER_RANK = {"high": 3, "moderate": 2, "low": 1, "noise": 0, "near-random": 0}
 
-# Paths Claude Code is allowed to create/modify. Customers can extend
-# via the `guardrails-allowlist` input on the action (comma-separated).
+# Default allowlist: permissive. Human review is in the loop for every
+# landed diff — the coordination-issue + PR-review layers upstream, and
+# the `check_integration()` / `stub_density` / `diff_risk_score` gates
+# downstream, replace the narrow allowlist that earlier versions used.
 #
-# Permissive on the target package because the agent needs to add small
-# wiring edits to existing files (e.g. a 3-line hook in evaluation.py) —
-# the post-hoc check_integration() validator enforces that at least one
-# newly-added callable is invoked from another changed file (rejecting
-# scaffold-shaped runs where new code is defined but never called).
-# Python source anywhere in the repo is editable: a wiring edit has to be
-# able to reach the real call site, which often lives outside the target
-# package (a pipeline/stage driver, an entrypoint module, etc.), and we
-# don't want to hard-code any one repo's directory layout. Infra files that
-# happen to sit alongside source — container builds, shell scripts,
-# dependency/build manifests, CI config — are blocked by ROLE in
-# ALWAYS_BLOCKED, which takes precedence.
-DEFAULT_ALLOWLIST_GLOBS = [
-    "*.py",
-    ".remyx-recommendation/**",
-    "**/*.md",               # Markdown anywhere (README, CHANGELOG, docs/,
-                             # ADR notes). Diff is text-only and reviewable.
-]
+# The old default (`*.py` + `.remyx-recommendation/**` + `**/*.md`)
+# surfaced in production as the top false-negative: legitimate drafts
+# rejected on canonical extension points (task YAML in lm-evaluation-
+# harness, adapter JSON in peft's method_comparison, .gitignore updates
+# in every training-pipeline branch, uv.lock regeneration). Every new
+# fork required a different `guardrails-allowlist` extension; the
+# whack-a-mole didn't add safety on top of human review.
+#
+# Teams that want strict blocking configure it explicitly via
+# `guardrails-blocklist`. `ALWAYS_BLOCKED` below keeps just one entry —
+# workflow files that would silently expand this run's own future
+# agency on the fork.
+DEFAULT_ALLOWLIST_GLOBS = ["**/*"]
 
 # Cap on number of newly-created .py files in the target package. A
 # real integration adds one module, sometimes two; anything beyond
@@ -148,28 +145,23 @@ PR_TITLE_PREFIX = "[Remyx Recommendation]"
 _ANTHROPIC_BILLING_URL = "https://console.anthropic.com/settings/billing"
 _ANTHROPIC_KEYS_URL = "https://console.anthropic.com/settings/keys"
 
-# Files that are NEVER allowed to be touched. Blocked by ROLE (filename /
-# type), not by directory, so the policy doesn't encode any one repo's
-# layout: a Dockerfile is off-limits whether it sits at the root, under
-# docker/, or anywhere else. `*` crosses `/` in path_matches_glob, so each
-# pattern catches the file at the repo root and nested at any depth. This
-# is checked before the allowlist and takes precedence, so even though
-# `*.py` is allowlisted, build scripts and dependency manifests stay
-# protected. (Replaces the old directory-based `docker/**` / `pipelines/**`
-# / `config/**` blanket blocks, which were overfit to one repo's tree and
-# locked out the stage drivers that are often the real call site.)
+# Files that are NEVER allowed to be touched, even under a permissive
+# allowlist. One entry: workflow files under `.github/workflows/**`.
+#
+# Rationale: an agent editing its own workflow file is the one class of
+# change that compounds silently across future runs — expanding
+# `permissions:`, swapping the `interest-id`, removing the concurrency
+# group, or exfiltrating secrets via a new step. Every other path
+# (Dockerfiles, dependency manifests, shell scripts, lockfiles) is
+# surfaced to human review in the standard PR diff and doesn't affect
+# future runs' agency, so we don't guard them by default.
+#
+# Teams that want tighter blocking add entries via the
+# `guardrails-blocklist` input. Matches take precedence over the
+# allowlist (checked first in `validate_changes`).
 ALWAYS_BLOCKED = [
-    ".github/**",            # CI / workflow config (GitHub-standard location)
-    "*Dockerfile",           # container build recipes, anywhere
-    "*Dockerfile.*",
-    "*.dockerfile",
-    "*.sh",                  # shell scripts (entrypoints, build hooks), anywhere
-    "*requirements*.txt",    # pip dependency manifests, anywhere
-    "setup.py",
-    "setup.cfg",
-    "pyproject.toml",
-    "MANIFEST.in",
-    "*.lock",                # lockfiles (poetry.lock, uv.lock, …)
+    ".github/workflows/**",  # Agent-authored workflow edits could silently
+                             # expand this run's own future agency on the fork.
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1511,7 +1503,20 @@ class Target:
     #                       PR at all). Equivalent to the old
     #                       draft_on_test_failure=False behavior.
     draft_mode: str = "always"
+    # DEPRECATED — path allowlisting is now permissive-by-default. Input is
+    # still parsed for backwards compat with existing customer workflows;
+    # extending it is a no-op (default allowlist already covers everything).
+    # Removal planned in v2.
     guardrails_allowlist: list[str] = field(default_factory=list)
+    # Comma-separated glob patterns that the coding agent must not touch,
+    # ADDED ON TOP OF `ALWAYS_BLOCKED` (which is currently just
+    # `.github/workflows/**`). Empty by default — the standard operating
+    # model relies on human review + coordination-issue-first policy for
+    # legitimacy checks, not on path pattern matching. Set this to opt
+    # into defense-in-depth for teams with policy requirements: e.g.
+    # `secrets/**` for anything sensitive, `*.lock` if lockfile churn is
+    # unwanted, `Dockerfile*` if base-image changes should be human-only.
+    guardrails_blocklist: list[str] = field(default_factory=list)
     # Test-integration gate policy:
     #   "strict" (default) — gate failure routes to Issue (current behavior)
     #   "soft"             — gate failure opens draft PR with warning section
@@ -8081,27 +8086,46 @@ def path_matches_glob(path: str, patterns: list[str]) -> bool:
 
 
 def effective_allowlist(target: Target, package: str) -> list[str]:
-    """The default allowlist globs (with `{package}` filled in) PLUS any
-    extra globs the customer passed via `guardrails-allowlist`.
+    """Default allowlist globs (with ``{package}`` filled in), plus any
+    ``guardrails-allowlist`` extras.
 
-    The customer input EXTENDS the defaults — it does not replace them. The
-    old `target.guardrails_allowlist or [defaults]` short-circuit silently
-    dropped the defaults (`.remyx-recommendation/**`, `*.py`, `README.md`)
-    the moment any extra glob was supplied, which then flagged the agent's
-    own scaffolding files as violations.
+    As of v1.7.24 the default is permissive (``["**/*"]``) and the
+    allowlist extension is a no-op — every path matches. Retained as a
+    function boundary for backwards compat with call sites and tests;
+    the returned list is still passed through to
+    :func:`path_matches_glob` in :func:`validate_changes`, which
+    short-circuits ``True`` for any input path.
+
+    The old strict default (``*.py`` + ``.remyx-recommendation/**`` +
+    ``**/*.md``) surfaced as the top false-negative in production:
+    canonical extension points (task YAML, adapter JSON, .gitignore,
+    lockfiles) were rejected while human review remained the actual
+    safety layer. See :data:`DEFAULT_ALLOWLIST_GLOBS`.
     """
     base = [g.format(package=package) for g in DEFAULT_ALLOWLIST_GLOBS]
     extra = [g for g in (target.guardrails_allowlist or []) if g not in base]
     return base + extra
 
 
+def effective_blocklist(target: Target) -> list[str]:
+    """Composite blocklist: :data:`ALWAYS_BLOCKED` extended by the
+    customer's ``guardrails-blocklist`` input (both may be empty).
+
+    Blocklist matches take precedence over the allowlist in
+    :func:`validate_changes` — a path that matches any blocklist glob
+    is rejected even if the allowlist would accept it.
+    """
+    return list(ALWAYS_BLOCKED) + list(target.guardrails_blocklist or [])
+
+
 def validate_changes(workdir: Path, target: Target, package: str) -> tuple[bool, list[str]]:
     """Returns (passed_allowlist, violations)."""
     allowlist = effective_allowlist(target, package)
+    blocklist = effective_blocklist(target)
     paths = changed_files(workdir)
     violations = []
     for p in paths:
-        if path_matches_glob(p, ALWAYS_BLOCKED):
+        if path_matches_glob(p, blocklist):
             violations.append(f"BLOCKED: {p}")
             continue
         if not path_matches_glob(p, allowlist):
@@ -9857,11 +9881,12 @@ def process_target(target: Target) -> dict:
                 )
                 # The former substitution guard fired here on
                 # `shape in ("replacement", "simplification")` and short-
-                # circuited to Issue. Removed: the workflow's path allowlist
-                # (`DEFAULT_ALLOWLIST_GLOBS`) already blocks dep files, and
-                # `check_integration()` measures oversized existing-file
-                # edits and orphan additions on the actual diff — replacing
-                # the shape label with measured evidence.
+                # circuited to Issue. Removed: `check_integration()` measures
+                # oversized existing-file edits and orphan additions on the
+                # actual diff — replacing the shape label with measured
+                # evidence. (In v1.7.24 path allowlisting also went
+                # permissive-by-default, so it no longer serves the belt-
+                # and-braces role this comment assumed.)
                 shape = (selection.get("integration_shape") or "addition").lower().strip()
                 result["selection_integration_shape"] = shape
                 result["selection_contract_match"] = (
@@ -10845,6 +10870,22 @@ def build_target_from_env() -> Target:
         if guardrails_raw
         else []
     )
+    if guardrails_allowlist:
+        log.warning(
+            "[deprecation] guardrails-allowlist input is now a no-op — "
+            "path allowlisting is permissive-by-default as of v1.7.24 "
+            "(human review + integration/stub-density gates replace it). "
+            "Use guardrails-blocklist if you need explicit file protection. "
+            "Removal planned in v2. Received: %s",
+            guardrails_allowlist,
+        )
+
+    guardrails_blocklist_raw = _optional_env("INPUT_GUARDRAILS_BLOCKLIST", "")
+    guardrails_blocklist = (
+        [p.strip() for p in guardrails_blocklist_raw.split(",") if p.strip()]
+        if guardrails_blocklist_raw
+        else []
+    )
 
     test_integration_policy = _optional_env(
         "INPUT_TEST_INTEGRATION_POLICY", "strict"
@@ -10856,7 +10897,11 @@ def build_target_from_env() -> Target:
         )
         sys.exit(2)
 
-    timeout_raw = _optional_env("INPUT_CLAUDE_TIMEOUT", "900")
+    # Default raised from 900s to 1500s in v1.7.24 — GLM sessions with
+    # staged-synthesis routinely reach 15-20 min, and users triggering
+    # runs without prior tuning were hitting the 15-min ceiling. Opus
+    # refinement runs sit comfortably under 25 min at the new default.
+    timeout_raw = _optional_env("INPUT_CLAUDE_TIMEOUT", "1500")
     try:
         claude_timeout_s = int(timeout_raw)
     except ValueError:
@@ -10877,6 +10922,7 @@ def build_target_from_env() -> Target:
         rate_limit_days=rate_limit_days,
         draft_mode=draft_mode,
         guardrails_allowlist=guardrails_allowlist,
+        guardrails_blocklist=guardrails_blocklist,
         test_integration_policy=test_integration_policy,
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
