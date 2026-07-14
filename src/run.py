@@ -6004,11 +6004,27 @@ def write_spec_bundle(
     lead_content_raw = (os.environ.get("INPUT_LEAD_CONTENT") or "").strip()
     lead_content_override, lead_tool_response = resolve_lead_content(lead_content_raw)
     if lead_tool_response is not None:
-        log.info(
+        log_msg = (
             f"  → lead-content routed via {lead_tool_response.connector} "
             f"connector: status={lead_tool_response.status} "
             f"latency={lead_tool_response.latency_ms:.0f}ms"
         )
+        # Surface the failure detail on any non-ok status so diagnostic isn't
+        # a re-run away. Connectors fall through gracefully to the raw URL,
+        # so the coding session proceeds — but without this, ops loses sight
+        # of WHY the connector failed (was it auth, not-found, rate-limit,
+        # a GraphQL error, or an unclassified HTTP failure?).
+        if lead_tool_response.status != "ok":
+            detail_parts: list[str] = []
+            if lead_tool_response.error_code:
+                detail_parts.append(f"error_code={lead_tool_response.error_code}")
+            if lead_tool_response.inline_snippet:
+                # Truncate — GraphQL error payloads and 4xx bodies can be long.
+                truncated = lead_tool_response.inline_snippet.replace("\n", " ")[:200]
+                detail_parts.append(f"message={truncated!r}")
+            if detail_parts:
+                log_msg += " · " + " · ".join(detail_parts)
+        log.info(log_msg)
     effective_experiment = lead_content_override or (rec.suggested_experiment or "(none)")
     (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
         paper_title=rec.paper_title,
