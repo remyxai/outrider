@@ -1,19 +1,26 @@
-name: Outrider daily (branch-mode, GLM)
+name: Outrider daily (branch-mode, drafter)
 
-# Continuous exploration companion to outrider.yml. Dispatches once daily
-# under publish=branch on the z.ai GLM backend — no PR, no Issue, no
-# maintainer notification. Preflight-passed candidates land as fork branches
-# that the team reviews at its own cadence. Complementary to the weekly
-# Anthropic Opus run in outrider.yml, which stays the committed-tier
-# deployment.
+# Drafter role in the two-tier setup: high-frequency, cheap-model
+# exploration. Publishes as branch — no PR/Issue, no maintainer signal.
+# Every dispatch accumulates repo_intel.yaml (observed_landing_zones,
+# rejected_shapes, prior dispatches). Complements outrider-weekly-refine.yml
+# which promotes one of the accumulated branches to a ready-for-review PR
+# with layered context (start-from-ref + gap-analysis as lead-content +
+# staged-synthesis + Opus).
+#
+# Default: Anthropic Claude Haiku 4.5 (cheap, well-suited for extension-
+# point discovery + structural first drafts). Set ANTHROPIC_MODEL to
+# claude-sonnet-4-6 for higher-quality drafts, or wire the z.ai path per
+# docs/backends.md to use GLM-5.2 instead (both providers work; Anthropic
+# is the single-vendor default for onboarding simplicity).
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'   # daily 06:00 UTC; adjust cadence to workload
   workflow_dispatch: {}
 
 concurrency:
-  group: outrider-daily
+  group: outrider-drafter
   cancel-in-progress: false
 
 jobs:
@@ -25,12 +32,18 @@ jobs:
       issues: write
     env:
       REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
-      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZAI_API_KEY }}
-      ANTHROPIC_MODEL: glm-5.2
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_MODEL: claude-haiku-4-5
     steps:
       - uses: actions/checkout@v4
       - uses: ./
         with:
           interest-id: '29ca03e7-454d-446c-9941-32c96c53d95d'
           publish: branch
-          model-base-url: 'https://api.z.ai/api/anthropic'
+          # Drafter's distinctive defaults: accumulate intel, skip the
+          # research phase. Research is proportionate for the refiner
+          # (~$1-2 per dispatch, weekly cadence) but wastes cost at the
+          # drafter's daily frequency (~$28-56/week/fork extra vs the
+          # ~$8/week baseline drafter spend).
+          maintain-state: 'true'
+          staged-synthesis: 'false'
