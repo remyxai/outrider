@@ -13753,12 +13753,17 @@ def run_fidelity_audit(target: Target) -> dict:
     _remove_pr_label(target, pr_number, FIDELITY_LABEL_TRIGGER)
 
     result["items_count"] = len(matrix.get("items", []))
-    result["needs_judgment"] = needs_judgment
+    # Use the effective value — advisory_only suppresses the label + status
+    # gate so downstream chain phases see the same needs_judgment flag that
+    # actually drove the labeling decision above. The prior bare `needs_judgment`
+    # reference produced a NameError that crashed the fidelity-audit phase after
+    # the PR opened (atropos run 29357999483 · PR #16 · 2026-07-14).
+    result["needs_judgment"] = effective_needs_judgment
     result["coverage_summary"] = matrix.get("summary", "")
     result["pr_url"] = pr.get("html_url", "")
     log.info(
         f"  ✓ {result['status']}: {result['items_count']} items, "
-        f"needs_judgment={needs_judgment}"
+        f"needs_judgment={effective_needs_judgment}"
     )
     return result
 
