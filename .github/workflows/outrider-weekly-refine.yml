@@ -29,6 +29,10 @@ on:
         description: 'Optional branch name to pick, bypassing the heuristic. Useful for testing before a full week accumulates.'
         required: false
         default: ''
+      pick-override-arxiv:
+        description: 'Optional arxiv_id to pair with pick-override when the branch does not have a resolvable arxiv (SPEC.md is a runtime artifact, not persisted on the branch).'
+        required: false
+        default: ''
 
 concurrency:
   group: outrider-refiner
@@ -51,6 +55,7 @@ jobs:
           set -euo pipefail
           LOOKBACK_DAYS="${{ inputs.lookback-days || '7' }}"
           OVERRIDE="${{ inputs.pick-override || '' }}"
+          OVERRIDE_ARXIV="${{ inputs.pick-override-arxiv || '' }}"
           REPO="${GITHUB_REPOSITORY}"
 
           if [ -n "$OVERRIDE" ]; then
@@ -92,14 +97,31 @@ jobs:
             exit 0
           fi
 
-          # Pull arxiv_id from the branch's SPEC.md (deposited by the drafter's coding session)
-          ARXIV=$(gh api "repos/$REPO/contents/.remyx-recommendation/SPEC.md?ref=$BRANCH" \
-            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
-            | grep -oE 'arxiv[_ ]?id[^0-9]*[0-9]+\.[0-9]+(v[0-9]+)?' \
-            | head -1 | grep -oE '[0-9]+\.[0-9]+(v[0-9]+)?' || echo "")
+          # Resolve arxiv_id, in order of source reliability:
+          #   1. Explicit override input (unambiguous)
+          #   2. Intel yaml's observed_landing_zones (drafter writes it on landing)
+          #   3. Empty (LLM gap analysis handles unresolved case; downstream refinement
+          #      still needs a value, so we surface the miss to the operator)
+          if [ -n "$OVERRIDE_ARXIV" ]; then
+            ARXIV="$OVERRIDE_ARXIV"
+          else
+            ARXIV=$(gh api "repos/$REPO/contents/.remyx/repo_intel.yaml?ref=main" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
+              | awk -v b="$BRANCH" '
+                  /confirmed_by:/ {in_cb=1; next}
+                  in_cb && /arxiv:/ {arxiv=$2; gsub(/^[ ]*|[ ]*$/, "", arxiv)}
+                  in_cb && /branch:/ {branch=$2; gsub(/^[ ]*|[ ]*$/, "", branch); if (branch == b) {print arxiv; exit}}
+                  /^[^ ]/ {in_cb=0}
+                ' || echo "")
+          fi
 
           echo "→ picked branch: $BRANCH"
           echo "→ arxiv: ${ARXIV:-<unresolved>}"
+
+          if [ -z "$ARXIV" ]; then
+            echo "::error::arxiv_id could not be resolved for branch $BRANCH (checked intel yaml + override). Re-dispatch with pick-override-arxiv=<id>."
+            exit 1
+          fi
           echo "picked=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "arxiv=$ARXIV" >> "$GITHUB_OUTPUT"
 
@@ -113,57 +135,51 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PYEOF' > gap_analysis.md
-          import json, os, urllib.request, subprocess
+          import json, os, re, subprocess, textwrap, urllib.request
 
           repo = os.environ["REPO"]
           branch = os.environ["BRANCH"]
           arxiv = os.environ.get("ARXIV", "")
 
-          # Diff summary — files touched by the branch vs main
           diff = subprocess.check_output([
               "gh", "api", f"repos/{repo}/compare/main...{branch}",
               "--jq", "[.files[] | {status, additions, deletions, path: .filename}]"
           ], text=True).strip()
 
-          # Paper title from arxiv (if available)
           paper_title = "(unknown)"
           if arxiv:
               try:
                   req = urllib.request.Request(f"https://export.arxiv.org/api/query?id_list={arxiv}")
                   body = urllib.request.urlopen(req, timeout=15).read().decode()
-                  import re
                   m = re.search(r"<title>([^<]+)</title>", body)
                   if m and "arXiv.org" not in m.group(1):
                       paper_title = m.group(1).strip().replace("\n", " ")
               except Exception:
                   pass
 
-          prompt = f"""You are auditing an Outrider-drafted GLM branch against its source paper before an Opus refinement pass. Produce a structured gap analysis matching this exact template:
+          prompt_body = textwrap.dedent(f"""
+              You are auditing an Outrider-drafted GLM branch against its source paper before an Opus refinement pass. Produce a structured gap-analysis markdown with this shape:
 
-- Lead paragraph: what the branch attempted vs what the paper actually specifies (2-3 sentences)
-- ## Gap N — <short title>
-    - **File:** path:line
-    - **Current:** what the code does now
-    - **Paper (arxiv:{arxiv}):** what the paper specifies
-    - **Fix:** the specific replacement/addition needed
-- Repeat per gap
-- ## Acceptance criteria (bulleted list of verifiable outcomes)
+              * Lead paragraph naming what the branch attempted vs what the paper actually specifies (2-3 sentences)
+              * A section per gap: `## Gap N — <short title>` with fields for File (path:line), Current behavior, Paper (arxiv:{arxiv}) specification, and the specific Fix.
+              * Final `## Acceptance criteria` bulleted list of verifiable outcomes.
 
-Focus on MECHANISM-LEVEL divergences (wrong math, invented heuristics, missing paper rules, category errors) — not stylistic. If the branch is faithful, say so and list only cosmetic items.
+              Focus on MECHANISM-LEVEL divergences (wrong math, invented heuristics, missing paper rules, category errors) — not stylistic. If the branch is faithful, say so and list only cosmetic items.
 
-Branch: {branch}
-Paper: {paper_title} (arxiv:{arxiv})
-Files touched:
-{diff}
+              Branch: {branch}
+              Paper: {paper_title} (arxiv:{arxiv})
+              Files touched:
+              {diff}
 
-Now read the paper (arxiv HTML at https://arxiv.org/html/{arxiv}) and compare against the actual branch code (repo {repo}, ref {branch}). Emit the gap analysis in markdown."""
+              Read the paper (arxiv HTML at https://arxiv.org/html/{arxiv}) and compare against the actual branch code (repo {repo}, ref {branch}). Emit the gap analysis in markdown.
+              """).strip()
 
           req = urllib.request.Request(
               "https://api.anthropic.com/v1/messages",
               data=json.dumps({
                   "model": "claude-sonnet-4-6",
                   "max_tokens": 4096,
-                  "messages": [{"role": "user", "content": prompt}],
+                  "messages": [{"role": "user", "content": prompt_body}],
               }).encode(),
               headers={
                   "Content-Type": "application/json",
@@ -196,6 +212,7 @@ Now read the paper (arxiv HTML at https://arxiv.org/html/{arxiv}) and compare ag
         run: |
           set -euo pipefail
           gh workflow run outrider.yml \
+            --repo "$GITHUB_REPOSITORY" \
             --ref main \
             -f mode=recommend \
             -f provider=anthropic \

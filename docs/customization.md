@@ -119,7 +119,39 @@ When the agent is choosing among candidates, it has these read-only tools at han
 These tools are what make selection "structural fit" rather than keyword match.
 
 
-## 5. Common customization recipes
+## 5. Two-tier drafter / refiner setup (recommended default)
+
+Outrider ships with two companion workflow templates that split exploration and commitment across two schedules and two model tiers. This is the recommended shape for any repo you want the pipeline to run continuously on.
+
+### The two roles
+
+| Role | Cadence | Model | Publish | Distinctive defaults | Cost/run |
+|---|---|---|---|---|---|
+| **Drafter** ([`outrider-daily.yml`](../.github/workflows/outrider-daily.yml)) | Daily (or `*/15` for high frequency) | Anthropic Claude Haiku 4.5 | `branch` — no PR/Issue | `maintain-state=true`, `staged-synthesis=false` | ~$0.20-0.40 |
+| **Refiner** ([`outrider-weekly-refine.yml`](../.github/workflows/outrider-weekly-refine.yml)) | Weekly (Monday noon UTC) | Anthropic Claude Opus 4.8 | `pr` — opens draft PR + chain | `maintain-state=true`, `staged-synthesis=true` | ~$5-10 (incl. gap-gen + chain) |
+
+The drafter accumulates a pool of branches through the arxiv frontier — every dispatch adds an `observed_landing_zone` or `rejected_shape` to `.remyx/repo_intel.yaml`. The refiner picks one candidate from that pool each week, generates a targeted gap analysis via Sonnet 4.6, and dispatches an Opus refinement with the gap analysis piped in as `lead-content`. The refinement's chain (fidelity → convention → test) runs inline; terminal artifact is a ready-for-review draft PR.
+
+### Why the split
+
+- **Higher commit-to-PR rate on borderline cases.** With a drafter branch already anchoring the extension point + test scaffolding + landing-zone shape, Opus's preflight has more grounding to commit to PR-shape rather than defer to Issue.
+- **Cheap exploration of the arxiv frontier.** Daily drafter dispatches sample from an ever-growing candidate pool (arxiv adds ~200 ML papers/day); a single-shot refiner-only setup would need spec-generation to substitute for that breadth, and spec generators saturate on any given paper × repo pair while the arxiv corpus keeps growing.
+- **Compounding intel accumulation.** Even failed drafter branches (category errors, no-code-link candidates) contribute negative-space signal to `repo_intel.yaml` — future preflight decisions benefit from the accumulated observed / rejected shape history.
+
+### Onboarding
+
+Requires one secret: `ANTHROPIC_API_KEY`. Optional: `LINEAR_API_KEY` for the durable-state pattern (refiner can file gap analyses as Linear issues and read them back via URL), but the default setup passes the gap analysis inline as raw markdown so no Linear provisioning is needed.
+
+For customers with existing z.ai credits or Anthropic-outage hedging needs, either role can be routed at a different backend via `model-base-url` — see [`backends.md`](backends.md).
+
+### Manual triggers for testing
+
+Both workflows expose `workflow_dispatch` so you can run either role on demand:
+- Drafter: any workflow dispatch produces one branch immediately (bypasses the cron)
+- Refiner: `pick-override=<branch-name>` selects a specific branch, `pick-override-arxiv=<id>` provides the arxiv when it can't be resolved from `repo_intel.yaml` (useful before the drafter has landed a full week of dispatches)
+
+
+## 5.1. Common customization recipes
 
 | Goal | Set this |
 |---|---|
