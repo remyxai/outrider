@@ -4446,6 +4446,36 @@ def _arxiv_linked_issues(target: Target, state: str = "all") -> list[dict]:
     return out
 
 
+def _has_user_intent_override(target: Target) -> bool:
+    """True when the caller explicitly targeted this run at a specific
+    paper/branch and the discharge throttle should step aside.
+
+    The signals here match the post-selection intel-yaml re-pick guard
+    later in ``process_target`` — both are "is this work already tracked
+    somewhere" checks and should honor the same intent signals so the
+    canonical refinement flow (open GLM draft → dispatch Opus with
+    ``start-from-ref`` + ``lead-content``) doesn't short-circuit on the
+    paper the caller explicitly asked us to iterate on.
+
+      - ``pin_arxiv`` / ``search_method`` — caller named the paper.
+      - ``start-from-ref`` — caller passed an existing branch to compound
+        work on top of, which usually has an open PR from a prior draft.
+      - ``lead-content`` — caller provided targeted implementation
+        guidance, typically to close specific gaps on an existing draft.
+
+    ``search_method`` and ``pin_arxiv`` live on the Target dataclass;
+    ``start-from-ref`` and ``lead-content`` are read directly from the
+    action's env vars (they don't have Target fields; the coding-session
+    setup reads them there too).
+    """
+    return bool(
+        target.search_method
+        or target.pin_arxiv
+        or (os.environ.get("INPUT_START_FROM_REF") or "").strip()
+        or (os.environ.get("INPUT_LEAD_CONTENT") or "").strip()
+    )
+
+
 def _all_discharge_issues(target: Target) -> list[dict]:
     """Merged discharge set: Outrider Issues + maintainer arxiv-linked
     Issues. The dedup gate's input.
@@ -9550,14 +9580,7 @@ def process_target(target: Target) -> dict:
     # don't waste budget re-deriving it" regardless of who opened the
     # Issue.
     open_issues = _all_discharge_issues(target)
-    # Pin-method / pin-arxiv = user explicitly named the paper; their
-    # intent overrides the discharge throttle (which is otherwise a
-    # "don't keep re-recommending what Outrider already pitched" guard
-    # for the normal selection flow). Without this override, A/B-style
-    # re-runs, demo re-takes, and "improve the prior artifact" workflows
-    # would always skip with skipped_issue_exists. PR-collision check
-    # below stays active — that's a real safety property.
-    pin_override = bool(target.search_method or target.pin_arxiv)
+    pin_override = _has_user_intent_override(target)
     viable: list[Recommendation] = []
     dropped_low_conf = 0
     dropped_pr_exists = 0
@@ -9567,7 +9590,7 @@ def process_target(target: Target) -> dict:
             dropped_low_conf += 1
             continue
         c_branch = format_branch_name(c)
-        if existing_pr_for(target, c_branch):
+        if not pin_override and existing_pr_for(target, c_branch):
             dropped_pr_exists += 1
             continue
         if not pin_override:
