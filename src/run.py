@@ -15793,6 +15793,8 @@ def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[
     per-agent patterns + URLs lookup keyed on ``agent`` — the call site
     in ``_write_step_summary`` doesn't change.
     """
+    from agent_trajectory_analysis import analyze_agent_trajectory
+
     tail = (log_tail or "").lower()
     lines: list[str] = []
     if "credit balance is too low" in tail:
@@ -15834,9 +15836,30 @@ def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[
             "scheduled run will retry.\n"
         )
     elif tail:
-        lines.append("\n<details><summary>Claude agent failure tail</summary>\n")
-        lines.append(f"\n```\n{log_tail[:1500]}\n```\n")
-        lines.append("\n</details>\n")
+        # Analyze the trajectory for early-stage epistemic errors (a key
+        # finding from "Failure as a Process" — failures often begin within
+        # the first few execution steps due to incorrect assumptions).
+        diagnostic = analyze_agent_trajectory(log_tail, claude_calls)
+        if diagnostic and diagnostic.failure_class == "epistemic":
+            timing_label = {
+                "early": "🔴 Early-stage",
+                "mid": "🟡 Mid-stage",
+                "late": "⏸️ Late-stage",
+            }.get(diagnostic.onset_timing, "Unknown")
+            lines.append(f"\n> ### {timing_label} epistemic error detected\n>")
+            lines.append(f"> {diagnostic.signal}\n>")
+            lines.append(
+                "> This suggests the agent made an incorrect assumption about "
+                "the task or environment early on."
+            )
+            lines.append(
+                "> Consider clarifying the task description or providing "
+                "additional context in future runs.\n"
+            )
+        else:
+            lines.append("\n<details><summary>Claude agent failure tail</summary>\n")
+            lines.append(f"\n```\n{log_tail[:1500]}\n```\n")
+            lines.append("\n</details>\n")
     return lines
 
 
