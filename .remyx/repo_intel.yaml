@@ -1,0 +1,17 @@
+schema_version: 1
+fork: remyxai/outrider
+observed_landing_zones:
+- path: src/
+  shape_tags:
+  - unclassified
+  confirmed_by:
+  - arxiv: 2607.09510v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "_agent_failure_blocks() \u2192 _write_step_summary() \u2192\
+      \ main execution path in Outrider's GitHub Actions orchestrator"
+    branch: failure-as-a-process-an-anatomy-of-cli-coding-agent-trajecto
+    timestamp: '2026-07-15T08:00:03Z'
+  last_observed: '2026-07-15T08:00:03Z'
+rejected_shapes: []
+coordination_signals: []
+last_updated: '2026-07-15T08:00:03Z'
