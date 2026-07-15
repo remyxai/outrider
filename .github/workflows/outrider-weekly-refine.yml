@@ -62,18 +62,35 @@ jobs:
             echo "→ pick override: $OVERRIDE"
             BRANCH="$OVERRIDE"
           else
-            # Enumerate branches newer than the lookback window, skip main
-            # + refined/promotion-suffixed branches. Prefer most-recent.
+            # Enumerate ONLY drafter-known branches: pull the branch names
+            # recorded in .remyx/repo_intel.yaml's confirmed_by list — that's
+            # the drafter's own landing record and the authoritative source of
+            # "this branch came out of a drafter dispatch." Filtering the raw
+            # branch list on name pattern alone (the prior approach) let in
+            # inherited upstream branches on forks (dependabot/*, feat/*,
+            # etc.) that don't have arxiv_ids to resolve, producing hard errors
+            # at the arxiv-resolution gate below rather than picking a valid
+            # drafter candidate.
             SINCE=$(date -u -d "$LOOKBACK_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
-            BRANCH=$(gh api "repos/$REPO/branches?per_page=100" \
-              --jq --arg since "$SINCE" '
-                .[]
-                | select(.name != "main" and (.name | endswith("-refined-v2") | not))
-                | select(.name | test("(-refined|^refined|/refined|^remyx-recommendation/)"; "i") | not)
-                | .name' \
+            KNOWN_BRANCHES=$(gh api "repos/$REPO/contents/.remyx/repo_intel.yaml?ref=main" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
+              | awk '
+                  /confirmed_by:/ {in_cb=1; next}
+                  in_cb && /branch:/ {b=$2; gsub(/^[ ]*|[ ]*$/, "", b); print b}
+                  /^[^ ]/ {in_cb=0}
+                ' | sort -u)
+
+            if [ -z "$KNOWN_BRANCHES" ]; then
+              echo "::warning::No drafter-known branches in .remyx/repo_intel.yaml — nothing to promote yet"
+              echo "picked=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            BRANCH=$(echo "$KNOWN_BRANCHES" \
               | while read -r name; do
-                  # Pull last-commit date from the branch head; keep only branches
-                  # created/updated within the lookback window
+                  [ -z "$name" ] && continue
+                  # Pull last-commit date from the branch head; keep only
+                  # branches still on origin + within the lookback window
                   DATE=$(gh api "repos/$REPO/branches/$name" \
                     --jq '.commit.commit.committer.date' 2>/dev/null || echo "")
                   if [ -n "$DATE" ] && [ "$DATE" \> "$SINCE" ]; then
