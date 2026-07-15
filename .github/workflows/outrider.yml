@@ -11,6 +11,26 @@ on:
         description: 'pr (default) or branch — under branch mode, produces a fork branch without opening PR/Issue.'
         required: false
         default: 'pr'
+      # Declared so outrider-weekly-refine.yml (the refiner) can dispatch this
+      # runner: it pins a picked draft branch (start-from-ref), pipes a gap
+      # analysis in (lead-content), and turns on staged synthesis. Defaults
+      # match the action's own, so scheduled/manual runs are unchanged.
+      mode:
+        description: 'Run mode (recommend by default). The refiner dispatches recommend against a pinned paper + start-from-ref.'
+        required: false
+        default: 'recommend'
+      start-from-ref:
+        description: 'Optional base branch to build on top of (the refiner passes the picked drafter branch). Empty = default branch.'
+        required: false
+        default: ''
+      lead-content:
+        description: 'Optional inline markdown (e.g. a gap analysis) fed to the agent as leading context.'
+        required: false
+        default: ''
+      staged-synthesis:
+        description: 'Enable the multi-pass staged-synthesis flow (the refiner sets true). Empty/false = single-pass.'
+        required: false
+        default: 'false'
       provider:
         description: 'anthropic (default) or zai for GLM.'
         type: choice
@@ -73,4 +93,9 @@ jobs:
           github-token: ${{ steps.remyx-bot.outputs.token }}
           pin-arxiv: ${{ inputs.pin-arxiv }}
           publish: ${{ inputs.publish }}
+          # Forwarded so outrider-weekly-refine.yml can dispatch a refinement run.
+          mode: ${{ inputs.mode }}
+          start-from-ref: ${{ inputs.start-from-ref }}
+          lead-content: ${{ inputs.lead-content }}
+          staged-synthesis: ${{ inputs.staged-synthesis }}
           model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '' }}
