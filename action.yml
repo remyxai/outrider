@@ -348,6 +348,55 @@ inputs:
       that the Claude Code CLI reports is computed with Anthropic-rate
       pricing applied to the backend's tokens — it's an estimate, not a
       bill. Token counts remain accurate.
+
+      For the known backends `zai` / `moonshot`, prefer the `provider`
+      input below — it configures both this URL and the correct auth env
+      var (Bearer vs x-api-key) from a single field, and picks up the
+      right per-vendor secret without a fork-side case-switch. Use
+      `model-base-url` directly only for custom / on-prem endpoints not
+      covered by the `provider` shortlist.
+    required: false
+    default: ''
+  provider:
+    description: |
+      Which Anthropic-Messages-compatible backend to route the coding
+      agent at. Consolidates the auth-env + base-URL wiring that forks
+      previously duplicated in a workflow-level Configure step.
+
+      Recognized values:
+        - `` (empty, default): existing behavior — pass through
+          `model-base-url` as-is, no auth manipulation. Backward-compatible.
+        - `anthropic`: default Anthropic API. Requires `ANTHROPIC_API_KEY`
+          in the caller's env block.
+        - `zai`: z.ai GLM Coding Plan. Requires `ZAI_API_KEY` in the
+          caller's env block. Sets `ANTHROPIC_AUTH_TOKEN` (Bearer) and
+          `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`.
+        - `moonshot`: Moonshot Kimi. Requires `MOONSHOT_API_KEY` in the
+          caller's env block. Sets `ANTHROPIC_AUTH_TOKEN` (Bearer) and
+          `ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic`.
+        - `custom`: use `model-base-url` + caller-supplied auth env var
+          for anything not in the shortlist above.
+
+      Secrets aren't magically visible inside the composite action — the
+      caller MUST pass the required secret via the `env:` block on the
+      `- uses: remyxai/outrider@v1` step (see docs/backends.md for the
+      canonical shape). The action fails clean with a specific error if
+      the required secret env var is missing.
+    required: false
+    default: ''
+  model:
+    description: |
+      Optional model name — sets `ANTHROPIC_MODEL` for the Claude Code
+      subprocess. When set, cost telemetry looks up the specific per-model
+      rate in the backend rate table (see `_BACKEND_RATES` in src/run.py)
+      rather than falling back to the host's flagship-tier default.
+
+      Examples: `claude-opus-4-8`, `claude-haiku-4-5`, `glm-5.2`,
+      `glm-4.6`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`.
+
+      Empty (default) → the caller's own `ANTHROPIC_MODEL` env var wins if
+      set; otherwise the backend picks its own default and cost telemetry
+      uses the host's flagship-tier rates.
     required: false
     default: ''
   enable-cocoindex:
@@ -508,6 +557,71 @@ runs:
       run: |
         git config --global user.name "remyx-ai[bot]"
         git config --global user.email "289541483+remyx-ai[bot]@users.noreply.github.com"
+
+    - name: Configure backend from provider input
+      if: ${{ inputs.provider != '' }}
+      shell: bash
+      # Consolidates the per-fork Configure step that previously mapped
+      # `provider` → (auth env var, base URL, secret name). Runs only when
+      # the caller sets `provider`; empty (default) preserves existing
+      # behavior — model-base-url and auth env vars pass through untouched.
+      #
+      # Composite-action env inheritance: the caller's `env:` block on the
+      # `- uses: remyxai/outrider@v1` step propagates to every step here,
+      # so ANTHROPIC_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY (whichever
+      # the caller passed) are readable via os.environ / bash env directly.
+      # Writing to $GITHUB_ENV makes the resulting ANTHROPIC_AUTH_TOKEN /
+      # ANTHROPIC_BASE_URL visible to subsequent composite steps (including
+      # the recommend step that runs run.py).
+      env:
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
+      run: |
+        set -eu
+        case "$INPUT_PROVIDER" in
+          anthropic)
+            if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+              echo "::error::provider=anthropic requires ANTHROPIC_API_KEY in the caller's env block" >&2
+              exit 1
+            fi
+            # ANTHROPIC_API_KEY is already in the parent env — no override needed
+            ;;
+          zai)
+            if [ -z "${ZAI_API_KEY:-}" ]; then
+              echo "::error::provider=zai requires ZAI_API_KEY in the caller's env block" >&2
+              exit 1
+            fi
+            echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY" >> "$GITHUB_ENV"
+            echo "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic" >> "$GITHUB_ENV"
+            ;;
+          moonshot)
+            if [ -z "${MOONSHOT_API_KEY:-}" ]; then
+              echo "::error::provider=moonshot requires MOONSHOT_API_KEY in the caller's env block" >&2
+              exit 1
+            fi
+            echo "ANTHROPIC_AUTH_TOKEN=$MOONSHOT_API_KEY" >> "$GITHUB_ENV"
+            echo "ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic" >> "$GITHUB_ENV"
+            ;;
+          custom)
+            if [ -z "$INPUT_MODEL_BASE_URL" ]; then
+              echo "::error::provider=custom requires model-base-url to be set" >&2
+              exit 1
+            fi
+            if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+              echo "::error::provider=custom requires ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in the caller's env block" >&2
+              exit 1
+            fi
+            # model-base-url passes through via INPUT_MODEL_BASE_URL to run.py
+            ;;
+          *)
+            echo "::error::unknown provider '$INPUT_PROVIDER'; must be one of: anthropic, zai, moonshot, custom" >&2
+            exit 1
+            ;;
+        esac
+        if [ -n "$INPUT_MODEL" ]; then
+          echo "ANTHROPIC_MODEL=$INPUT_MODEL" >> "$GITHUB_ENV"
+        fi
 
     - name: Recommend + implement + open PR
       id: recommend

@@ -45,7 +45,7 @@ The job-level conditional `${{ inputs.provider == 'zai' && '' || secrets.ANTHROP
 
 ## Workflow template — per-dispatch provider + model switching
 
-The canonical pattern for A/B-comparing Anthropic vs a non-default backend on the same repo. `remyxai outrider setup-local` (CLI v0.4.3+) generates the two-provider variant of this (anthropic + zai); adding the `moonshot` `case` branch shown below is a one-line fork-side edit until CLI support for it lands:
+The canonical pattern for A/B-comparing Anthropic vs a non-default backend on the same repo, using the action's built-in `provider` input:
 
 ```yaml
 on:
@@ -72,54 +72,31 @@ on:
 jobs:
   recommend:
     runs-on: ubuntu-latest
-    env:
-      REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
-      # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL
-      # are set in the 'Configure provider auth' step below
-      # (auth env vars are mutually exclusive; ANTHROPIC_MODEL is
-      # optional and only set when the workflow_dispatch input is
-      # non-empty).
     steps:
-      - name: Configure provider auth
-        id: prov
-        shell: bash
-        env:
-          ANTHROPIC_API_KEY_SECRET: ${{ secrets.ANTHROPIC_API_KEY }}
-          ZAI_API_KEY_SECRET: ${{ secrets.ZAI_API_KEY }}
-          MOONSHOT_API_KEY_SECRET: ${{ secrets.MOONSHOT_API_KEY }}
-          MODEL_INPUT: ${{ inputs.model }}
-        run: |
-          case "${{ inputs.provider }}" in
-            zai)
-              echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY_SECRET" >> "$GITHUB_ENV"
-              echo "base_url=https://api.z.ai/api/anthropic" >> "$GITHUB_OUTPUT"
-              ;;
-            moonshot)
-              echo "ANTHROPIC_AUTH_TOKEN=$MOONSHOT_API_KEY_SECRET" >> "$GITHUB_ENV"
-              echo "base_url=https://api.moonshot.ai/anthropic" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_SECRET" >> "$GITHUB_ENV"
-              echo "base_url=" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
-          if [ -n "$MODEL_INPUT" ]; then
-            echo "ANTHROPIC_MODEL=$MODEL_INPUT" >> "$GITHUB_ENV"
-          fi
       - uses: remyxai/outrider@v1
+        env:
+          REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+          # Pass every backend's secret the workflow might select. The
+          # action reads only the one matching `provider`; the rest are
+          # ignored. Skip any secret your fork doesn't have configured.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
         with:
           interest-id: <uuid>
           pin-method: ${{ inputs.pin-method }}
-          model-base-url: ${{ steps.prov.outputs.base_url }}
+          provider: ${{ inputs.provider }}
+          model: ${{ inputs.model }}
 ```
 
 Key properties:
 
-- Default behavior unchanged: `provider=anthropic` (the default) sets `ANTHROPIC_API_KEY` and leaves `model-base-url` empty, so existing customers see no change
-- Single source of auth truth: the `Configure provider auth` step writes one and only one auth env var; subsequent steps inherit it
+- Default behavior unchanged: `provider=''` (unset) preserves the pre-v1.x action behavior — no auth manipulation, `model-base-url` passes through as-is
+- Auth resolution is the action's job: the action's Configure step picks the correct auth env var per provider (Bearer for zai/moonshot, x-api-key for anthropic) and sets `ANTHROPIC_BASE_URL` from a fixed per-provider map. No fork-side case-switch to maintain.
+- Fails clean if the required secret is missing: `provider=moonshot` with no `MOONSHOT_API_KEY` in the caller's env block errors before any Claude call
 - Per-dispatch switchable: dispatch with `provider=zai` or `provider=moonshot` to route through that vendor for one run; default cron runs stay on Anthropic
-- Model selection independent of provider: `--model glm-5.2` and `--model glm-4.6` both work with `--provider zai`; `--model kimi-k3` and `--model kimi-k2.7-code` both work with `--provider moonshot`; `--model claude-opus-4-8` and `--model claude-sonnet-4-6` both work with `--provider anthropic`
-- Adding a new backend later (Bedrock, Vertex) is a new `case` branch plus a base-URL mapping
+- Model selection independent of provider: `--model glm-5.2` and `--model glm-4.6` both work with `--provider zai`; `--model kimi-k3` and `--model kimi-k2.7-code` both work with `--provider moonshot`; `--model claude-opus-4-8` and `--model claude-sonnet-4-6` both work with `--provider anthropic`. Setting `--model` also gives per-model cost accuracy (see Cost telemetry below).
+- Custom / on-prem endpoints: set `provider: custom` + `model-base-url: <your-url>` + supply `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in env directly. The action's provider shortlist is a UX helper for the common cases; `custom` is the escape hatch for anything else.
 
 
 ## Cost telemetry
