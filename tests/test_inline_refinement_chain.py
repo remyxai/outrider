@@ -135,17 +135,45 @@ def test_chain_runs_all_phases_for_paper_anchored_audit(monkeypatch, audited_sta
 
 
 @pytest.mark.parametrize("skip_status", [
-    "fidelity_skipped_no_reference",
-    "fidelity_skipped_not_bot",
-    "fidelity_failed_clone",
+    "fidelity_skipped_no_pr",       # no PR → downstream also can't run
+    "fidelity_failed_claude",       # audit crashed → conservative short-circuit
+    "fidelity_failed_clone",        # audit crashed → conservative short-circuit
 ])
-def test_chain_short_circuits_when_fidelity_does_not_audit(monkeypatch, skip_status):
+def test_chain_short_circuits_when_fidelity_fails_or_has_no_pr(monkeypatch, skip_status):
     _base_env(monkeypatch)
     calls = _record_phases(monkeypatch, skip_status)
     chain = run.run_refinement_chain(run.Target(repo="owner/repo"), 42)
 
     assert [c[0] for c in calls] == ["fidelity"]  # convention/test never ran
     assert chain == {"pr_number": 42, "fidelity_status": skip_status}
+
+
+@pytest.mark.parametrize("skipped_status", [
+    "fidelity_skipped_no_reference",
+    "fidelity_skipped_not_bot",
+    "fidelity_skipped_reference_mismatch",
+])
+def test_chain_continues_when_fidelity_skipped_but_pr_exists(monkeypatch, skipped_status):
+    """Fidelity-skipped statuses (no_reference, not_bot, reference_mismatch)
+    mean the audit couldn't run against the paper's reference impl — but the
+    PR itself is unchanged and downstream phases don't depend on fidelity's
+    signal. Convention (PR-body rewrite) and test (pytest gate) must still
+    fire. Regression test for the atropos PR #18 case (2026-07-17): a Kimi
+    refinement pass on a paper whose reference URL was generic (`verl` —
+    doesn't back-reference the arxiv) got convention + test skipped, so the
+    PR shipped with unadapted body + no test-gate label transition."""
+    _base_env(monkeypatch)
+    calls = _record_phases(monkeypatch, skipped_status)
+    chain = run.run_refinement_chain(run.Target(repo="owner/repo"), 42)
+
+    assert [c[0] for c in calls] == ["fidelity", "convention", "test"]
+    assert chain == {
+        "pr_number": 42,
+        "fidelity_status": skipped_status,
+        "convention_status": "convention_aligned",
+        "test_status": "test_passed",
+        "draft_dropped": True,
+    }
 
 
 # ─── main(): recommend-mode continuation gated by chain_enabled ─────────────
