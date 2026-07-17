@@ -126,7 +126,7 @@ jobs:
               --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
               | awk -v b="$BRANCH" '
                   /confirmed_by:/ {in_cb=1; next}
-                  in_cb && /arxiv:/ {arxiv=$2; gsub(/^[ ]*|[ ]*$/, "", arxiv)}
+                  in_cb && /arxiv:/ {arxiv=$NF; gsub(/^[ ]*|[ ]*$/, "", arxiv)}
                   in_cb && /branch:/ {branch=$2; gsub(/^[ ]*|[ ]*$/, "", branch); if (branch == b) {print arxiv; exit}}
                   /^[^ ]/ {in_cb=0}
                 ' || echo "")
@@ -135,8 +135,8 @@ jobs:
           echo "→ picked branch: $BRANCH"
           echo "→ arxiv: ${ARXIV:-<unresolved>}"
 
-          if [ -z "$ARXIV" ]; then
-            echo "::error::arxiv_id could not be resolved for branch $BRANCH (checked intel yaml + override). Re-dispatch with pick-override-arxiv=<id>."
+          if ! printf '%s' "$ARXIV" | grep -qE '^(arxiv:)?[0-9]{4}\.[0-9]{4,5}(v[0-9]+)?$'; then
+            echo "::error::arxiv_id could not be resolved to a valid id for branch $BRANCH (checked intel yaml + override). Re-dispatch with pick-override-arxiv=<id>."
             exit 1
           fi
           echo "picked=$BRANCH" >> "$GITHUB_OUTPUT"
