@@ -18,7 +18,7 @@ By default Outrider talks to Anthropic's hosted API. To route at any other Anthr
 | Backend | `model-base-url` value | Secret | Default model | Recommended `claude-timeout` |
 |---|---|---|---|---|
 | Anthropic (default) | _(empty — uses `api.anthropic.com`)_ | `ANTHROPIC_API_KEY` | `claude-opus-4-8` | `900` (default) |
-| z.ai / GLM Coding Plan | `https://api.z.ai/api/anthropic` | `ZAI_API_KEY` | `glm-5.2` | `900` (default) |
+| z.ai / GLM Coding Plan | `https://api.z.ai/api/anthropic` | `ZAI_API_KEY` | `glm-5.2` | `3600` (glm-5.2's thinking mode adds per-turn latency) |
 | Moonshot / Kimi | `https://api.moonshot.ai/anthropic` | `MOONSHOT_API_KEY` | `kimi-k3` | `3600` (thinking-mode adds per-turn latency) |
 | AWS Bedrock (Claude) | `https://bedrock-runtime.<region>.amazonaws.com` | (AWS SigV4 — uses the workflow's `aws-actions/configure-aws-credentials` chain) | (varies per Bedrock configuration) | `900` (default) |
 | GCP Vertex (Claude) | `https://<region>-aiplatform.googleapis.com/v1/projects/<proj>/...` | `GOOGLE_APPLICATION_CREDENTIALS` (OAuth via service-account JSON) | (varies per Vertex configuration) | `900` (default) |
