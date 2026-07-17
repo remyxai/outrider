@@ -75,6 +75,7 @@ from exploration_structure import (
     structure_enabled,
 )
 from instruction_files import render_instruction_files
+from logit_verifier import score_implementation
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -10438,6 +10439,28 @@ def process_target(target: Target) -> dict:
             result["issue_url"] = issue_url
             result["issue_number"] = issue_number
             return result
+
+        # 7.8. Continuous verification score via logit distribution (LLM-as-
+        # a-Verifier). Complements the static diff-risk assessment with
+        # probabilistic quality signals: correctness, style, integration.
+        # Extracts calibrated [0,1] scores from LLM logit expectations instead
+        # of forcing discrete judgments, enabling finer-grained routing and
+        # candidate ranking when Outrider grows to multi-generation synthesis.
+        impl_diff = _capture_implementation_diff(workdir)
+        verif_score = score_implementation(
+            diff_text=impl_diff, repo_context=target.description,
+            timeout_s=target.claude_timeout_s,
+        )
+        result["verif_correctness"] = verif_score.correctness
+        result["verif_style"] = verif_score.style
+        result["verif_integration"] = verif_score.integration
+        result["verif_overall"] = verif_score.overall
+        result["verif_confidence"] = verif_score.confidence
+        log.info(
+            f"  ✓ continuous verification: correctness={verif_score.correctness:.2f} "
+            f"style={verif_score.style:.2f} integration={verif_score.integration:.2f} "
+            f"overall={verif_score.overall:.2f}"
+        )
 
         # 8. Tests
         tests_status, test_output = run_tests(workdir)
