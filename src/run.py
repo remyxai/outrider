@@ -16420,12 +16420,34 @@ def run_refinement_chain(target: Target, pr_number: int) -> dict:
     log.info("  ─── chain phase: fidelity audit ───")
     fidelity = run_fidelity_audit(target)
     chain["fidelity_status"] = fidelity.get("status")
-    if not str(fidelity.get("status", "")).startswith("fidelity_audited"):
+    # Chain-continuation taxonomy:
+    #   audited (any suffix) → run convention + test (existing behavior)
+    #   skipped_* except no_pr → run convention + test (audit couldn't
+    #       run — no reference URL, not bot-authored, reference URL
+    #       doesn't back-reference the arxiv — but the PR is unchanged
+    #       and downstream phases don't need fidelity's signal)
+    #   skipped_no_pr → short-circuit (nothing to work on)
+    #   failed_* → short-circuit (audit crashed; something went wrong,
+    #       don't muck with the PR further pending investigation)
+    status = str(fidelity.get("status", ""))
+    audited = status.startswith("fidelity_audited")
+    skipped_with_pr = (
+        status.startswith("fidelity_skipped")
+        and status != "fidelity_skipped_no_pr"
+    )
+    if not (audited or skipped_with_pr):
         log.info(
-            f"  ↪ fidelity did not audit (status={fidelity.get('status')!r}); "
+            f"  ↪ fidelity did not audit and cannot continue "
+            f"(status={fidelity.get('status')!r}); "
             f"skipping convention + test phases"
         )
         return chain
+    if not audited:
+        log.info(
+            f"  ↪ fidelity skipped ({fidelity.get('status')!r}) — continuing "
+            f"to convention + test (PR unchanged; downstream phases don't "
+            f"depend on fidelity signal)"
+        )
 
     log.info("  ─── chain phase: convention pass ───")
     convention = run_convention_pass(target)
