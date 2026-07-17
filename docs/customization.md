@@ -47,9 +47,9 @@ Set to a free-text method query (e.g. `"knowledge distillation"`) or a literal `
 
 ### Model backend — `model-base-url`
 
-Optional override that routes the Claude Code subprocess at any Anthropic-Messages-compatible backend (z.ai's GLM Coding Plan, AWS Bedrock, GCP Vertex, on-prem proxies). Empty (default) = Anthropic's API.
+Optional override that routes the Claude Code subprocess at any Anthropic-Messages-compatible backend (z.ai's GLM Coding Plan, Moonshot's Kimi, AWS Bedrock, GCP Vertex, on-prem proxies). Empty (default) = Anthropic's API.
 
-The full backend matrix — including the auth-header gotcha that bites on z.ai (the env vars `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are mutually exclusive), the per-dispatch backend-switching workflow template, cost-telemetry behavior per backend, and a 401-debug checklist — lives in [`backends.md`](backends.md).
+The full backend matrix — supported backends with their base URLs, secret names, default models, and recommended `claude-timeout` values; the auth-header gotcha that bites on non-Anthropic backends (the env vars `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are mutually exclusive); the per-dispatch backend-switching workflow template; cost-telemetry behavior per backend; and a 401-debug checklist — lives in [`backends.md`](backends.md).
 
 ### Filesystem reach — `guardrails-allowlist`
 
@@ -142,7 +142,7 @@ The drafter accumulates a pool of branches through the arxiv frontier — every 
 
 Requires one secret: `ANTHROPIC_API_KEY`. Optional: `LINEAR_API_KEY` for the durable-state pattern (refiner can file gap analyses as Linear issues and read them back via URL), but the default setup passes the gap analysis inline as raw markdown so no Linear provisioning is needed.
 
-For customers with existing z.ai credits or Anthropic-outage hedging needs, either role can be routed at a different backend via `model-base-url` — see [`backends.md`](backends.md).
+For customers with existing z.ai / Moonshot credits or Anthropic-outage hedging needs, either role can be routed at a different backend via `model-base-url` — see [`backends.md`](backends.md).
 
 ### Manual triggers for testing
 
