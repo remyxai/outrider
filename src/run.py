@@ -10153,8 +10153,15 @@ def process_target(target: Target) -> dict:
         if staged in ("true", "1", "yes"):
             log.info("  → staged-synthesis enabled; running research phase before coding session")
             write_research_invocation(workdir, rec, target)
+            # Research inherits the run's claude-timeout budget in full —
+            # slow-backend runs (Kimi K3 thinking mode, GLM-5.2 reasoning)
+            # need the same headroom every other phase gets. The previous
+            # `min(600, target.claude_timeout_s)` cap ignored the caller's
+            # bumped timeout and forced research to fail-best-effort on
+            # any run where turns took >75s on average, dropping paper
+            # context from the coding session for no gain.
             research_ok, research_log = invoke_research_phase(
-                workdir, timeout_s=min(600, target.claude_timeout_s),
+                workdir, timeout_s=target.claude_timeout_s,
             )
             result["research_phase_ok"] = research_ok
             result["research_log_tail"] = research_log[-1000:]
