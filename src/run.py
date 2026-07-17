@@ -6181,22 +6181,43 @@ def _reset_run_cost() -> None:
 # ── Per-backend pricing for cost telemetry ─────────────────────────────────
 #
 # When ``ANTHROPIC_BASE_URL`` routes Claude Code at a non-Anthropic backend
-# (z.ai / GLM, Bedrock, on-prem proxies), the CLI's ``total_cost_usd`` field
-# uses its built-in Anthropic-rate table — wrong by a constant factor for
-# any other backend. This table lets us override with the backend's actual
-# rate card when the URL matches a known host substring.
+# (z.ai / GLM, Moonshot / Kimi, on-prem proxies), the CLI's ``total_cost_usd``
+# field uses its built-in Anthropic-rate table — wrong by a constant factor
+# for any other backend. This table lets us override with the backend's
+# actual rate card when the URL matches a known host substring.
 #
-# Rates are USD per million tokens: ``(input, output, cache_read)``. Update
-# as providers publish new rates. Backends not in the table fall back to
-# the CLI's ``total_cost_usd`` (with a "may be approximate" note in the
-# step summary so the operator knows the figure isn't authoritative for
-# their backend).
-_BACKEND_RATES: dict[str, tuple[float, float, float]] = {
-    # z.ai GLM (Anthropic-Messages-compat endpoint) — PAYG rates for the
-    # default GLM-4.6 routing. Users on the GLM Coding Plan subscription
-    # don't pay per-token, but the per-token estimate stays useful as a
-    # "what would this cost outside the subscription" indicator.
-    "api.z.ai": (0.60, 2.20, 0.06),
+# Keyed by host substring, then by ANTHROPIC_MODEL name. Rates are USD per
+# million tokens: ``(input, output, cache_read)``. Update as providers
+# publish new rates. Backends not in the table fall back to the CLI's
+# ``total_cost_usd`` (with a "may be approximate" note in the step summary
+# so the operator knows the figure isn't authoritative for their backend).
+#
+# A tier pair (drafter + refiner) can differ 3-4x per token — z.ai's
+# glm-4.6 vs glm-5.2, Moonshot's kimi-k2.7-code vs kimi-k3 — so cost
+# accuracy requires per-model rates within each host. Subscription plans
+# (z.ai's GLM Coding Plan) don't pay per-token, but the per-token estimate
+# stays useful as a "what would this cost outside the subscription"
+# indicator.
+_BACKEND_RATES: dict[str, dict[str, tuple[float, float, float]]] = {
+    "api.z.ai": {
+        # PAYG rates per docs.z.ai/guides/overview/pricing.md
+        "glm-5.2": (1.40, 4.40, 0.26),
+        "glm-4.6": (0.60, 2.20, 0.11),
+    },
+    "api.moonshot.ai": {
+        # PAYG rates per platform.kimi.ai/docs/pricing/*
+        "kimi-k3": (3.00, 15.00, 0.30),
+        "kimi-k2.7-code": (0.95, 4.00, 0.19),
+        "kimi-k2.7-code-highspeed": (1.90, 8.00, 0.38),
+    },
+}
+
+# Per-host fallback when ANTHROPIC_MODEL is unset or names a model we don't
+# have rates for — pick the model most callers are actually likely to be
+# running so the estimate is closer than "no idea".
+_BACKEND_DEFAULT_MODEL: dict[str, str] = {
+    "api.z.ai": "glm-5.2",
+    "api.moonshot.ai": "kimi-k3",
 }
 
 
@@ -6296,7 +6317,10 @@ def _validate_claude_auth_env() -> tuple[bool, list[str]]:
     return True, warnings
 
 
-def _detect_backend(base_url: str) -> tuple[str, tuple[float, float, float] | None]:
+def _detect_backend(
+    base_url: str,
+    model: str = "",
+) -> tuple[str, tuple[float, float, float] | None]:
     """Identify the Anthropic-Messages-compat backend behind ANTHROPIC_BASE_URL.
 
     Returns ``(display_name, rates_or_None)``. When the host isn't in the
@@ -6304,15 +6328,27 @@ def _detect_backend(base_url: str) -> tuple[str, tuple[float, float, float] | No
     rates — the caller falls back to the CLI's reported ``total_cost_usd``
     (which is Anthropic-rate; only correct for default Anthropic or
     Bedrock-Claude, miscalibrated for any other backend).
+
+    When ``model`` is empty or names a model not in the host's rate row,
+    falls back to ``_BACKEND_DEFAULT_MODEL[host_key]`` — closer than
+    "no idea", but slightly off for tier pairs (e.g. cost reported as
+    kimi-k3 when the actual call was kimi-k2.7-code will overestimate
+    ~3x). Callers with a known model should pass it.
     """
     if not base_url:
         return ("Anthropic", None)  # default — CLI's envelope cost is correct
     host = base_url.split("://", 1)[-1].split("/", 1)[0]
     display_overrides = {
         "api.z.ai": "z.ai (GLM)",
+        "api.moonshot.ai": "Moonshot (Kimi)",
     }
-    for key, rates in _BACKEND_RATES.items():
+    for key, model_rates in _BACKEND_RATES.items():
         if key in host:
+            rates = model_rates.get(model) if model else None
+            if rates is None:
+                default_model = _BACKEND_DEFAULT_MODEL.get(key)
+                if default_model:
+                    rates = model_rates.get(default_model)
             return (display_overrides.get(key, host), rates)
     return (host, None)
 
@@ -6348,7 +6384,11 @@ def _record_claude_usage(env: dict) -> None:
         )
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-    backend_name, rates = _detect_backend(base_url)
+    # Prefer the envelope's model (what was actually served) over the env
+    # var (what we requested) — same in practice, but envelope wins when
+    # both are present.
+    model = env.get("model") or os.environ.get("ANTHROPIC_MODEL", "")
+    backend_name, rates = _detect_backend(base_url, model)
     if rates is not None and "api.anthropic.com" not in base_url:
         # Compute from tokens × backend rates (USD per million).
         rate_in, rate_out, rate_cache = rates
