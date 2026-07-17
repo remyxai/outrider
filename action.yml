@@ -579,6 +579,15 @@ runs:
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
       run: |
         set -eu
+        # Mutual-exclusion enforcement: callers typically pass every backend's
+        # secret via the top-level env block ({ANTHROPIC,ZAI,MOONSHOT}_API_KEY
+        # all set) so `provider` can be dispatch-time-switchable. Per the
+        # docs/backends.md auth-header matrix, having both ANTHROPIC_API_KEY
+        # and ANTHROPIC_AUTH_TOKEN set makes Claude Code prefer x-api-key —
+        # which non-Anthropic backends reject with 401. Each branch below
+        # clears the non-selected auth var to $GITHUB_ENV (empty string,
+        # which Claude Code and the CLI's auth validator both treat as
+        # unset for the mutual-exclusion check).
         case "$INPUT_PROVIDER" in
           anthropic)
             if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
@@ -586,6 +595,7 @@ runs:
               exit 1
             fi
             # ANTHROPIC_API_KEY is already in the parent env — no override needed
+            echo "ANTHROPIC_AUTH_TOKEN=" >> "$GITHUB_ENV"
             ;;
           zai)
             if [ -z "${ZAI_API_KEY:-}" ]; then
@@ -593,6 +603,7 @@ runs:
               exit 1
             fi
             echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY" >> "$GITHUB_ENV"
+            echo "ANTHROPIC_API_KEY=" >> "$GITHUB_ENV"
             echo "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic" >> "$GITHUB_ENV"
             ;;
           moonshot)
@@ -601,6 +612,7 @@ runs:
               exit 1
             fi
             echo "ANTHROPIC_AUTH_TOKEN=$MOONSHOT_API_KEY" >> "$GITHUB_ENV"
+            echo "ANTHROPIC_API_KEY=" >> "$GITHUB_ENV"
             echo "ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic" >> "$GITHUB_ENV"
             ;;
           custom)
@@ -612,7 +624,8 @@ runs:
               echo "::error::provider=custom requires ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in the caller's env block" >&2
               exit 1
             fi
-            # model-base-url passes through via INPUT_MODEL_BASE_URL to run.py
+            # model-base-url passes through via INPUT_MODEL_BASE_URL to run.py.
+            # No clearing here — caller supplied exactly what they want.
             ;;
           *)
             echo "::error::unknown provider '$INPUT_PROVIDER'; must be one of: anthropic, zai, moonshot, custom" >&2
