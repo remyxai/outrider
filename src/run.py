@@ -1651,7 +1651,14 @@ class Recommendation:
 # per run, success or failure. `permissions` carries the scopes the engine
 # actually granted so capability-aware callers (the Discussion post) can
 # branch instead of discovering a 403.
-_BOT_TOKEN = {"attempted": False, "token": "", "permissions": {}}
+_BOT_TOKEN = {"attempted": False, "token": "", "permissions": {}, "minted_at": 0.0}
+
+# GitHub App installation tokens have a 60-minute TTL. Slow-backend runs
+# (Kimi K3 thinking mode, GLM-5.2 with reasoning) can spend 30-40 min per
+# phase — a full recommend → implement → self-review → push cycle blows
+# past that. Re-mint before the cached token expires; 5-min safety margin
+# so a call made just under the wire still gets a fresh token.
+_BOT_TOKEN_MAX_AGE_S = 55 * 60  # 3300s
 
 
 def _mint_bot_token() -> str:
@@ -1660,14 +1667,33 @@ def _mint_bot_token() -> str:
     The action already holds REMYX_API_KEY — exactly the credential the
     engine's ``/github/installation-token`` endpoint authenticates — so
     the bot identity must not depend on the customer's workflow YAML
-    carrying a mint step. Called lazily by ``_github_token``; one attempt
-    per run. Best-effort: any failure (engine unreachable, App not
-    installed, no provisioned action for this repo) returns ``""`` and
-    the caller falls back to GITHUB_TOKEN — the same graceful semantics
-    as the YAML mint step's ``|| token=""``.
+    carrying a mint step. Called lazily by ``_github_token``. Best-effort:
+    any failure (engine unreachable, App not installed, no provisioned
+    action for this repo) returns ``""`` and the caller falls back to
+    GITHUB_TOKEN — the same graceful semantics as the YAML mint step's
+    ``|| token=""``.
+
+    Caching semantics:
+      - Successful mint: cached for up to _BOT_TOKEN_MAX_AGE_S. Older
+        than that, we re-mint before returning (installation tokens
+        expire at 60 min; slow-backend runs push after that window).
+      - Failed mint: cached-empty for the run. Not retried on every
+        call — that would flood the engine when the App isn't installed
+        or the endpoint is down.
     """
+    now = time.time()
     if _BOT_TOKEN["attempted"]:
-        return _BOT_TOKEN["token"]
+        # Prior mint attempt returned empty (App not installed, engine
+        # unreachable) — honor the cached-empty result; don't retry.
+        if not _BOT_TOKEN["token"]:
+            return ""
+        # Cached success: reuse if still fresh; otherwise fall through
+        # to re-mint.
+        age_s = now - _BOT_TOKEN["minted_at"]
+        if age_s < _BOT_TOKEN_MAX_AGE_S:
+            return _BOT_TOKEN["token"]
+        log.info(f"  bot token stale (age {int(age_s)}s > "
+                 f"{_BOT_TOKEN_MAX_AGE_S}s); re-minting")
     _BOT_TOKEN["attempted"] = True
     api_key = (
         os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
@@ -1695,6 +1721,7 @@ def _mint_bot_token() -> str:
     _BOT_TOKEN["token"] = (data.get("token") or "").strip()
     _BOT_TOKEN["permissions"] = data.get("permissions") or {}
     if _BOT_TOKEN["token"]:
+        _BOT_TOKEN["minted_at"] = now
         log.info(f"  ✓ self-minted remyx[bot] token (scopes: "
                  f"{sorted(_BOT_TOKEN['permissions']) or '(unreported)'})")
     return _BOT_TOKEN["token"]
@@ -6175,7 +6202,7 @@ def _reset_run_cost() -> None:
         envelopes_without_usage=0,
     )
     _RUN_REFINE_QUERIES.clear()
-    _BOT_TOKEN.update(attempted=False, token="", permissions={})
+    _BOT_TOKEN.update(attempted=False, token="", permissions={}, minted_at=0.0)
 
 
 # ── Per-backend pricing for cost telemetry ─────────────────────────────────
@@ -8900,6 +8927,21 @@ def commit_and_push(
 
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
     subprocess.run(["git", "commit", "-m", title], cwd=workdir, check=True)
+
+    # Refresh origin's URL with a freshly-minted token before pushing.
+    # The URL baked into `origin` at clone time embeds the token (see
+    # prepare_workdir). Installation tokens have a 60-min TTL and long
+    # coding sessions (Kimi K3 thinking mode, GLM-5.2 reasoning) can
+    # extend the clone→push window past that. `_github_token()` re-mints
+    # on staleness (see `_BOT_TOKEN_MAX_AGE_S`) but the git remote URL
+    # stays frozen at clone time unless we explicitly rewrite it.
+    fresh_token = _github_token()
+    if fresh_token:
+        subprocess.run(
+            ["git", "remote", "set-url", "origin",
+             f"https://x-access-token:{fresh_token}@github.com/{repo}.git"],
+            cwd=workdir, check=True, capture_output=True,
+        )
 
     # Delete any orphan branch with the same name from the remote before
     # pushing. Two reasons:
