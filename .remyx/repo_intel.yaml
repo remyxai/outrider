@@ -11,7 +11,13 @@ observed_landing_zones:
       \ main execution path in Outrider's GitHub Actions orchestrator"
     branch: failure-as-a-process-an-anatomy-of-cli-coding-agent-trajecto
     timestamp: '2026-07-15T08:00:03Z'
-  last_observed: '2026-07-15T08:00:03Z'
+  - arxiv: 2607.05391v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "process_target() \u2192 result dict at line 10450, invoked\
+      \ from main orchestrator at line 16575"
+    branch: llm-as-a-verifier-a-general-purpose-verification-framework
+    timestamp: '2026-07-17T08:01:18Z'
+  last_observed: '2026-07-17T08:01:18Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-07-15T08:00:03Z'
+last_updated: '2026-07-17T08:01:18Z'
