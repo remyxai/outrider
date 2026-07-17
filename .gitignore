@@ -5,3 +5,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+
+# Env files (never commit)
+.env
+.env.*
+!.env.example
+*.env.local
+
