@@ -15839,6 +15839,26 @@ def run_test_gate(target: Target) -> dict:
     result["test_status"] = test_status
     log.info(f"  → tests: {test_status}")
 
+    # Interaction refinement loop: if lint or tests failed, attempt to
+    # use grounded feedback (the real observations) to refine the code.
+    # This implements interaction scaling (arXiv:2607.11598v1) — breaking
+    # through the ceiling that reasoning-only and sampling-only approaches
+    # hit by leveraging external instruments to observe actual behavior.
+    interaction_result = None
+    if (lint_status == "failed" or test_status == "failed") and touched_py:
+        from grounded_feedback_loop import attempt_interaction_refinement
+        interaction_result = attempt_interaction_refinement(
+            clone_workdir, touched_py, lint_output, test_output,
+            claude_timeout_s=target.claude_timeout_s, max_iterations=2
+        )
+        if interaction_result and interaction_result["status"] == "interaction_succeeded":
+            lint_status = interaction_result["final_lint_status"] or lint_status
+            test_status = interaction_result["final_test_status"] or test_status
+            test_output = "(refined via interaction loop)"
+            log.info(f"  ✓ interaction loop fixed the issues: "
+                     f"lint={lint_status}, test={test_status}")
+        result["interaction_result"] = interaction_result
+
     # Render the result section and write to the action run-summary
     # panel; the PR body is owned by the convention pass's body rewrite
     # and isn't an appropriate surface for per-run check output.
