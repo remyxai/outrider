@@ -17,7 +17,13 @@ observed_landing_zones:
       \ from main orchestrator at line 16575"
     branch: llm-as-a-verifier-a-general-purpose-verification-framework
     timestamp: '2026-07-17T08:01:18Z'
-  last_observed: '2026-07-17T08:01:18Z'
+  - arxiv: 2607.11598v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "run_test_gate() in src/run.py:15848 \u2014 invoked when\
+      \ lint_status or test_status equals 'failed' after initial generation"
+    branch: interaction-scaling-grounding-the-third-axis-of-test-time-co
+    timestamp: '2026-07-19T08:08:20Z'
+  last_observed: '2026-07-19T08:08:20Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -26,4 +32,4 @@ rejected_shapes:
   - arxiv: 2607.00990v1
     timestamp: '2026-07-18T07:32:36Z'
 coordination_signals: []
-last_updated: '2026-07-18T07:32:36Z'
+last_updated: '2026-07-19T08:08:20Z'
