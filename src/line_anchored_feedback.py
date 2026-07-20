@@ -50,7 +50,14 @@ def _parse_unified_diff(diff_text: str, max_anchors_per_file: int = 100) -> list
     files = []
     current_file = None
     current_anchors = []
-    current_line_offset = 0
+    # Separate cursors for the two sides of the diff. Added lines are anchored
+    # to their position in the NEW file (``new_line``); removed lines to their
+    # position in the OLD file (``old_line``). Conflating the two — or deriving
+    # a position from the count of already-emitted anchors — makes the reported
+    # ``L`` numbers drift on any hunk that mixes additions and removals, which
+    # defeats the whole point of line anchoring.
+    new_line = 0
+    old_line = 0
     current_truncated = False
 
     lines = diff_text.split("\n")
@@ -75,36 +82,43 @@ def _parse_unified_diff(diff_text: str, max_anchors_per_file: int = 100) -> list
             i += 1
             continue
 
-        # Hunk header: "@@ -10,5 +20,7 @@"
+        # Hunk header: "@@ -10,5 +20,7 @@" — reset both cursors to the hunk's
+        # declared start lines (old side, new side).
         if line.startswith("@@"):
-            match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            match = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
             if match:
-                current_line_offset = int(match.group(1)) - 1
+                old_line = int(match.group(1))
+                new_line = int(match.group(2))
+            i += 1
+            continue
 
         # Content lines
         if line.startswith("+") and not line.startswith("+++"):
-            # Added line
+            # Added line — position is in the new file.
             if len(current_anchors) < max_anchors_per_file:
                 current_anchors.append(LineAnchor(
-                    line_number=current_line_offset + len(current_anchors) + 1,
+                    line_number=new_line,
                     context="added",
                     content=line[1:],  # Strip leading '+'
                 ))
             else:
                 current_truncated = True
+            new_line += 1
         elif line.startswith("-") and not line.startswith("---"):
-            # Removed line
+            # Removed line — position is in the old file.
             if len(current_anchors) < max_anchors_per_file:
                 current_anchors.append(LineAnchor(
-                    line_number=current_line_offset,
+                    line_number=old_line,
                     context="removed",
                     content=line[1:],  # Strip leading '-'
                 ))
             else:
                 current_truncated = True
+            old_line += 1
         elif line.startswith(" "):
-            # Context line (unchanged)
-            current_line_offset += 1
+            # Context line (unchanged) — advances both sides.
+            new_line += 1
+            old_line += 1
 
         i += 1
 

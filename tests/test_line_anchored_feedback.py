@@ -102,6 +102,68 @@ def test_parse_respects_max_anchors():
     assert anchored[0].truncated is True
 
 
+# ─── Anchor line-number accuracy ─────────────────────────────────────────────
+
+
+def test_anchor_line_numbers_on_mixed_hunk():
+    """Removed lines anchor to the OLD file, added lines to the NEW file.
+
+    On a hunk that mixes a removal and an addition the two positions must be
+    computed independently — deriving either from a running anchor count makes
+    the reported ``L`` numbers drift, which defeats line anchoring entirely.
+    """
+    diff = """\
+--- a/test.py
++++ b/test.py
+@@ -5,4 +5,4 @@
+ def foo():
+     x = 1
+-    old = 1
++    new = 1
+     return new
+"""
+    anchors = _parse_unified_diff(diff)[0].anchors
+    removed = next(a for a in anchors if a.context == "removed")
+    added = next(a for a in anchors if a.context == "added")
+    # ``old = 1`` is the 3rd line of the old file (start=5 -> 5,6,7).
+    assert removed.line_number == 7
+    # ``new = 1`` is the 3rd line of the new file (start=5 -> 5,6,7).
+    assert added.line_number == 7
+
+
+def test_anchor_line_numbers_across_multiple_hunks():
+    """Each hunk header re-seats both cursors to its declared start lines."""
+    diff = """\
+--- a/test.py
++++ b/test.py
+@@ -1,2 +1,3 @@
+ a = 1
++b = 2
+ c = 3
+@@ -20,2 +21,3 @@
+ x = 1
++y = 2
+ z = 3
+"""
+    added = [a for a in _parse_unified_diff(diff)[0].anchors if a.context == "added"]
+    assert [a.line_number for a in added] == [2, 22]
+
+
+def test_consecutive_removed_lines_advance_old_cursor():
+    """Multiple removals in a row map to consecutive old-file line numbers."""
+    diff = """\
+--- a/test.py
++++ b/test.py
+@@ -10,4 +10,1 @@
+ keep = 0
+-drop_a = 1
+-drop_b = 2
+ keep2 = 3
+"""
+    removed = [a for a in _parse_unified_diff(diff)[0].anchors if a.context == "removed"]
+    assert [a.line_number for a in removed] == [11, 12]
+
+
 # ─── Formatting for feedback ───────────────────────────────────────────────
 
 

@@ -171,3 +171,38 @@ def test_anchored_feedback_in_fidelity_audit_flow():
 
     # Core assertion: line-anchored feedback is in the prompt
     assert "line-anchored" in prompt.lower()
+
+
+def test_audit_prompt_reports_accurate_line_numbers():
+    """The anchor numbers embedded in the real audit prompt must match the
+    diff's true file line numbers, even on a hunk mixing add + remove.
+
+    This guards the fidelity-audit call site against the anchor-drift bug:
+    a wrong ``L`` number is worse than none, since it points the auditor at
+    the wrong line.
+    """
+    diff = """\
+--- a/src/module.py
++++ b/src/module.py
+@@ -5,4 +5,4 @@
+ def foo():
+     x = 1
+-    old = 1
++    new = 1
+     return new
+"""
+
+    prompt = run._build_fidelity_audit_prompt(
+        pr_title="Refactor",
+        pr_body="Rename variable",
+        pr_diff=diff,
+        arxiv_id="2607.12713v1",
+        reference_url="https://example.com/ref",
+        reference_root=Path("/tmp"),
+    )
+
+    # Both the removed old-file line and the added new-file line are line 7.
+    assert "L7: + " in prompt and "new = 1" in prompt
+    assert "L7: - " in prompt and "old = 1" in prompt
+    # The buggy implementation would have emitted L6/L8 here.
+    assert "L8:" not in prompt
