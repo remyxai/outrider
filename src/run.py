@@ -3630,6 +3630,10 @@ def _remyx_get_asset(arxiv_id: str) -> dict | None:
 _ARXIV_API_ENDPOINT = "https://export.arxiv.org/api/query"
 _ARXIV_ATOM_NS = "{http://www.w3.org/2005/Atom}"
 _ARXIV_ID_IN_ABS_URL = re.compile(r"arxiv\.org/abs/(\d{4}\.\d{4,5}(?:v\d+)?)")
+# arxiv's API terms request a bot-identifying UA. The default Python-urllib
+# UA is silently filtered by their edge in some cases; setting a proper UA
+# both respects the policy and reliably reaches the origin.
+_ARXIV_USER_AGENT = "Outrider/1.0 (+https://github.com/remyxai/outrider)"
 
 
 def _fetch_arxiv_asset(arxiv_id: str) -> dict | None:
@@ -3645,24 +3649,38 @@ def _fetch_arxiv_asset(arxiv_id: str) -> dict | None:
 
     Returns ``None`` on 404 / malformed XML / network failure. Never
     raises — a fallback path must not itself become a new skip cause.
+    Failure paths log at WARNING so runners' default log level (INFO)
+    surfaces them; silent None was the debug shape and made the fallback
+    indistinguishable from a hard skip.
     """
     arxiv_id = (arxiv_id or "").strip()
     if not arxiv_id:
         return None
     url = f"{_ARXIV_API_ENDPOINT}?id_list={urllib.parse.quote(arxiv_id)}"
+    req = urllib.request.Request(url, headers={"User-Agent": _ARXIV_USER_AGENT})
     try:
-        with urllib.request.urlopen(url, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=20) as r:
             body = r.read().decode("utf-8", errors="replace")
     except Exception as e:
-        log.debug(f"    arxiv fallback fetch for {arxiv_id!r} failed: {e}")
+        log.warning(
+            f"    arxiv fallback fetch for {arxiv_id!r} failed: "
+            f"{type(e).__name__}: {e}"
+        )
         return None
     try:
         root = ET.fromstring(body)
     except ET.ParseError as e:
-        log.debug(f"    arxiv fallback XML parse for {arxiv_id!r} failed: {e}")
+        log.warning(
+            f"    arxiv fallback XML parse for {arxiv_id!r} failed: {e} "
+            f"(response head: {body[:200]!r})"
+        )
         return None
     entries = root.findall(f"{_ARXIV_ATOM_NS}entry")
     if not entries:
+        log.warning(
+            f"    arxiv fallback returned no <entry> for {arxiv_id!r} "
+            f"(response was {len(body)} bytes; totalResults likely 0)"
+        )
         return None
     entry = entries[0]
     title_el = entry.find(f"{_ARXIV_ATOM_NS}title")
@@ -3670,8 +3688,10 @@ def _fetch_arxiv_asset(arxiv_id: str) -> dict | None:
     id_el = entry.find(f"{_ARXIV_ATOM_NS}id")
     title = (title_el.text or "").strip() if title_el is not None else ""
     if not title:
-        # arxiv occasionally returns an empty <entry> for withdrawn / not-yet-
-        # indexed IDs — treat as a miss so the caller falls through to skip.
+        log.warning(
+            f"    arxiv fallback entry for {arxiv_id!r} had empty title — "
+            f"treating as miss (likely withdrawn / placeholder entry)"
+        )
         return None
     abstract = (summary_el.text or "").strip() if summary_el is not None else ""
     canonical_id = arxiv_id
@@ -3679,6 +3699,10 @@ def _fetch_arxiv_asset(arxiv_id: str) -> dict | None:
         m = _ARXIV_ID_IN_ABS_URL.search(id_el.text)
         if m:
             canonical_id = m.group(1)
+    log.info(
+        f"    arxiv fallback resolved {arxiv_id!r} → {canonical_id!r}: "
+        f"{title[:80]}"
+    )
     return {
         "arxiv_id": canonical_id,
         "title": title,
