@@ -1,5 +1,11 @@
 # Outrider — GitHub Action
 
+
+
+https://github.com/user-attachments/assets/4b22a207-d878-4b4d-a1f1-02e886a8e994
+
+
+
 Validating and comparing new methods against your own codebase is 10× the work of any single implementation. Schedule Outrider (or dispatch on demand) as a GitHub Action to wire arXiv methods (or your own design-doc leads) into real call sites, so your team can measure the change against the metrics you already track.
 
 ```yaml
