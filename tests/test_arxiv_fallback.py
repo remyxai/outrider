@@ -132,6 +132,40 @@ def test_fetch_canonical_id_falls_back_to_input(monkeypatch):
     assert out["title"] == "Some Paper"
 
 
+def test_fetch_retries_on_429_and_succeeds(monkeypatch):
+    """arxiv throttles GH Actions runner IPs — first 429 must retry, not
+    surface as a hard miss. Motivating case: run 29712953207."""
+    import urllib.error
+    call_count = {"n": 0}
+    def fake_urlopen(req, timeout=20):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise urllib.error.HTTPError(
+                url=getattr(req, "full_url", ""), code=429,
+                msg="Too Many Requests", hdrs=None, fp=None,
+            )
+        return _FakeResp(_TIPSV2_ATOM)
+    monkeypatch.setattr(run.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(run.time, "sleep", lambda s: None)  # skip backoff wait
+    out = run._fetch_arxiv_asset("2604.12012")
+    assert out is not None
+    assert "TIPSv2" in out["title"]
+    assert call_count["n"] == 2  # one 429, one success
+
+
+def test_fetch_gives_up_after_repeated_429(monkeypatch):
+    """After 3 attempts still hitting 429 → return None cleanly."""
+    import urllib.error
+    def fake_urlopen(req, timeout=20):
+        raise urllib.error.HTTPError(
+            url=getattr(req, "full_url", ""), code=429,
+            msg="Too Many Requests", hdrs=None, fp=None,
+        )
+    monkeypatch.setattr(run.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(run.time, "sleep", lambda s: None)
+    assert run._fetch_arxiv_asset("2604.12012") is None
+
+
 def test_fetch_asset_shape_compatible_with_asset_to_recommendation(monkeypatch):
     """The synthesized envelope must survive `_asset_to_recommendation`
     without KeyError — that's the whole point of matching shape."""

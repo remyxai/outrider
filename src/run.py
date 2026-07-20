@@ -3658,13 +3658,47 @@ def _fetch_arxiv_asset(arxiv_id: str) -> dict | None:
         return None
     url = f"{_ARXIV_API_ENDPOINT}?id_list={urllib.parse.quote(arxiv_id)}"
     req = urllib.request.Request(url, headers={"User-Agent": _ARXIV_USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            body = r.read().decode("utf-8", errors="replace")
-    except Exception as e:
+    # arxiv aggressively throttles shared runner IP ranges (GH Actions Azure
+    # egress is a common one). A first-attempt 429 is expected; retry with
+    # exponential backoff + honor the server's Retry-After when present.
+    # arxiv's documented API cadence is 3s between queries, so 3s → 6s → 12s
+    # matches their guidance and clears typical short-window throttles.
+    body = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = r.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                retry_after_hdr = e.headers.get("Retry-After") or "" if e.headers else ""
+                try:
+                    retry_after = int(retry_after_hdr) if retry_after_hdr else 0
+                except ValueError:
+                    retry_after = 0
+                delay = max(retry_after, 3 * (2 ** attempt))
+                log.warning(
+                    f"    arxiv fallback rate-limited (429) for {arxiv_id!r}; "
+                    f"retry {attempt+1}/3 after {delay}s "
+                    f"(Retry-After: {retry_after_hdr!r})"
+                )
+                time.sleep(delay)
+                continue
+            log.warning(
+                f"    arxiv fallback fetch for {arxiv_id!r} failed on "
+                f"attempt {attempt+1}: HTTP {e.code} {e.reason}"
+            )
+            return None
+        except Exception as e:
+            log.warning(
+                f"    arxiv fallback fetch for {arxiv_id!r} failed on "
+                f"attempt {attempt+1}: {type(e).__name__}: {e}"
+            )
+            return None
+    if body is None:
         log.warning(
-            f"    arxiv fallback fetch for {arxiv_id!r} failed: "
-            f"{type(e).__name__}: {e}"
+            f"    arxiv fallback for {arxiv_id!r} exhausted retries "
+            f"without a successful response"
         )
         return None
     try:
