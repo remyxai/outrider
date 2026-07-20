@@ -8965,7 +8965,12 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
 def commit_and_push(
     workdir: Path, branch: str, title: str, repo: str, base_branch: str = "main",
 ) -> None:
-    """Stage all changes, commit, and push the branch to origin.
+    """Stage all changes, commit (if any), and push the branch to origin.
+
+    When the session made no edits — a valid outcome for warm-start
+    refinements that judge the curated branch already clean — the commit
+    is skipped and the branch is pushed as-is; it still differs from
+    base_branch by the whole implementation, so the PR opens normally.
 
     The branch's final commit is (re)created through the GitHub git data
     API with the App installation token so it's attributed to
@@ -9047,7 +9052,22 @@ def commit_and_push(
         shutil.rmtree(bundle_path, ignore_errors=True)
 
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
-    subprocess.run(["git", "commit", "-m", title], cwd=workdir, check=True)
+    # An empty staged diff means the session reviewed the branch and
+    # changed nothing — a valid (best-case) outcome for warm-start
+    # refinements. The branch still differs from base_branch by the
+    # whole implementation, so push + PR proceed as usual; only the
+    # commit (and the bot re-author below, which would otherwise add an
+    # empty commit) is skipped.
+    has_changes = (
+        subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=workdir,
+        ).returncode
+        != 0
+    )
+    if has_changes:
+        subprocess.run(["git", "commit", "-m", title], cwd=workdir, check=True)
+    else:
+        log.info("  → no changes to commit (branch already clean); pushing as-is")
 
     # Refresh origin's URL with a freshly-minted token before pushing.
     # The URL baked into `origin` at clone time embeds the token (see
@@ -9090,8 +9110,11 @@ def commit_and_push(
     # its blobs) to the remote; we now point the branch at an identical
     # tree wrapped in an API-created commit. `head_sha` is the base we
     # branched from (asserted == origin/<base_branch> above), so it's the
-    # new commit's sole parent.
-    _recommit_via_api(workdir, repo, branch, title, parent_sha=head_sha)
+    # new commit's sole parent. Skipped when nothing was committed: the
+    # branch head IS `head_sha`, and wrapping it would only pin an empty
+    # commit on top.
+    if has_changes:
+        _recommit_via_api(workdir, repo, branch, title, parent_sha=head_sha)
 
 
 def _recommit_via_api(
