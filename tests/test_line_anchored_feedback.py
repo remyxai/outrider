@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from line_anchored_feedback import (
+from run import (
     format_anchored_feedback,
     AnchoredDiff,
     _parse_unified_diff,

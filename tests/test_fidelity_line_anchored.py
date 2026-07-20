@@ -134,14 +134,13 @@ def test_fidelity_audit_prompt_with_large_diff():
 
 
 def test_format_anchored_feedback_used():
-    """Verify the line_anchored_feedback.format_anchored_feedback is imported
-    and callable from run.py."""
-    from line_anchored_feedback import format_anchored_feedback  # noqa: F401
+    """Verify format_anchored_feedback is defined and callable in run.py."""
+    from run import format_anchored_feedback  # noqa: F401
 
-    # Module should be importable
+    # Function should be importable
     assert callable(format_anchored_feedback)
 
-    # Should be imported in run.py
+    # Should be defined in run.py
     assert hasattr(run, "format_anchored_feedback")
 
 
