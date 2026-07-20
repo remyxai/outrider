@@ -23,7 +23,14 @@ observed_landing_zones:
       \ lint_status or test_status equals 'failed' after initial generation"
     branch: interaction-scaling-grounding-the-third-axis-of-test-time-co
     timestamp: '2026-07-19T08:08:20Z'
-  last_observed: '2026-07-19T08:08:20Z'
+  - arxiv: 2607.12713v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "Two entry points in fidelity audit pipeline: (1) `_run_pre_pr_fidelity_check()`\
+      \ \u2192 `_build_fidelity_audit_prompt()` for pre-PR self-review; (2) `run_fidelity_audit()`\
+      \ \u2192 `_build_fidelity_audit_prompt_pa"
+    branch: line-anchored-feedback-cuts-token-costs-and-improves-correct
+    timestamp: '2026-07-20T08:48:48Z'
+  last_observed: '2026-07-20T08:48:48Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -32,4 +39,4 @@ rejected_shapes:
   - arxiv: 2607.00990v1
     timestamp: '2026-07-18T07:32:36Z'
 coordination_signals: []
-last_updated: '2026-07-19T08:08:20Z'
+last_updated: '2026-07-20T08:48:48Z'
