@@ -122,9 +122,9 @@ def test_mint_re_mints_when_cached_token_is_stale(monkeypatch):
     time would be expired at push time. `_mint_bot_token` must re-mint
     when the cached token age exceeds `_BOT_TOKEN_MAX_AGE_S`.
 
-    Regression test for the git push 401 seen on the atropos smoke
-    (run 29552199454): first mint at 03:26:34, push attempt at 04:40:24
-    — 74 min later, 14 min past the 60-min TTL, cached-token bug bit.
+    Regression test for a git push 401 seen in the wild: first mint at
+    03:26:34, push attempt at 04:40:24 — 74 min later, 14 min past the
+    60-min TTL, cached-token bug bit.
     """
     _clean_env(
         monkeypatch,

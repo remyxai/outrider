@@ -161,7 +161,7 @@ def test_detect_default_branch_after_ref_checkout(fake_remote, tmp_path, monkeyp
     remote's default (main) — not the currently-checked-out ref. Otherwise
     the PR base would open against the ref instead of main, and the diff
     review wouldn't show the full baseline+refinement state (observed on
-    the OLMo-core live test, run 29198542589 → PR #12 with base=T3 ref)."""
+    a live warm-start test where the PR opened with the ref as its base)."""
     bare, _main_sha, _refine_sha = fake_remote
     monkeypatch.setenv("INPUT_START_FROM_REF", "refine-me")
 

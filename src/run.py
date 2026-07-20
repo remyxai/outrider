@@ -10733,10 +10733,10 @@ def process_target(target: Target) -> dict:
             workdir, branch, pr_title, repo=target.repo, base_branch=default_branch
         )
 
-        # REMYX-186: Pre-PR fidelity gate.
+        # Pre-PR fidelity gate.
         # Run fidelity on the local branch BEFORE opening the PR. If
         # substantive deviations from the reference are found, either
-        # patch the branch (REMYX-185, scoped-down single-attempt) or
+        # patch the branch (scoped-down single-attempt) or
         # skip publication entirely. Fabricated artifacts never become
         # public.
         prepub_verdict = _run_pre_pr_fidelity_check(
@@ -12843,7 +12843,7 @@ def _build_fidelity_audit_prompt(
     )
     body_excerpt = (pr_body or "")[:4000]
 
-    # Mode-aware guidance (REMYX-195). Mode 3 is handled by a separate
+    # Mode-aware guidance. Mode 3 is handled by a separate
     # function; here we branch between Mode 1 (strict) and Mode 2
     # (auxiliary-substitution-tolerant).
     substitutions = substitutions or []
@@ -13015,7 +13015,7 @@ def _run_pre_pr_fidelity_check(
     doesn't exist yet. Returns a verdict dict with ``needs_judgment``,
     ``items_count``, ``coverage_section``, ``status``, ``matrix``.
 
-    Mode-aware routing (REMYX-195): reads ``self_review['mode_cited']``
+    Mode-aware routing: reads ``self_review['mode_cited']``
     to pick the audit shape.
 
       * **Mode 1 (direct port)** — strict reference-vs-diff comparison.
@@ -14010,7 +14010,7 @@ def run_fidelity_audit(target: Target) -> dict:
     # gate so downstream chain phases see the same needs_judgment flag that
     # actually drove the labeling decision above. The prior bare `needs_judgment`
     # reference produced a NameError that crashed the fidelity-audit phase after
-    # the PR opened (atropos run 29357999483 · PR #16 · 2026-07-14).
+    # the PR opened.
     result["needs_judgment"] = effective_needs_judgment
     result["coverage_summary"] = matrix.get("summary", "")
     result["pr_url"] = pr.get("html_url", "")

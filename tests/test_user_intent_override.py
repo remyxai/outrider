@@ -70,7 +70,7 @@ def test_lead_content_url_form_also_triggers_override(monkeypatch):
     # here we care that either shape signals intent to the throttle.
     monkeypatch.setenv(
         "INPUT_LEAD_CONTENT",
-        "https://linear.app/remyx/issue/REMYX-239/road-vla-opus-refinement",
+        "https://linear.app/example/issue/TEAM-239/some-refinement-issue",
     )
     assert run._has_user_intent_override(_target()) is True
 

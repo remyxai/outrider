@@ -246,7 +246,7 @@ def test_patch_returns_true_when_files_touched(tmp_path):
     assert "Fidelity remediation brief" in invoc.read_text()
 
 
-# --- REMYX-195: mode-aware fidelity gate -------------------------------------
+# --- mode-aware fidelity gate ------------------------------------------------
 
 def test_classify_mode_cited_reads_mode_1():
     assert run._classify_mode_cited({"mode_cited": "Mode 1 (direct port)"}) == "mode-1"
@@ -291,7 +291,7 @@ def test_build_fidelity_audit_prompt_mode_2_injects_substitutions():
 
 def test_build_fidelity_audit_prompt_scoped_out_lists_deferred_items():
     """Scoped-out items should appear in the prompt so the gate downgrades
-    them from needs-judgment to deferred (original REMYX-195 fix)."""
+    them from needs-judgment to deferred."""
     prompt = run._build_fidelity_audit_prompt(
         pr_title="Test", pr_body="body", pr_diff="diff",
         arxiv_id="2606.27025", reference_url="https://github.com/x/y",
@@ -497,8 +497,6 @@ def test_process_target_source_passes_self_review_to_both_fidelity_calls():
 # arxiv 2303.17580 (HuggingGPT). Comparing PLAY2PROMPT code against
 # HuggingGPT flagged every legitimate feature as fabrication and triggered
 # a false-positive `skipped_fidelity_fabrication_after_patch`.
-# See https://linear.app/remyx/issue/REMYX-234 comment thread for the
-# investigation write-up.
 
 def test_arxiv_bare_id_strips_v_suffix():
     assert run._arxiv_bare_id("2503.14432v2") == "2503.14432"
