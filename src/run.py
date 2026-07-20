@@ -76,6 +76,7 @@ from exploration_structure import (
     structure_enabled,
 )
 from instruction_files import render_instruction_files
+from line_anchored_feedback import format_anchored_feedback
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -12857,6 +12858,11 @@ def _build_fidelity_audit_prompt(
     )
     body_excerpt = (pr_body or "")[:4000]
 
+    # Format diff using line-anchored feedback (arxiv:2607.12713v1).
+    # This reduces token costs and improves correctness by providing
+    # feedback with explicit line numbers rather than holistic context.
+    anchored_diff_feedback = format_anchored_feedback(diff_excerpt)
+
     # Mode-aware guidance. Mode 3 is handled by a separate
     # function; here we branch between Mode 1 (strict) and Mode 2
     # (auxiliary-substitution-tolerant).
@@ -12913,7 +12919,18 @@ NOT ``needs-judgment``:
 {body_excerpt}
 ```
 
-## PR diff
+## PR diff (line-anchored format)
+
+For efficient code review, the diff is presented in line-anchored format with
+explicit line numbers. This structured feedback reduces token costs and improves
+correctness (as demonstrated in "Line-Anchored Feedback Cuts Token Costs and
+Improves Correctness in AI Code Editing", arxiv:2607.12713v1).
+
+```
+{anchored_diff_feedback}
+```
+
+For detailed inspection, the full unified diff:
 
 ```
 {diff_excerpt}
@@ -13520,6 +13537,11 @@ def _build_fidelity_audit_prompt_paper_anchored(
     body_excerpt = (pr_body or "")[:4000]
     paper_excerpt = paper_text[:8000]
 
+    # Format diff using line-anchored feedback (arxiv:2607.12713v1).
+    # This reduces token costs and improves correctness by providing
+    # feedback with explicit line numbers rather than holistic context.
+    anchored_diff_feedback = format_anchored_feedback(diff_excerpt)
+
     return f"""You are auditing a draft PR's fidelity to the paper it claims to implement.
 
 # PR under audit
@@ -13542,7 +13564,18 @@ def _build_fidelity_audit_prompt_paper_anchored(
 {body_excerpt}
 ```
 
-## PR diff
+## PR diff (line-anchored format)
+
+For efficient code review, the diff is presented in line-anchored format with
+explicit line numbers. This structured feedback reduces token costs and improves
+correctness (as demonstrated in "Line-Anchored Feedback Cuts Token Costs and
+Improves Correctness in AI Code Editing", arxiv:2607.12713v1).
+
+```
+{anchored_diff_feedback}
+```
+
+For detailed inspection, the full unified diff:
 
 ```
 {diff_excerpt}
