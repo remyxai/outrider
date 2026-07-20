@@ -60,6 +60,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3624,6 +3625,126 @@ def _remyx_get_asset(arxiv_id: str) -> dict | None:
     if isinstance(resp, dict) and (resp.get("arxiv_id") or resp.get("title")):
         return resp
     return None
+
+
+_ARXIV_API_ENDPOINT = "https://export.arxiv.org/api/query"
+_ARXIV_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+_ARXIV_ID_IN_ABS_URL = re.compile(r"arxiv\.org/abs/(\d{4}\.\d{4,5}(?:v\d+)?)")
+# arxiv's API terms request a bot-identifying UA. The default Python-urllib
+# UA is silently filtered by their edge in some cases; setting a proper UA
+# both respects the policy and reliably reaches the origin.
+_ARXIV_USER_AGENT = "Outrider/1.0 (+https://github.com/remyxai/outrider)"
+
+
+def _fetch_arxiv_asset(arxiv_id: str) -> dict | None:
+    """Fetch paper metadata directly from arxiv.org as a catalog-miss fallback.
+
+    Returns an asset envelope shaped like ``_remyx_get_asset`` output so
+    downstream consumers (``_asset_to_recommendation``) don't switch on
+    the source. Used when the Remyx catalog hasn't ingested a paper yet —
+    common for very recent submissions where an ingestion pass hasn't
+    caught up. Traces built off this envelope won't have the corpus-
+    derived enrichment (interest-context, experiment-history) that
+    ingested assets carry; call sites should log the degraded shape.
+
+    Returns ``None`` on 404 / malformed XML / network failure. Never
+    raises — a fallback path must not itself become a new skip cause.
+    Failure paths log at WARNING so runners' default log level (INFO)
+    surfaces them; silent None was the debug shape and made the fallback
+    indistinguishable from a hard skip.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return None
+    url = f"{_ARXIV_API_ENDPOINT}?id_list={urllib.parse.quote(arxiv_id)}"
+    req = urllib.request.Request(url, headers={"User-Agent": _ARXIV_USER_AGENT})
+    # arxiv aggressively throttles shared runner IP ranges (GH Actions Azure
+    # egress is a common one). A first-attempt 429 is expected; retry with
+    # exponential backoff + honor the server's Retry-After when present.
+    # arxiv's documented API cadence is 3s between queries, so 3s → 6s → 12s
+    # matches their guidance and clears typical short-window throttles.
+    body = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = r.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                retry_after_hdr = e.headers.get("Retry-After") or "" if e.headers else ""
+                try:
+                    retry_after = int(retry_after_hdr) if retry_after_hdr else 0
+                except ValueError:
+                    retry_after = 0
+                delay = max(retry_after, 3 * (2 ** attempt))
+                log.warning(
+                    f"    arxiv fallback rate-limited (429) for {arxiv_id!r}; "
+                    f"retry {attempt+1}/3 after {delay}s "
+                    f"(Retry-After: {retry_after_hdr!r})"
+                )
+                time.sleep(delay)
+                continue
+            log.warning(
+                f"    arxiv fallback fetch for {arxiv_id!r} failed on "
+                f"attempt {attempt+1}: HTTP {e.code} {e.reason}"
+            )
+            return None
+        except Exception as e:
+            log.warning(
+                f"    arxiv fallback fetch for {arxiv_id!r} failed on "
+                f"attempt {attempt+1}: {type(e).__name__}: {e}"
+            )
+            return None
+    if body is None:
+        log.warning(
+            f"    arxiv fallback for {arxiv_id!r} exhausted retries "
+            f"without a successful response"
+        )
+        return None
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        log.warning(
+            f"    arxiv fallback XML parse for {arxiv_id!r} failed: {e} "
+            f"(response head: {body[:200]!r})"
+        )
+        return None
+    entries = root.findall(f"{_ARXIV_ATOM_NS}entry")
+    if not entries:
+        log.warning(
+            f"    arxiv fallback returned no <entry> for {arxiv_id!r} "
+            f"(response was {len(body)} bytes; totalResults likely 0)"
+        )
+        return None
+    entry = entries[0]
+    title_el = entry.find(f"{_ARXIV_ATOM_NS}title")
+    summary_el = entry.find(f"{_ARXIV_ATOM_NS}summary")
+    id_el = entry.find(f"{_ARXIV_ATOM_NS}id")
+    title = (title_el.text or "").strip() if title_el is not None else ""
+    if not title:
+        log.warning(
+            f"    arxiv fallback entry for {arxiv_id!r} had empty title — "
+            f"treating as miss (likely withdrawn / placeholder entry)"
+        )
+        return None
+    abstract = (summary_el.text or "").strip() if summary_el is not None else ""
+    canonical_id = arxiv_id
+    if id_el is not None and id_el.text:
+        m = _ARXIV_ID_IN_ABS_URL.search(id_el.text)
+        if m:
+            canonical_id = m.group(1)
+    log.info(
+        f"    arxiv fallback resolved {arxiv_id!r} → {canonical_id!r}: "
+        f"{title[:80]}"
+    )
+    return {
+        "arxiv_id": canonical_id,
+        "title": title,
+        "abstract": abstract,
+        # arxiv metadata carries no github_url / hf_url; downstream
+        # _extract_huggingface_urls() scans the abstract for HF links,
+        # matching what catalog assets do when those fields are unset.
+    }
 
 
 _PIN_METHOD_ARXIV_RE = re.compile(r"^\d{4}\.\d{4,5}(v\d+)?$")
@@ -9580,10 +9701,28 @@ def process_target(target: Target) -> dict:
         # per-candidate license enrichment on the full pool). Explicit
         # "use THIS paper" intent doesn't need the ranker's opinion.
         asset = _remyx_get_asset(target.pin_arxiv)
+        payload_source = "catalog"
         if asset is None:
-            log.info(f"  ✗ skipped_pin_arxiv_not_found: pin-arxiv "
-                     f"{target.pin_arxiv!r} not found in Remyx catalog")
-            result["status"] = "skipped_pin_arxiv_not_found"
+            # Catalog miss — very recent papers hit this gap silently before
+            # the ingestion pass catches up. Fall back to a direct arxiv.org
+            # fetch so pin-arxiv still resolves. The fallback envelope
+            # lacks corpus-derived enrichment (interest_context,
+            # experiment_history stay empty), but has enough for the
+            # coding session to proceed against the target paper.
+            fallback_asset = _fetch_arxiv_asset(target.pin_arxiv)
+            if fallback_asset is not None:
+                asset = fallback_asset
+                payload_source = "arxiv_fallback"
+                log.warning(
+                    f"  ⚠ pin-arxiv {target.pin_arxiv!r} missed the Remyx "
+                    f"catalog; using direct arxiv metadata as fallback. "
+                    f"Traces won't carry corpus-derived enrichment."
+                )
+        if asset is None:
+            log.info(f"  ✗ skipped_pin_arxiv_unresolvable: pin-arxiv "
+                     f"{target.pin_arxiv!r} not in Remyx catalog and "
+                     f"not resolvable via arxiv.org")
+            result["status"] = "skipped_pin_arxiv_unresolvable"
             result["pin_arxiv_requested"] = target.pin_arxiv
             return result
         rec = _asset_to_recommendation(
@@ -9594,9 +9733,11 @@ def process_target(target: Target) -> dict:
         )
         log.info(
             f"  → pin-arxiv {target.pin_arxiv!r} resolved to "
-            f"{rec.paper_title[:60]}… (skipped ranker pool)"
+            f"{rec.paper_title[:60]}… (skipped ranker pool, "
+            f"source={payload_source})"
         )
         candidates = [rec]
+        result["payload_source"] = payload_source
         result["pin_arxiv_resolution"] = {
             "arxiv_id": rec.arxiv_id,
             "title": rec.paper_title,
@@ -9754,7 +9895,7 @@ def process_target(target: Target) -> dict:
                     f"  ✗ pin-arxiv {target.pin_arxiv!r} unexpectedly "
                     f"absent from viable pool (fast-path bug?); skipping"
                 )
-                result["status"] = "skipped_pin_arxiv_not_found"
+                result["status"] = "skipped_pin_arxiv_unresolvable"
                 result["pin_arxiv_requested"] = target.pin_arxiv
                 return result
         if pinned_idx is not None:
