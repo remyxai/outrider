@@ -186,6 +186,35 @@ inputs:
                            stub density, self-review) to keep PRs honest.
     required: false
     default: 'strict'
+  fidelity-policy:
+    description: |
+      How the pre-PR fidelity gate treats a needs-judgment verdict (the
+      audit that compares the drafted diff against the paper's reference
+      implementation before opening the PR). One of:
+
+        block (default) — a needs-judgment verdict blocks publication: one
+                          scoped patch attempt, then skip if it still flags
+                          (branch mode preserves the branch instead). Keeps
+                          fabricated / hallucinated implementations out of
+                          public PRs. Best for autonomous runs on arbitrary
+                          repos.
+        advisory        — run the audit and attach the "## Coverage" matrix,
+                          but never block: the PR opens even when items are
+                          flagged. Best for curated or warm-start runs
+                          (start-from-ref) where a human already vetted the
+                          branch and a strict full-reference-port comparison
+                          is the wrong lens for a scoped integration. Reuses
+                          the existing medium-confidence advisory path.
+        off             — skip the gate entirely (no reference clone, no
+                          audit). The other validators (path allowlist,
+                          integration check, stub density, self-review,
+                          diff-risk) still apply.
+
+      Independent of the medium-confidence auto-advisory behavior, which
+      still applies under `block` when the reference doesn't self-identify
+      strongly with the paper.
+    required: false
+    default: 'block'
   lookback:
     description: |
       Recommendation lookback window. The action pulls the candidate pool
@@ -657,6 +686,7 @@ runs:
         INPUT_GUARDRAILS_ALLOWLIST: ${{ inputs.guardrails-allowlist }}
         INPUT_GUARDRAILS_BLOCKLIST: ${{ inputs.guardrails-blocklist }}
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
+        INPUT_FIDELITY_POLICY: ${{ inputs.fidelity-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         INPUT_SEARCH_METHOD: ${{ inputs.search-method }}
