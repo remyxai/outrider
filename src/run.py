@@ -2517,8 +2517,16 @@ def _fetch_url_html(url: str, timeout_s: int = 10) -> str:
 
 def _extract_project_page_urls(html: str, title: str) -> list[str]:
     """Extract URLs from ``html`` that look like paper-project pages —
-    URL path contains a title-word substring. Filters out github (already
-    handled by the direct-arxiv-HTML path) and boilerplate hosts.
+    URL path OR hostname contains a title-word substring. Filters out
+    github (already handled by the direct-arxiv-HTML path) and
+    boilerplate hosts.
+
+    Hostname match catches the ``<paper-name>.github.io/`` (and
+    ``<paper-name>.io/`` / ``<lab>.<paper>.dev/``) pattern that's the
+    dominant academic project-page convention — the paper name lives in
+    the subdomain and the path is empty. The prior path-only check
+    silently skipped these, costing license detection on any paper whose
+    only code link was reachable via such a project page.
     """
     if not html:
         return []
@@ -2537,12 +2545,18 @@ def _extract_project_page_urls(html: str, title: str) -> list[str]:
             "doi.org/", "openreview.net/",
         )):
             continue
-        # Path (after the host) contains at least one title-word substring?
+        # Split into hostname + path. Empty path is common for project
+        # pages served at the root of a paper-named subdomain.
         try:
-            path = url.split("//", 1)[1].split("/", 1)[1].lower()
+            host_and_path = url.split("//", 1)[1]
         except IndexError:
             continue
-        if not any(w in path for w in title_words):
+        parts = host_and_path.split("/", 1)
+        host = parts[0].lower()
+        path = parts[1].lower() if len(parts) > 1 else ""
+        # Accept when a title-word appears in EITHER path OR hostname.
+        if not (any(w in path for w in title_words)
+                or any(w in host for w in title_words)):
             continue
         if url in seen:
             continue
