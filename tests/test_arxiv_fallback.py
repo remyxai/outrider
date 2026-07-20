@@ -1,4 +1,4 @@
-"""Tests for the REMYX-247 arxiv-fallback path:
+"""Tests for the arxiv-fallback path:
 
   - `_fetch_arxiv_asset(arxiv_id)` fetches metadata directly from
     export.arxiv.org and shapes it as an asset envelope
@@ -10,8 +10,7 @@
 
 The motivating case: TIPSv2 (arxiv 2604.12012) published early July 2026,
 merged into transformers 2026-07-07 but not yet ingested by the Remyx
-catalog when a pin-arxiv dispatch tried to target it. See run
-smellslikeml/prismatic-vlms/actions/runs/29712103628.
+catalog when a pin-arxiv dispatch tried to target it.
 
 Run with: pytest tests/test_arxiv_fallback.py -q
 """
@@ -134,7 +133,7 @@ def test_fetch_canonical_id_falls_back_to_input(monkeypatch):
 
 def test_fetch_retries_on_429_and_succeeds(monkeypatch):
     """arxiv throttles GH Actions runner IPs — first 429 must retry, not
-    surface as a hard miss. Motivating case: run 29712953207."""
+    surface as a hard miss."""
     import urllib.error
     call_count = {"n": 0}
     def fake_urlopen(req, timeout=20):

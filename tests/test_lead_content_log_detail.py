@@ -49,7 +49,7 @@ def test_ok_status_stays_compact():
     resp = tool_response_ok(
         connector="linear",
         latency_ms=210.4,
-        inline_snippet="# REMYX-XXX ...",
+        inline_snippet="# TEAM-XXX ...",
     )
     line = _log_line_for(resp)
     assert "status=ok" in line
@@ -82,13 +82,13 @@ def test_http_400_class_error_surfaces_code_and_message():
         connector="linear",
         latency_ms=366.0,
         error_code="http_400",
-        message="Linear API returned HTTP 400 for REMYX-240",
+        message="Linear API returned HTTP 400 for TEAM-240",
     )
     line = _log_line_for(resp)
     assert "status=error" in line
     assert "latency=366ms" in line
     assert "error_code=http_400" in line
-    assert "Linear API returned HTTP 400 for REMYX-240" in line
+    assert "Linear API returned HTTP 400 for TEAM-240" in line
 
 
 def test_graphql_error_message_is_truncated_to_200_chars():

@@ -1319,7 +1319,7 @@ def test_guard_bypass_lead_content(tmp_path, monkeypatch):
     workdir = _guard_test_setup(tmp_path, _INTEL_WITH_LANDING)
     monkeypatch.setenv("INPUT_MAINTAIN_STATE", "true")
     monkeypatch.setenv("INPUT_LEAD_CONTENT",
-                       "https://linear.app/remyx/issue/REMYX-XYZ")
+                       "https://linear.app/example/issue/TEAM-XYZ")
     assert (os.environ.get("INPUT_LEAD_CONTENT") or "").strip().startswith("https://")
 
 

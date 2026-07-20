@@ -8979,7 +8979,12 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
 def commit_and_push(
     workdir: Path, branch: str, title: str, repo: str, base_branch: str = "main",
 ) -> None:
-    """Stage all changes, commit, and push the branch to origin.
+    """Stage all changes, commit (if any), and push the branch to origin.
+
+    When the session made no edits — a valid outcome for warm-start
+    refinements that judge the curated branch already clean — the commit
+    is skipped and the branch is pushed as-is; it still differs from
+    base_branch by the whole implementation, so the PR opens normally.
 
     The branch's final commit is (re)created through the GitHub git data
     API with the App installation token so it's attributed to
@@ -9061,7 +9066,22 @@ def commit_and_push(
         shutil.rmtree(bundle_path, ignore_errors=True)
 
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
-    subprocess.run(["git", "commit", "-m", title], cwd=workdir, check=True)
+    # An empty staged diff means the session reviewed the branch and
+    # changed nothing — a valid (best-case) outcome for warm-start
+    # refinements. The branch still differs from base_branch by the
+    # whole implementation, so push + PR proceed as usual; only the
+    # commit (and the bot re-author below, which would otherwise add an
+    # empty commit) is skipped.
+    has_changes = (
+        subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=workdir,
+        ).returncode
+        != 0
+    )
+    if has_changes:
+        subprocess.run(["git", "commit", "-m", title], cwd=workdir, check=True)
+    else:
+        log.info("  → no changes to commit (branch already clean); pushing as-is")
 
     # Refresh origin's URL with a freshly-minted token before pushing.
     # The URL baked into `origin` at clone time embeds the token (see
@@ -9104,8 +9124,11 @@ def commit_and_push(
     # its blobs) to the remote; we now point the branch at an identical
     # tree wrapped in an API-created commit. `head_sha` is the base we
     # branched from (asserted == origin/<base_branch> above), so it's the
-    # new commit's sole parent.
-    _recommit_via_api(workdir, repo, branch, title, parent_sha=head_sha)
+    # new commit's sole parent. Skipped when nothing was committed: the
+    # branch head IS `head_sha`, and wrapping it would only pin an empty
+    # commit on top.
+    if has_changes:
+        _recommit_via_api(workdir, repo, branch, title, parent_sha=head_sha)
 
 
 def _recommit_via_api(
@@ -10724,10 +10747,10 @@ def process_target(target: Target) -> dict:
             workdir, branch, pr_title, repo=target.repo, base_branch=default_branch
         )
 
-        # REMYX-186: Pre-PR fidelity gate.
+        # Pre-PR fidelity gate.
         # Run fidelity on the local branch BEFORE opening the PR. If
         # substantive deviations from the reference are found, either
-        # patch the branch (REMYX-185, scoped-down single-attempt) or
+        # patch the branch (scoped-down single-attempt) or
         # skip publication entirely. Fabricated artifacts never become
         # public.
         prepub_verdict = _run_pre_pr_fidelity_check(
@@ -12834,7 +12857,7 @@ def _build_fidelity_audit_prompt(
     )
     body_excerpt = (pr_body or "")[:4000]
 
-    # Mode-aware guidance (REMYX-195). Mode 3 is handled by a separate
+    # Mode-aware guidance. Mode 3 is handled by a separate
     # function; here we branch between Mode 1 (strict) and Mode 2
     # (auxiliary-substitution-tolerant).
     substitutions = substitutions or []
@@ -13006,7 +13029,7 @@ def _run_pre_pr_fidelity_check(
     doesn't exist yet. Returns a verdict dict with ``needs_judgment``,
     ``items_count``, ``coverage_section``, ``status``, ``matrix``.
 
-    Mode-aware routing (REMYX-195): reads ``self_review['mode_cited']``
+    Mode-aware routing: reads ``self_review['mode_cited']``
     to pick the audit shape.
 
       * **Mode 1 (direct port)** — strict reference-vs-diff comparison.
@@ -14001,7 +14024,7 @@ def run_fidelity_audit(target: Target) -> dict:
     # gate so downstream chain phases see the same needs_judgment flag that
     # actually drove the labeling decision above. The prior bare `needs_judgment`
     # reference produced a NameError that crashed the fidelity-audit phase after
-    # the PR opened (atropos run 29357999483 · PR #16 · 2026-07-14).
+    # the PR opened.
     result["needs_judgment"] = effective_needs_judgment
     result["coverage_summary"] = matrix.get("summary", "")
     result["pr_url"] = pr.get("html_url", "")
