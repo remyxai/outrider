@@ -16,6 +16,8 @@ Validating and comparing new methods against your own codebase is 10× the work 
 
 Each dispatch runs the coding agent in a fresh, ephemeral runner — candidates don't share state, testing variance stays low, and you can dispatch dozens per week without context pollution. Backends are pluggable: Anthropic Opus for the shipping commit, z.ai's GLM-5.2 at ~20× lower cost for scouting and branch-mode exploration.
 
+<img width="2752" height="1536" alt="outrider-pipeline-diagram" src="https://github.com/user-attachments/assets/e7732730-9130-4f0f-96f7-d23c8047387d" />
+
 
 ## What you get
 
