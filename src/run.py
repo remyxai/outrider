@@ -1398,6 +1398,9 @@ DRAFT_MODES = ("always", "on_test_failure", "never")
 # Test-integration gate policy values. See Target.test_integration_policy.
 TEST_INTEGRATION_POLICIES = ("strict", "soft", "off")
 
+# Pre-PR fidelity gate policy values. See Target.fidelity_policy.
+FIDELITY_POLICIES = ("block", "advisory", "off")
+
 # Terminal statuses that should make the workflow step exit non-zero (red
 # in CI). Everything else — Issues, skips, PRs — is a legitimate green
 # outcome. `claude_failed` used to exit 0, so a run that produced no PR/Issue
@@ -1528,6 +1531,18 @@ class Target:
     # libraries) benefit from "soft"; application/pipeline repos should
     # keep "strict".
     test_integration_policy: str = "strict"
+    # Pre-PR fidelity gate policy (see `_run_pre_pr_fidelity_check`):
+    #   "block"    — default; a needs-judgment verdict blocks publication
+    #                (patch attempt, then skip; branch mode preserves the
+    #                branch). Fabricated artifacts never become public.
+    #   "advisory" — run the audit and surface the coverage matrix, but
+    #                NEVER block: the PR opens even when items are flagged.
+    #                For curated / warm-start runs where a human already
+    #                vetted the branch and a strict full-reference-port
+    #                comparison is the wrong lens (scoped integrations).
+    #                Reuses the medium-confidence advisory path.
+    #   "off"      — skip the gate entirely (no reference clone, no audit).
+    fidelity_policy: str = "block"
     # Per-run wall-clock budget for the Claude Code implementation step.
     # 600s was too tight on large repos; configurable via `claude-timeout`.
     claude_timeout_s: int = 900
@@ -11204,6 +11219,16 @@ def build_target_from_env() -> Target:
         )
         sys.exit(2)
 
+    fidelity_policy = _optional_env(
+        "INPUT_FIDELITY_POLICY", "block"
+    ).strip().lower()
+    if fidelity_policy not in FIDELITY_POLICIES:
+        log.error(
+            f"INPUT_FIDELITY_POLICY={fidelity_policy!r} "
+            f"is invalid. Must be one of {FIDELITY_POLICIES}."
+        )
+        sys.exit(2)
+
     # Default raised from 900s to 1500s in v1.7.24 — GLM sessions with
     # staged-synthesis routinely reach 15-20 min, and users triggering
     # runs without prior tuning were hitting the 15-min ceiling. Opus
@@ -11231,6 +11256,7 @@ def build_target_from_env() -> Target:
         guardrails_allowlist=guardrails_allowlist,
         guardrails_blocklist=guardrails_blocklist,
         test_integration_policy=test_integration_policy,
+        fidelity_policy=fidelity_policy,
         claude_timeout_s=claude_timeout_s,
         pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
         search_method=_optional_env("INPUT_SEARCH_METHOD", ""),
@@ -12929,12 +12955,6 @@ Improves Correctness in AI Code Editing", arxiv:2607.12713v1).
 ```
 {anchored_diff_feedback}
 ```
-
-For detailed inspection, the full unified diff:
-
-```
-{diff_excerpt}
-```
 {mode_guidance}
 # Task
 
@@ -13030,6 +13050,29 @@ def _classify_mode_cited(review: "dict | None") -> str:
     return ""
 
 
+def _fidelity_advisory(target: "Target", base_advisory: bool) -> bool:
+    """True when fidelity flags should surface but never block publication.
+
+    Advisory when ANY of:
+      * ``base_advisory`` — the reference confidence is only medium (the
+        reference doesn't self-identify strongly enough to trust the flag
+        count as ground truth);
+      * ``fidelity-policy: advisory`` — curated / warm-start runs where a
+        human already vetted the branch;
+      * ``fidelity-policy: off`` — the pre-PR gate is short-circuited before
+        this is reached, so this only governs the post-PR chain, where "off"
+        must likewise not re-apply a needs-judgment label the gate skipped.
+
+    Defaults to the medium-confidence behavior when ``target`` has no policy
+    attribute (defensive; the field always exists on a normally-constructed
+    Target).
+    """
+    return (
+        base_advisory
+        or getattr(target, "fidelity_policy", "block") in ("advisory", "off")
+    )
+
+
 def _run_pre_pr_fidelity_check(
     rec: "Recommendation",
     target: "Target",
@@ -13088,6 +13131,14 @@ def _run_pre_pr_fidelity_check(
         "mode_cited": mode or "mode-1",
     }
 
+    # Policy gate: "off" skips the audit entirely — no reference clone, no
+    # Claude call. The default verdict (needs_judgment=False) lets the flow
+    # proceed to open the PR. Applies to every mode.
+    if getattr(target, "fidelity_policy", "block") == "off":
+        verdict["status"] = "pre_pr_fidelity_skipped_policy_off"
+        log.info("  → pre-PR fidelity: policy=off — skipping the gate")
+        return verdict
+
     # Mode 3 has its own audit shape — insight-preservation, no reference impl needed.
     if mode == "mode-3":
         return _run_mode3_insight_preservation_check(
@@ -13136,11 +13187,13 @@ def _run_pre_pr_fidelity_check(
         )
         return verdict
 
-    advisory_only = (confidence == "medium")
+    advisory_only = _fidelity_advisory(target, confidence == "medium")
     if advisory_only:
+        _why = ("fidelity-policy=advisory"
+                if getattr(target, "fidelity_policy", "block") == "advisory"
+                else "medium-confidence reference (title-token match only)")
         log.info(
-            f"  → pre-PR fidelity: medium-confidence reference "
-            f"(title-token match only); running in advisory mode "
+            f"  → pre-PR fidelity: {_why}; running in advisory mode "
             f"(flags surfaced but non-blocking)"
         )
 
@@ -13402,7 +13455,12 @@ def _run_mode3_insight_preservation_check(
         for k in ("docstring_cites_paper", "docstring_frames_as_inspired",
                   "code_embodies_insight")
     )
-    needs_judgment = bool(matrix.get("needs_judgment", False)) or insight_fail
+    raw_needs_judgment = bool(matrix.get("needs_judgment", False)) or insight_fail
+    # fidelity-policy=advisory surfaces the flags but never blocks (mirrors
+    # the reference-anchored advisory path). "off" is short-circuited before
+    # this function is reached.
+    advisory_only = _fidelity_advisory(target, False)
+    needs_judgment = raw_needs_judgment and not advisory_only
 
     verdict.update({
         "needs_judgment": needs_judgment,
@@ -13410,14 +13468,17 @@ def _run_mode3_insight_preservation_check(
         "coverage_section": coverage_section,
         "matrix": matrix,
         "insight_check": insight_check,
+        "advisory_only": advisory_only,
         "status": (
-            "pre_pr_fidelity_mode3_needs_judgment" if needs_judgment
+            "pre_pr_fidelity_advisory" if (advisory_only and raw_needs_judgment)
+            else "pre_pr_fidelity_mode3_needs_judgment" if needs_judgment
             else "pre_pr_fidelity_mode3_insight_preserved"
         ),
     })
     log.info(
         f"  ✓ pre-PR fidelity (mode-3): {verdict['items_count']} items, "
         f"insight_check={insight_check}, needs_judgment={needs_judgment}"
+        + (" (advisory-only)" if advisory_only and raw_needs_judgment else "")
     )
     return verdict
 
@@ -13573,12 +13634,6 @@ Improves Correctness in AI Code Editing", arxiv:2607.12713v1).
 
 ```
 {anchored_diff_feedback}
-```
-
-For detailed inspection, the full unified diff:
-
-```
-{diff_excerpt}
 ```
 
 # Task
@@ -14018,7 +14073,10 @@ def run_fidelity_audit(target: Target) -> dict:
     # with the paper strongly enough to trust judgment as ground truth.
     # Surface the coverage matrix + flag count in the run summary but
     # don't apply the needs-judgment label that would gate reviewer flow.
-    advisory_only = (reference_confidence == "medium")
+    # fidelity-policy=advisory forces the same non-blocking behavior, so the
+    # post-PR chain doesn't re-apply a needs-judgment label the pre-PR gate
+    # deliberately withheld.
+    advisory_only = _fidelity_advisory(target, reference_confidence == "medium")
     effective_needs_judgment = raw_needs_judgment and not advisory_only
 
     if effective_needs_judgment:

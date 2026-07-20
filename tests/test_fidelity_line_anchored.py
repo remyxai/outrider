@@ -47,8 +47,10 @@ def test_fidelity_audit_includes_anchored_feedback():
     assert "arxiv:2607.12713v1" in prompt  # Paper attribution included
     # Should show line numbers from the anchored format
     assert "L" in prompt and ":" in prompt
-    # Original diff should still be available for detailed inspection
-    assert "unified diff" in prompt.lower() or "detailed inspection" in prompt.lower()
+    # The anchored format REPLACES the full unified diff — emitting both would
+    # add tokens and invert the paper's token-cost claim (arxiv:2607.12713v1).
+    assert "unified diff" not in prompt.lower()
+    assert "detailed inspection" not in prompt.lower()
 
 
 def test_paper_anchored_prompt_includes_anchored_feedback():
