@@ -60,6 +60,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3624,6 +3625,68 @@ def _remyx_get_asset(arxiv_id: str) -> dict | None:
     if isinstance(resp, dict) and (resp.get("arxiv_id") or resp.get("title")):
         return resp
     return None
+
+
+_ARXIV_API_ENDPOINT = "https://export.arxiv.org/api/query"
+_ARXIV_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+_ARXIV_ID_IN_ABS_URL = re.compile(r"arxiv\.org/abs/(\d{4}\.\d{4,5}(?:v\d+)?)")
+
+
+def _fetch_arxiv_asset(arxiv_id: str) -> dict | None:
+    """Fetch paper metadata directly from arxiv.org as a catalog-miss fallback.
+
+    Returns an asset envelope shaped like ``_remyx_get_asset`` output so
+    downstream consumers (``_asset_to_recommendation``) don't switch on
+    the source. Used when the Remyx catalog hasn't ingested a paper yet —
+    common for very recent submissions where an ingestion pass hasn't
+    caught up. Traces built off this envelope won't have the corpus-
+    derived enrichment (interest-context, experiment-history) that
+    ingested assets carry; call sites should log the degraded shape.
+
+    Returns ``None`` on 404 / malformed XML / network failure. Never
+    raises — a fallback path must not itself become a new skip cause.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return None
+    url = f"{_ARXIV_API_ENDPOINT}?id_list={urllib.parse.quote(arxiv_id)}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            body = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"    arxiv fallback fetch for {arxiv_id!r} failed: {e}")
+        return None
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        log.debug(f"    arxiv fallback XML parse for {arxiv_id!r} failed: {e}")
+        return None
+    entries = root.findall(f"{_ARXIV_ATOM_NS}entry")
+    if not entries:
+        return None
+    entry = entries[0]
+    title_el = entry.find(f"{_ARXIV_ATOM_NS}title")
+    summary_el = entry.find(f"{_ARXIV_ATOM_NS}summary")
+    id_el = entry.find(f"{_ARXIV_ATOM_NS}id")
+    title = (title_el.text or "").strip() if title_el is not None else ""
+    if not title:
+        # arxiv occasionally returns an empty <entry> for withdrawn / not-yet-
+        # indexed IDs — treat as a miss so the caller falls through to skip.
+        return None
+    abstract = (summary_el.text or "").strip() if summary_el is not None else ""
+    canonical_id = arxiv_id
+    if id_el is not None and id_el.text:
+        m = _ARXIV_ID_IN_ABS_URL.search(id_el.text)
+        if m:
+            canonical_id = m.group(1)
+    return {
+        "arxiv_id": canonical_id,
+        "title": title,
+        "abstract": abstract,
+        # arxiv metadata carries no github_url / hf_url; downstream
+        # _extract_huggingface_urls() scans the abstract for HF links,
+        # matching what catalog assets do when those fields are unset.
+    }
 
 
 _PIN_METHOD_ARXIV_RE = re.compile(r"^\d{4}\.\d{4,5}(v\d+)?$")
@@ -9580,10 +9643,28 @@ def process_target(target: Target) -> dict:
         # per-candidate license enrichment on the full pool). Explicit
         # "use THIS paper" intent doesn't need the ranker's opinion.
         asset = _remyx_get_asset(target.pin_arxiv)
+        payload_source = "catalog"
         if asset is None:
-            log.info(f"  ✗ skipped_pin_arxiv_not_found: pin-arxiv "
-                     f"{target.pin_arxiv!r} not found in Remyx catalog")
-            result["status"] = "skipped_pin_arxiv_not_found"
+            # Catalog miss — very recent papers hit this gap silently before
+            # the ingestion pass catches up. Fall back to a direct arxiv.org
+            # fetch so pin-arxiv still resolves. The fallback envelope
+            # lacks corpus-derived enrichment (interest_context,
+            # experiment_history stay empty), but has enough for the
+            # coding session to proceed against the target paper.
+            fallback_asset = _fetch_arxiv_asset(target.pin_arxiv)
+            if fallback_asset is not None:
+                asset = fallback_asset
+                payload_source = "arxiv_fallback"
+                log.warning(
+                    f"  ⚠ pin-arxiv {target.pin_arxiv!r} missed the Remyx "
+                    f"catalog; using direct arxiv metadata as fallback. "
+                    f"Traces won't carry corpus-derived enrichment."
+                )
+        if asset is None:
+            log.info(f"  ✗ skipped_pin_arxiv_unresolvable: pin-arxiv "
+                     f"{target.pin_arxiv!r} not in Remyx catalog and "
+                     f"not resolvable via arxiv.org")
+            result["status"] = "skipped_pin_arxiv_unresolvable"
             result["pin_arxiv_requested"] = target.pin_arxiv
             return result
         rec = _asset_to_recommendation(
@@ -9594,9 +9675,11 @@ def process_target(target: Target) -> dict:
         )
         log.info(
             f"  → pin-arxiv {target.pin_arxiv!r} resolved to "
-            f"{rec.paper_title[:60]}… (skipped ranker pool)"
+            f"{rec.paper_title[:60]}… (skipped ranker pool, "
+            f"source={payload_source})"
         )
         candidates = [rec]
+        result["payload_source"] = payload_source
         result["pin_arxiv_resolution"] = {
             "arxiv_id": rec.arxiv_id,
             "title": rec.paper_title,
@@ -9754,7 +9837,7 @@ def process_target(target: Target) -> dict:
                     f"  ✗ pin-arxiv {target.pin_arxiv!r} unexpectedly "
                     f"absent from viable pool (fast-path bug?); skipping"
                 )
-                result["status"] = "skipped_pin_arxiv_not_found"
+                result["status"] = "skipped_pin_arxiv_unresolvable"
                 result["pin_arxiv_requested"] = target.pin_arxiv
                 return result
         if pinned_idx is not None:
