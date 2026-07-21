@@ -108,6 +108,51 @@ def test_enrich_out_of_range_index_gets_safe_defaults():
     assert enriched[0]["license_compat"] == 0.0
 
 
+def test_enrich_tolerates_bare_string_entries():
+    """Looser backends (observed with GLM) emit rejected
+    entries as bare rationale strings instead of the
+    ``{index, why}`` objects the selection schema specifies. These must
+    be carried as unattributed rejections, not crash the run with
+    ``'str' object has no attribute 'get'``."""
+    viable = [_rec("2606.00001v1")]
+    enriched = run._enrich_selection_rejected(
+        [
+            "paper assumes a trainer the repo lacks",
+            {"index": 0, "why": "wrong problem class"},
+        ],
+        viable,
+    )
+    assert len(enriched) == 2
+    assert enriched[0]["title"] == "(unattributed rejection)"
+    assert enriched[0]["reason"] == "paper assumes a trainer the repo lacks"
+    assert enriched[0]["license_class"] == "unknown"
+    assert enriched[1]["arxiv_id"] == "2606.00001v1"
+
+
+def test_enrich_drops_non_dict_non_str_entries():
+    """Entries that are neither dict nor str (e.g. a stray int or list)
+    are dropped rather than crashing — the rejection list only feeds the
+    step summary and telemetry."""
+    viable = [_rec("2606.00001v1")]
+    enriched = run._enrich_selection_rejected(
+        [42, ["nested"], {"index": 0, "why": "kept"}], viable
+    )
+    assert len(enriched) == 1
+    assert enriched[0]["reason"] == "kept"
+
+
+def test_enrich_coerces_non_string_why():
+    """A non-string ``why`` (None, dict, …) is coerced to str so the
+    telemetry compaction's reason-truncation slice can't crash."""
+    viable = [_rec("2606.00001v1")]
+    enriched = run._enrich_selection_rejected(
+        [{"index": 0, "why": None}, {"index": 0, "why": {"text": "odd"}}],
+        viable,
+    )
+    assert enriched[0]["reason"] == ""
+    assert isinstance(enriched[1]["reason"], str)
+
+
 def test_enrich_empty_raw_returns_empty_list():
     """Empty input → empty list; not None, not error. Downstream
     consumers can iterate without nil-checks."""

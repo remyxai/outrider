@@ -9495,24 +9495,43 @@ def _enrich_selection_rejected(
     candidates were ``no-code-link``). Including them in the per-rejected
     record makes that signal queryable at engine scale rather than only
     visible in the per-run step summary.
+
+    Entry shape is normalized defensively: the prompt specifies
+    ``{index, why}`` objects, but looser backends (observed with GLM)
+    emit bare rationale strings. Those are carried as unattributed
+    rejections; any other non-dict entry is dropped. The rejection list
+    only feeds the step summary and telemetry, so a malformed entry must
+    never fail the run.
     """
     enriched = []
     for r in raw:
+        if isinstance(r, str):
+            r = {"why": r}
+        elif not isinstance(r, dict):
+            log.warning(
+                f"  selection: dropping malformed rejected entry "
+                f"(expected dict or str, got {type(r).__name__})"
+            )
+            continue
         idx = r.get("index")
+        reason = str(r.get("why") or "")
         if isinstance(idx, int) and 0 <= idx < len(viable):
             cand = viable[idx]
             enriched.append({
                 "arxiv_id": cand.arxiv_id,
                 "title": cand.paper_title,
-                "reason": r.get("why", ""),
+                "reason": reason,
                 "license_class": cand.license_class,
                 "license_compat": cand.license_compat,
             })
         else:
             enriched.append({
                 "arxiv_id": "",
-                "title": "(candidate index out of range)",
-                "reason": r.get("why", ""),
+                "title": (
+                    "(unattributed rejection)" if idx is None
+                    else "(candidate index out of range)"
+                ),
+                "reason": reason,
                 "license_class": "unknown",
                 "license_compat": 0.0,
             })
