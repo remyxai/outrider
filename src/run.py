@@ -323,6 +323,7 @@ for you. Use the patterns below to shape your generated code, PR title,
 PR body, and commit messages. Do NOT re-explore these files yourself
 (that's redundant cost) — the relevant content is summarized here.
 
+{review_conventions_block}
 {contributor_guides_block}
 {pr_template_block}
 {recent_merged_prs_block}
@@ -333,6 +334,12 @@ PR body, and commit messages. Do NOT re-explore these files yourself
 
 ## How to use this orientation
 
+- **Review conventions**: if the "Review conventions (`REVIEW.md`)" block
+  above is present, it is the highest-precedence signal for verdict
+  triggers, test bar, scope stance, and anti-patterns. Shape the diff,
+  PR title, and PR body so the maintainer can apply the block's `approve`
+  criteria without asking for changes. When the block is absent, fall
+  back to the contributor-guide / PR-history signals below.
 - **PR title**: match the convention shown in the recent merged PRs above
   (the title pattern — e.g. `<scope>: <verb> <thing>` if that's what
   recent merges follow). Do not use Remyx-prefixed titles.
@@ -4922,6 +4929,36 @@ def detect_package_name(workdir: Path) -> str:
     return "src"
 
 
+def _orient_review_conventions(workdir: Path, cap: int = 4000) -> str:
+    """Read the target repo's ``REVIEW.md`` (or ``.github/REVIEW.md``).
+
+    Complements the contributor-guide files: ``REVIEW.md`` carries a repo's
+    review conventions — verdict triggers, test bar, scope stance,
+    author-preference policy, benchmark expectations, anti-patterns — that
+    are usually implicit and rarely captured in ``CONTRIBUTING.md``. When
+    the maintainer authors one, threading it into the agent's context lets
+    the drafter and the downstream fidelity / convention passes shape
+    changes against those norms instead of inferring them from PR history.
+
+    Absent file → empty string (caller omits the section).
+    """
+    for rel in ("REVIEW.md", ".github/REVIEW.md"):
+        path = workdir / rel
+        if not path.is_file():
+            continue
+        try:
+            body = path.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if not body:
+            continue
+        snippet = body[:cap] + ("\n…[truncated]" if len(body) > cap else "")
+        return f"### `{rel}`\n\n{snippet}"
+    log.info("  · no REVIEW.md found in target repo; "
+             "review conventions will be inferred from CONTRIBUTING.md + PR history")
+    return ""
+
+
 def _orient_contributor_guides(workdir: Path, cap: int = 3000) -> str:
     """Read the canonical agent-instruction files; concatenate, truncate to ``cap``.
 
@@ -5225,6 +5262,9 @@ def _collect_repo_orientation(workdir: Path, target: Target, package: str) -> st
         return f"## {title}\n\n{body}"
 
     blocks = {
+        "review_conventions_block": _section(
+            "Review conventions (`REVIEW.md`)", _orient_review_conventions(workdir)
+        ),
         "contributor_guides_block": _section(
             "Contributor guides", _orient_contributor_guides(workdir)
         ),
@@ -12986,6 +13026,13 @@ Focus on the math/algorithm-bearing pieces — function bodies, numerical
 constants, control-flow shape, what's multiplied by what. Don't flag stylistic
 differences (variable naming, docstring shape, test framework) as deviations.
 
+If a ``REVIEW.md`` file is present at the repo root (or ``.github/REVIEW.md``),
+also cross-check the diff against its scope-stance, test-bar, and anti-pattern
+sections. Convention-shaped mismatches surfaced by REVIEW.md belong in the
+Coverage matrix as ``deviation`` / ``needs-judgment`` when they touch the
+mechanism the PR is landing; pure convention mismatches (formatting, PR-body
+shape) are out of scope for this audit and stay with the convention pass.
+
 # Output
 
 Return ONLY a valid JSON object (no prose before or after):
@@ -14718,6 +14765,11 @@ tools as needed.
 If a misalignment is ambiguous between "convention" and "algorithm", skip it
 and leave a note in your final summary. **It is strictly better to skip an
 unclear patch than to make one that touches paper-anchored math.**
+
+If a ``REVIEW.md`` is present at the repo root (or ``.github/REVIEW.md``), treat
+it as the highest-precedence source for scope-stance, test-bar, and
+anti-pattern conventions — it overrides any extracted-from-history pattern
+below where they conflict.
 
 ## Extracted conventions
 
