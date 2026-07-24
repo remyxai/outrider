@@ -64,7 +64,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from diff_risk_score import (
     DIFF_RISK_ISSUE_THRESHOLD,
@@ -12580,6 +12580,179 @@ def run_weekly_summary(target: Target) -> dict:
 #                                       or  outrider:needs-judgment
 #   - status: fidelity_audited / fidelity_skipped_* / fidelity_failed_*
 
+# ─── Line-anchored feedback ──────────────────────────────────────────────────
+#
+# Line-anchored feedback formatting for efficient code review, implementing the
+# core insight from "Line-Anchored Feedback Cuts Token Costs and Improves
+# Correctness in AI Code Editing" (arxiv:2607.12713v1): diff feedback provided
+# in a structured, line-numbered format reduces token costs (22-58% reduction
+# observed in the paper) and improves correctness, especially for larger files
+# (100+ lines). The functions format diff segments with explicit line numbers,
+# making feedback more precise and reducing the model's need to infer context
+# from surrounding text. Used by the fidelity-audit prompt builders below.
+
+
+class LineAnchor(NamedTuple):
+    """A single line-anchored feedback item."""
+
+    line_number: int
+    context: str  # "added" | "removed" | "modified"
+    content: str  # The actual line content
+    note: str | None = None  # Optional annotation
+
+
+class AnchoredDiff(NamedTuple):
+    """A structured, line-anchored representation of a diff."""
+
+    file_path: str
+    anchors: list[LineAnchor]
+    truncated: bool = False  # True if diff was too large and truncated
+
+
+def _parse_unified_diff(diff_text: str, max_anchors_per_file: int = 100) -> list[AnchoredDiff]:
+    """Parse unified diff format into line-anchored segments.
+
+    Extracts file paths and line numbers from unified diff, producing a
+    structured format suitable for line-anchored feedback. Limits output
+    to max_anchors_per_file per file to keep feedback concise.
+
+    Args:
+        diff_text: Unified diff output (e.g., from git diff)
+        max_anchors_per_file: Maximum anchors to extract per file
+
+    Returns:
+        List of AnchoredDiff objects, one per modified file.
+    """
+    files = []
+    current_file = None
+    current_anchors = []
+    # Separate cursors for the two sides of the diff. Added lines are anchored
+    # to their position in the NEW file (``new_line``); removed lines to their
+    # position in the OLD file (``old_line``). Conflating the two — or deriving
+    # a position from the count of already-emitted anchors — makes the reported
+    # ``L`` numbers drift on any hunk that mixes additions and removals, which
+    # defeats the whole point of line anchoring.
+    new_line = 0
+    old_line = 0
+    current_truncated = False
+
+    lines = diff_text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # File header: "--- a/path/to/file" or "diff --git a/... b/..."
+        if line.startswith("--- a/"):
+            # Save previous file if any
+            if current_file is not None:
+                files.append(AnchoredDiff(
+                    file_path=current_file,
+                    anchors=current_anchors,
+                    truncated=current_truncated,
+                ))
+
+            # Extract filename from "--- a/path/to/file"
+            current_file = line[6:]  # strip "--- a/"
+            current_anchors = []
+            current_truncated = False
+            i += 1
+            continue
+
+        # Hunk header: "@@ -10,5 +20,7 @@" — reset both cursors to the hunk's
+        # declared start lines (old side, new side).
+        if line.startswith("@@"):
+            match = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if match:
+                old_line = int(match.group(1))
+                new_line = int(match.group(2))
+            i += 1
+            continue
+
+        # Content lines
+        if line.startswith("+") and not line.startswith("+++"):
+            # Added line — position is in the new file.
+            if len(current_anchors) < max_anchors_per_file:
+                current_anchors.append(LineAnchor(
+                    line_number=new_line,
+                    context="added",
+                    content=line[1:],  # Strip leading '+'
+                ))
+            else:
+                current_truncated = True
+            new_line += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            # Removed line — position is in the old file.
+            if len(current_anchors) < max_anchors_per_file:
+                current_anchors.append(LineAnchor(
+                    line_number=old_line,
+                    context="removed",
+                    content=line[1:],  # Strip leading '-'
+                ))
+            else:
+                current_truncated = True
+            old_line += 1
+        elif line.startswith(" "):
+            # Context line (unchanged) — advances both sides.
+            new_line += 1
+            old_line += 1
+
+        i += 1
+
+    # Save last file
+    if current_file is not None:
+        files.append(AnchoredDiff(
+            file_path=current_file,
+            anchors=current_anchors,
+            truncated=current_truncated,
+        ))
+
+    return files
+
+
+def format_anchored_feedback(diff_text: str) -> str:
+    """Format diff as structured, line-anchored feedback.
+
+    Converts a unified diff into a structured format that lists changed
+    lines with explicit line numbers. This reduces token usage by making
+    feedback more precise and reducing context-inference work.
+
+    Args:
+        diff_text: Unified diff output
+
+    Returns:
+        Formatted line-anchored feedback string suitable for inclusion
+        in an LLM prompt.
+    """
+    anchored_diffs = _parse_unified_diff(diff_text)
+
+    if not anchored_diffs:
+        return "(no changes)"
+
+    sections = []
+    for diff in anchored_diffs:
+        file_section = [f"**File: {diff.file_path}**"]
+
+        if not diff.anchors:
+            file_section.append("  (no changed lines extracted)")
+            if diff.truncated:
+                file_section.append("  ⚠️ (diff was truncated)")
+            sections.append("\n".join(file_section))
+            continue
+
+        for anchor in diff.anchors:
+            status_icon = "+" if anchor.context == "added" else "-"
+            file_section.append(f"  L{anchor.line_number}: {status_icon} {anchor.content[:80]}")
+            if anchor.note:
+                file_section.append(f"      → {anchor.note}")
+
+        if diff.truncated:
+            file_section.append("  ⚠️ (diff was truncated; additional changes not shown)")
+
+        sections.append("\n".join(file_section))
+
+    return "\n\n".join(sections)
+
+
 FIDELITY_COVERAGE_SECTION_HEADER = "## Coverage"
 FIDELITY_LABEL_TRIGGER = "outrider:draft"
 FIDELITY_LABEL_DONE = "outrider:fidelity-done"
@@ -12942,6 +13115,11 @@ def _build_fidelity_audit_prompt(
     )
     body_excerpt = (pr_body or "")[:4000]
 
+    # Format diff using line-anchored feedback (arxiv:2607.12713v1).
+    # This reduces token costs and improves correctness by providing
+    # feedback with explicit line numbers rather than holistic context.
+    anchored_diff_feedback = format_anchored_feedback(diff_excerpt)
+
     # Mode-aware guidance. Mode 3 is handled by a separate
     # function; here we branch between Mode 1 (strict) and Mode 2
     # (auxiliary-substitution-tolerant).
@@ -12998,10 +13176,15 @@ NOT ``needs-judgment``:
 {body_excerpt}
 ```
 
-## PR diff
+## PR diff (line-anchored format)
+
+For efficient code review, the diff is presented in line-anchored format with
+explicit line numbers. This structured feedback reduces token costs and improves
+correctness (as demonstrated in "Line-Anchored Feedback Cuts Token Costs and
+Improves Correctness in AI Code Editing", arxiv:2607.12713v1).
 
 ```
-{diff_excerpt}
+{anchored_diff_feedback}
 ```
 {mode_guidance}
 # Task
@@ -13653,6 +13836,11 @@ def _build_fidelity_audit_prompt_paper_anchored(
     body_excerpt = (pr_body or "")[:4000]
     paper_excerpt = paper_text[:8000]
 
+    # Format diff using line-anchored feedback (arxiv:2607.12713v1).
+    # This reduces token costs and improves correctness by providing
+    # feedback with explicit line numbers rather than holistic context.
+    anchored_diff_feedback = format_anchored_feedback(diff_excerpt)
+
     return f"""You are auditing a draft PR's fidelity to the paper it claims to implement.
 
 # PR under audit
@@ -13675,10 +13863,15 @@ def _build_fidelity_audit_prompt_paper_anchored(
 {body_excerpt}
 ```
 
-## PR diff
+## PR diff (line-anchored format)
+
+For efficient code review, the diff is presented in line-anchored format with
+explicit line numbers. This structured feedback reduces token costs and improves
+correctness (as demonstrated in "Line-Anchored Feedback Cuts Token Costs and
+Improves Correctness in AI Code Editing", arxiv:2607.12713v1).
 
 ```
-{diff_excerpt}
+{anchored_diff_feedback}
 ```
 
 # Task
