@@ -22,7 +22,7 @@ from run import Target  # noqa: E402
 
 ISSUE_BODY_BLOCKED_NO_CODE = """\
 **Recommended paper**: [Some Paper](https://arxiv.org/abs/2310.99999v1)
-**Confidence**: 🟡 moderate (Remyx relevance 0.65)
+**Confidence**: 🟡 moderate
 
 ## License & code availability
 
@@ -34,7 +34,7 @@ ISSUE_BODY_BLOCKED_NO_CODE = """\
 
 ISSUE_BODY_BLOCKED_MISSING_LICENSE = """\
 **Recommended paper**: [Other Paper](https://arxiv.org/abs/2606.11111v2)
-**Confidence**: 🟡 moderate (Remyx relevance 0.72)
+**Confidence**: 🟡 moderate
 
 ## License & code availability
 
