@@ -193,13 +193,12 @@ type: implementation_spec
 arxiv_id: {arxiv_id}
 arxiv_url: https://arxiv.org/abs/{arxiv_id}
 tier: {tier}
-relevance_score: {relevance_score:.2f}
 ---
 
 # Implementation spec — drafted by Remyx Recommendation
 
 **Recommended paper**: [{paper_title}](https://arxiv.org/abs/{arxiv_id})
-**Confidence**: {tier} (Remyx relevance {relevance_score:.2f})
+**Confidence**: {tier}
 **Research interest**: {interest_name}
 
 ---
@@ -1370,7 +1369,7 @@ _PR_BODY_TEMPLATE = """\
 > **Drafted by an autonomous discovery loop** — Remyx ranks recent arXiv papers against this team's research interest and shipping history; Claude Code selects the candidate most directly implementable against this repo from the lookback window and drafts it.
 >
 > **Recommended paper**: [{paper_title}](https://arxiv.org/abs/{arxiv_id})
-> **Confidence**: {tier_emoji} {tier} (Remyx relevance {relevance_score:.2f})
+> **Confidence**: {tier_emoji} {tier}
 > **Research interest**: {interest_name}
 > **Implementation by**: Claude Code as autonomous agent
 
@@ -1389,8 +1388,6 @@ _PR_BODY_TEMPLATE = """\
 {test_section}
 
 ---
-
-> **Want eval-on-every-PR?** Outrider Validate (coming soon, paid tier) runs your benchmark suite against this diff and posts the results as a PR comment. Design partner pilot is open — [join the waitlist](https://github.com/remyxai/outrider/discussions/19).
 
 _Opened by the [Remyx Recommendation]({attribution_url}) orchestrator._
 """
@@ -9445,8 +9442,7 @@ def _open_downgrade_issue(
     sections.append(
         f"**Recommended paper**: "
         f"[{rec.paper_title}](https://arxiv.org/abs/{rec.arxiv_id})\n"
-        f"**Confidence**: {rec.tier} "
-        f"(Remyx relevance {rec.relevance_score:.2f})\n"
+        f"**Confidence**: {rec.tier}\n"
         f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
         f"\n---\n"
     )
@@ -10545,8 +10541,7 @@ def process_target(target: Target) -> dict:
             issue_body = (
                 f"**Recommended paper**: "
                 f"[{rec.paper_title}](https://arxiv.org/abs/{rec.arxiv_id})\n"
-                f"**Confidence**: {rec.tier} "
-                f"(Remyx relevance {rec.relevance_score:.2f})\n"
+                f"**Confidence**: {rec.tier}\n"
                 f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
                 f"{_render_license_section(rec)}"
                 f"{checkpoint_block}"
