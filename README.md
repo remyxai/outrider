@@ -34,6 +34,7 @@ Each dispatch runs the coding agent in a fresh, ephemeral runner — candidates 
 |---|---|---|
 | Anthropic Opus (default) | ~$2–3 | The commit — one candidate shipped as a draft PR |
 | z.ai GLM-5.2 | ~$0.05–0.10 | Scouting, branch-mode exploration, batched candidate scans |
+| Moonshot Kimi-K3 | ~$0.10–0.20 | Long-context repos, mixed-language codebases where a second cheap opinion helps |
 
 Route per-dispatch via a `provider` input — see [`docs/backends.md`](docs/backends.md) for the auth-header matrix and the switching workflow template. Rule of thumb: GLM for the exploration ladder, Opus for the candidate you commit to ship.
 

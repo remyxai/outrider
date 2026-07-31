@@ -1379,28 +1379,27 @@ __DIFF__
 """
 
 _PR_BODY_TEMPLATE = """\
-> **Drafted by an autonomous discovery loop** — Remyx ranks recent arXiv papers against this team's research interest and shipping history; Claude Code selects the candidate most directly implementable against this repo from the lookback window and drafts it.
->
-> **Recommended paper**: [{paper_title}](https://arxiv.org/abs/{arxiv_id})
-> **Confidence**: {tier_emoji} {tier}
-> **Research interest**: {interest_name}
-> **Implementation by**: Claude Code as autonomous agent
+{test_section}
+{license_section}
+_Implements [{paper_title}](https://arxiv.org/abs/{arxiv_id})._
 
----
+<details>
+<summary><b>Discovery context</b></summary>
+
+> Drafted by an autonomous discovery loop — Remyx ranks recent arXiv papers against this team's research interest and shipping history; Claude Code selects the candidate most directly implementable against this repo from the lookback window and drafts it.
+
+**Research interest**: {interest_name}
+**Implementation by**: Claude Code as autonomous agent
 
 ## Why this paper for this team
 
 {reasoning}
-{selection_section}{license_section}
+{selection_section}
 ## Suggested experiment
 
 {suggested_experiment}
 
----
-
-{test_section}
-
----
+</details>
 
 _Opened by the [Remyx Recommendation]({attribution_url}) orchestrator._
 """
@@ -9494,7 +9493,6 @@ def _open_downgrade_issue(
     sections.append(
         f"**Recommended paper**: "
         f"[{rec.paper_title}](https://arxiv.org/abs/{rec.arxiv_id})\n"
-        f"**Confidence**: {rec.tier}\n"
         f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
         f"\n---\n"
     )
@@ -11176,7 +11174,6 @@ def build_pr_body(
     selection_note: str = "",
     test_integration_warning: bool = False,
 ) -> str:
-    tier_emoji = {"high": "🟢", "moderate": "🟡", "low": "🟠", "noise": "🔴"}.get(rec.tier, "⚪")
     if tests_status == "passed":
         test_section_inner = "### Test results\n\n✅ All tests passed.\n"
     elif tests_status == "unvalidated":
@@ -11228,9 +11225,6 @@ def build_pr_body(
     return _PR_BODY_TEMPLATE.format(
         paper_title=rec.paper_title,
         arxiv_id=rec.arxiv_id,
-        tier_emoji=tier_emoji,
-        tier=rec.tier,
-        relevance_score=rec.relevance_score,
         interest_name=rec.interest_name or "(unnamed)",
         reasoning=rec.reasoning or "(no reasoning provided)",
         selection_section=selection_section,
