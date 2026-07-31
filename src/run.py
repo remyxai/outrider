@@ -140,6 +140,37 @@ PR_TITLE_FILENAME = f"{BUNDLE_DIR_NAME}/PR_TITLE.txt"
 BRANCH_PREFIX = "remyx-recommendation/"
 PR_TITLE_PREFIX = "[Remyx Recommendation]"
 
+
+def _mark_bundle_gitignored(workdir) -> None:
+    """Add ``BUNDLE_DIR_NAME`` to the workdir's ``.git/info/exclude``.
+
+    The bundle holds scratch-only briefing files (SPEC.md, PAPER.md,
+    INVOCATION.md, PR_TITLE.txt). ``commit_and_push`` deletes the
+    directory before staging, but other downstream flows (refinement
+    runs, dispatcher scripts, manual punch-ups) may ``git add -A`` on
+    the workdir without knowing about the bundle. ``.git/info/exclude``
+    is a per-repo ignore that isn't tracked, so it doesn't leak into
+    the target repo's ``.gitignore`` and can't itself be committed.
+
+    Best-effort: if the workdir isn't a git repo, or ``.git`` isn't a
+    regular directory (submodules / worktrees resolve to a file
+    pointing elsewhere), skip silently — this is defense-in-depth, not
+    the primary safeguard.
+    """
+    from pathlib import Path as _Path
+    exclude = _Path(workdir) / ".git" / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text() if exclude.exists() else ""
+        line = f"/{BUNDLE_DIR_NAME}/"
+        if line not in existing.splitlines():
+            with exclude.open("a") as fh:
+                if existing and not existing.endswith("\n"):
+                    fh.write("\n")
+                fh.write(line + "\n")
+    except OSError:
+        pass
+
 # Vendor-console URLs surfaced in step_summary when the agent fails with a
 # recognizable cause. Currently Anthropic-only; when alternative agent CLIs
 # land, these become a per-agent lookup (`_AGENT_URLS = {"claude": ...,
@@ -6241,6 +6272,7 @@ def write_spec_bundle(
     """
     bundle = workdir / BUNDLE_DIR_NAME
     bundle.mkdir(exist_ok=True)
+    _mark_bundle_gitignored(workdir)
 
     interest_block = (
         rec.interest_context
@@ -6937,6 +6969,7 @@ def write_research_invocation(
     """
     bundle = workdir / BUNDLE_DIR_NAME
     bundle.mkdir(exist_ok=True)
+    _mark_bundle_gitignored(workdir)
 
     # Prior-attempt hint: if start-from-ref names a preserved branch on the
     # target fork, surface it explicitly so the research phase probes it.
