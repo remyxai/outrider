@@ -64,8 +64,8 @@ on:
         description: 'Specific model name (e.g. claude-opus-4-8, glm-5.2, kimi-k3). Empty = provider default.'
         required: false
         default: ''
-      pin-method:
-        description: 'Optional arxiv_id or method query.'
+      search-method:
+        description: 'Optional method query — searches for the top-hit paper and implements it.'
         required: false
         default: ''
 
@@ -84,7 +84,7 @@ jobs:
           MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
         with:
           interest-id: <uuid>
-          pin-method: ${{ inputs.pin-method }}
+          search-method: ${{ inputs.search-method }}
           provider: ${{ inputs.provider }}
           model: ${{ inputs.model }}
 ```
