@@ -136,6 +136,7 @@ MAX_NEW_PACKAGE_FILES = 3
 STUB_DENSITY_DOWNGRADE_THRESHOLD = 0.5
 
 BUNDLE_DIR_NAME = ".remyx-recommendation"
+PR_TITLE_FILENAME = f"{BUNDLE_DIR_NAME}/PR_TITLE.txt"
 BRANCH_PREFIX = "remyx-recommendation/"
 PR_TITLE_PREFIX = "[Remyx Recommendation]"
 
@@ -764,6 +765,18 @@ When complete, output a one-paragraph SUMMARY of what you built. Call out:
   - The paper insight this delivers, and what you intentionally scoped
     out as unnecessary for that value — frame these as scoping decisions,
     not shortfalls. A focused slice that delivers the result is success.
+
+**PR TITLE.** Write your PR title to
+`.remyx-recommendation/PR_TITLE.txt` — a single line describing the
+CHANGE (not the paper), under ~70 chars. Do NOT restate the paper
+title; that signals automation on first skim. Format like a human
+contributor would:
+
+  - "Add opt-in LLM severity panel with oracle agreement stats"
+  - "Wire scheherazade chain generator into scripts/build_benchmark.py"
+  - "Cast pixel_values to model dtype in Florence-2 detector"
+
+Skip the file only if routing to Issue mode (no code diff).
 
 Still distinguish "intentionally out of scope" (expected) from
 "stubbed / incomplete" (TODO-dominated bodies) — the latter still routes
@@ -1994,15 +2007,54 @@ def slugify(s: str, max_len: int = 60) -> str:
     return s[:max_len]
 
 
-def format_pr_title(rec: "Recommendation") -> str:
+_TITLE_MAX_LEN = 100
+
+
+def _read_agent_pr_title(workdir: "Path") -> str | None:
+    """Read the drafter-written PR title (``PR_TITLE.txt``), if usable.
+
+    Returns ``None`` when the file is missing, empty, whitespace-only, or
+    obviously malformed. Strips surrounding quotes and the leading
+    ``Title:`` label some agents emit, and takes the first non-empty line
+    when the agent wrote a multi-line entry.
+    """
+    try:
+        raw = (workdir / PR_TITLE_FILENAME).read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, OSError):
+        return None
+    first_line = ""
+    for line in raw.splitlines():
+        s = line.strip()
+        if s:
+            first_line = s
+            break
+    if not first_line:
+        return None
+    if first_line.lower().startswith("title:"):
+        first_line = first_line[len("title:"):].strip()
+    first_line = first_line.strip('"').strip("'").strip()
+    if not first_line:
+        return None
+    if len(first_line) > _TITLE_MAX_LEN:
+        first_line = first_line[:_TITLE_MAX_LEN - 3].rstrip() + "..."
+    return first_line
+
+
+def format_pr_title(rec: "Recommendation", workdir: "Path | None" = None) -> str:
     """Return a clean PR title for the recommendation, no Outrider prefix.
 
-    Drops the historical ``[Remyx Recommendation]`` prefix so the title
-    matches how a human contributor would title the PR. Outrider
-    attribution is preserved in the PR body footer; dedup falls back to
-    body-marker recognition (``"Remyx Recommendation" in body``) for
-    PRs created without the legacy title prefix.
+    Prefer a change-descriptor title written by the drafter to
+    ``.remyx-recommendation/PR_TITLE.txt``. Paper-title-verbatim reads as
+    automation and turns maintainers off on the first-30-seconds skim; a
+    change-descriptor ("Add opt-in LLM severity panel with oracle stats")
+    reads as a human contribution. Falls back to the paper title when the
+    drafter didn't write the file, wrote something empty/malformed, or
+    wrote something that just restates the paper title verbatim.
     """
+    if workdir is not None:
+        agent_title = _read_agent_pr_title(workdir)
+        if agent_title and agent_title.strip().lower() != rec.paper_title.strip().lower():
+            return agent_title
     return rec.paper_title
 
 
@@ -9428,7 +9480,7 @@ def _open_downgrade_issue(
     if publish_mode == "branch" and workdir is not None and branch:
         try:
             commit_and_push(
-                workdir, branch, format_pr_title(rec),
+                workdir, branch, format_pr_title(rec, workdir=workdir),
                 repo=target.repo, base_branch=base_branch,
             )
         except Exception as e:
@@ -9436,7 +9488,7 @@ def _open_downgrade_issue(
         branch_url = f"https://github.com/{target.repo}/tree/{branch}"
         raise BranchPushedFromDowngrade(branch, branch_url, reason, detail)
 
-    title = format_pr_title(rec)
+    title = format_pr_title(rec, workdir=workdir)
 
     sections: list[str] = []
     sections.append(
@@ -10803,7 +10855,7 @@ def process_target(target: Target) -> dict:
             draft = True
 
         # 11. Commit + push + PR
-        pr_title = format_pr_title(rec)
+        pr_title = format_pr_title(rec, workdir=workdir)
         pr_body = build_pr_body(
             target, rec, tests_status, test_output,
             review_section=review_section,
@@ -13469,7 +13521,7 @@ def _run_mode3_insight_preservation_check(
         return verdict
 
     prompt = _build_mode3_insight_preservation_prompt(
-        pr_title=format_pr_title(rec),
+        pr_title=format_pr_title(rec, workdir=workdir),
         pr_diff=diff,
         reframed_insight=reframed_insight,
         honest_summary=honest_summary,

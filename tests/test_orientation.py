@@ -406,6 +406,58 @@ def test_format_pr_title_drops_remyx_prefix() -> None:
     assert "[Remyx Recommendation]" not in title
 
 
+def test_format_pr_title_prefers_agent_written_title(tmp_path) -> None:
+    """When the drafter writes PR_TITLE.txt, prefer that change-descriptor over the paper title."""
+    bundle = tmp_path / run.BUNDLE_DIR_NAME
+    bundle.mkdir(parents=True)
+    (tmp_path / run.PR_TITLE_FILENAME).write_text(
+        "Add opt-in LLM severity panel with oracle stats\n"
+    )
+    title = run.format_pr_title(
+        _rec("Beyond Attack Success Rate: Structural Risk in Agent Benchmarks"),
+        workdir=tmp_path,
+    )
+    assert title == "Add opt-in LLM severity panel with oracle stats"
+
+
+def test_format_pr_title_strips_agent_boilerplate(tmp_path) -> None:
+    """Common auto-generation artifacts (Title: prefix, surrounding quotes,
+    multi-line entries) get normalized to the first meaningful line."""
+    bundle = tmp_path / run.BUNDLE_DIR_NAME
+    bundle.mkdir(parents=True)
+    (tmp_path / run.PR_TITLE_FILENAME).write_text(
+        'Title: "Wire scheherazade chain generator into build_benchmark.py"\n\n'
+        "(optional second-line explanation)\n"
+    )
+    title = run.format_pr_title(_rec("Scheherazade"), workdir=tmp_path)
+    assert title == "Wire scheherazade chain generator into build_benchmark.py"
+
+
+def test_format_pr_title_ignores_paper_title_verbatim(tmp_path) -> None:
+    """If the drafter wrote the paper title verbatim, treat it as a non-descriptor
+    and fall back to the paper title (i.e. current behavior — no regression)."""
+    bundle = tmp_path / run.BUNDLE_DIR_NAME
+    bundle.mkdir(parents=True)
+    (tmp_path / run.PR_TITLE_FILENAME).write_text("Scheherazade\n")
+    title = run.format_pr_title(_rec("Scheherazade"), workdir=tmp_path)
+    assert title == "Scheherazade"  # falls back to paper title (same string, but via fallback path)
+
+
+def test_format_pr_title_falls_back_when_file_missing(tmp_path) -> None:
+    """No PR_TITLE.txt → paper title unchanged (current behavior preserved)."""
+    title = run.format_pr_title(_rec("Formalizing Prompt Injection"), workdir=tmp_path)
+    assert title == "Formalizing Prompt Injection"
+
+
+def test_format_pr_title_falls_back_when_file_empty(tmp_path) -> None:
+    """Empty PR_TITLE.txt → paper title unchanged."""
+    bundle = tmp_path / run.BUNDLE_DIR_NAME
+    bundle.mkdir(parents=True)
+    (tmp_path / run.PR_TITLE_FILENAME).write_text("   \n\n")
+    title = run.format_pr_title(_rec("Formalizing Prompt Injection"), workdir=tmp_path)
+    assert title == "Formalizing Prompt Injection"
+
+
 def test_format_branch_name_uses_slugified_paper_title() -> None:
     """New branch names use the slugified paper title, no remyx-recommendation/ prefix."""
     branch = run.format_branch_name(
