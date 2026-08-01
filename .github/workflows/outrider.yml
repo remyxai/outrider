@@ -43,6 +43,10 @@ on:
         description: 'Model name (empty = provider default).'
         required: false
         default: ''
+      base-url:
+        description: 'Optional Anthropic-compatible endpoint (self-hosted model, litellm proxy, vLLM Anthropic shim). Empty = use the provider default.'
+        required: false
+        default: ''
 
 concurrency:
   group: outrider
@@ -98,4 +102,6 @@ jobs:
           start-from-ref: ${{ inputs.start-from-ref }}
           lead-content: ${{ inputs.lead-content }}
           staged-synthesis: ${{ inputs.staged-synthesis }}
-          model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '' }}
+          # Explicit `base-url` wins (self-hosted proxy, on-prem endpoint);
+          # otherwise fall back to the per-provider default.
+          model-base-url: ${{ inputs.base-url != '' && inputs.base-url || (inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '') }}
