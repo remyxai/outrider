@@ -7221,19 +7221,90 @@ def _run_claude_oneshot_streaming(
     return _run_claude_stream(cmd, prompt, workdir, timeout_s)
 
 
+_JSON_FENCE_RE = re.compile(
+    r"```(?:json)?\s*\n?(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
 def _extract_json_object(s: str) -> dict | None:
-    """Pull the first JSON object out of `s`. Tolerant of prose wrappers."""
+    """Pull the first well-formed JSON object out of ``s``.
+
+    Tolerant of prose wrappers, Markdown code fences (``` ```json …
+    ``` ```), and leading/trailing commentary. The previous first-``{``/
+    last-``}`` heuristic tripped whenever the response contained any
+    stray ``{`` in prose before the JSON envelope (bracketed template
+    placeholders like ``{title}``, lettered list items with braces,
+    example config snippets in explanations) — the substring between
+    the wrong braces then failed to parse and the whole call was lost.
+
+    Strategy, in order:
+      1. Extract fenced code blocks (```` ```json … ``` ```` /
+         ```` ``` … ``` ````) and try each in text order — this is the
+         model's own "here's the payload" delimiter when it uses one.
+      2. Bracket-match forward from every ``{``, respecting string
+         escapes, and return the first substring that parses as a
+         JSON object.
+
+    Returns ``None`` if nothing parses — same contract as before.
+    """
     if not s:
         return None
-    try:
-        start = s.index("{")
-        end = s.rindex("}")
-    except ValueError:
-        return None
-    try:
-        return json.loads(s[start:end + 1])
-    except json.JSONDecodeError:
-        return None
+
+    # Strategy 1 — fenced blocks. Model output like ``Here's the
+    # analysis:\n```json\n{...}\n``` `` gets picked up cleanly.
+    for match in _JSON_FENCE_RE.finditer(s):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            result = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict):
+            return result
+
+    # Strategy 2 — bracket-match. Scan every ``{`` and try to find its
+    # matching ``}``, respecting string escapes; return the first
+    # substring that parses. Handles unfenced responses and responses
+    # where prose containing ``{`` precedes the envelope.
+    for i, ch in enumerate(s):
+        if ch != "{":
+            continue
+        depth = 0
+        in_string = False
+        escape_next = False
+        end_idx = None
+        for j in range(i, len(s)):
+            c = s[j]
+            if escape_next:
+                escape_next = False
+                continue
+            if in_string:
+                if c == "\\":
+                    escape_next = True
+                elif c == '"':
+                    in_string = False
+                continue
+            if c == '"':
+                in_string = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end_idx = j
+                    break
+        if end_idx is None:
+            continue
+        try:
+            result = json.loads(s[i:end_idx + 1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict):
+            return result
+
+    return None
 
 
 def _repo_layout_manifest(workdir: Path, package: str, max_lines: int = 60) -> str:
