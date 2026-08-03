@@ -112,6 +112,20 @@ def test_build_pr_body_ends_with_trailer():
     assert body.count(run.BOT_NOREPLY_EMAIL) == 1
 
 
+def test_build_pr_body_brief_mode_ends_with_trailer():
+    # Brief mode (no arxiv_id) returns from a separate template earlier in
+    # the function; it is an outbound PR body too and needs the trailer.
+    rec = _rec()
+    rec.arxiv_id = ""
+    rec.suggested_experiment = "Wire the retry budget into the scheduler. Refs #12."
+    body = run.build_pr_body(
+        Target(repo="owner/name"), rec,
+        tests_status="passed", test_output="",
+    )
+    assert body.rstrip().splitlines()[-1] == run.BOT_COAUTHOR_TRAILER
+    assert body.count(run.BOT_NOREPLY_EMAIL) == 1
+
+
 def test_build_pr_body_trailer_survives_failing_tests_path():
     body = run.build_pr_body(
         Target(repo="owner/name"), _rec(),
