@@ -48,7 +48,7 @@ Sequence when `recommend` mode opens a PR: **fidelity audit → convention pass 
 ## Conventions
 
 - **Commit format:** conventional (`feat(scope): …`, `fix(scope): …`, `docs(scope): …`, `chore(scope): …`). Body describes the *why*, not the *what*.
-- **No co-author line.** Repo convention omits `Co-Authored-By: Claude …`; the maintainers don't use it.
+- **No co-author line on commits *to this repo*.** Repo convention omits `Co-Authored-By: Claude …`; the maintainers don't use it. This does not apply to outbound PR bodies: those carry `BOT_COAUTHOR_TRAILER` as their final line so a squash-merge preserves the bot's contributor credit. Don't strip it.
 - **PR body:** terse on this public repo. No Linear IDs, no customer names, no dollar figures from internal trials. `test_*.py` names are fine.
 - **Version discipline:** `@v1` is a moving tag; ship additive changes on `@v1` without a version bump. New input + new provider values + new rate table rows are all additive. **Breaking changes (rename, remove, semantic change) require reviewing every caller.**
 - **Release convention:** every version bump = `git tag vX.Y.Z <sha>` + `git push origin vX.Y.Z` + `git tag -f v1 <sha>` + `git push -f v1` + `gh release create vX.Y.Z --notes ...`. The `gh release create` step is easy to forget; the git tag push alone does NOT surface in the GitHub UI.
