@@ -256,6 +256,31 @@ tier: {tier}
 {paper_abstract}
 """
 
+# Brief-mode SPEC: no paper anchor. The brief itself IS the spec; the
+# coding agent reads the "Design brief" section as the primary target
+# and the interest-context block if a ResearchInterest is configured.
+_SPEC_MD_TEMPLATE_BRIEF = """\
+---
+type: implementation_spec
+mode: brief
+tier: brief
+---
+
+# Implementation spec — drafted from a design brief
+
+**Anchor**: none (paper-less dispatch — brief supplied at dispatch time)
+
+---
+
+## Team's research focus
+
+{interest_context_block}
+
+## Design brief
+
+{suggested_experiment}
+"""
+
 _PAPER_MD_TEMPLATE = """\
 ---
 type: paper
@@ -813,6 +838,97 @@ Still distinguish "intentionally out of scope" (expected) from
 "stubbed / incomplete" (TODO-dominated bodies) — the latter still routes
 to an Issue per the honesty rules above.
 """
+
+
+# Brief-mode invocation: no paper, no arXiv, no Mode 1/2/3 framing.
+# The design brief IS the spec. Structurally the same file list as
+# paper-mode (SPEC/GUARDRAILS/ORIENTATION) minus PAPER.md; the
+# PR-vs-Issue decision, path/scope discipline, and self-review shape
+# are unchanged so downstream gates (integration check, stub density,
+# path allowlist, OPEN_AS_ISSUE.md) still apply exactly as before.
+_INVOCATION_MD_TEMPLATE_BRIEF = """\
+---
+type: agent_invocation
+description: Headless prompt for the Claude Code CLI invocation (brief mode).
+---
+
+You are a coding agent implementing a design brief supplied via the
+Remyx Recommendation orchestrator (attribution URL: {attribution_url}).
+There is NO paper anchoring this run — the brief IS the spec.
+
+Read these files in order:
+  1. .remyx-recommendation/SPEC.md         — the design brief and the
+                                              team's configured research
+                                              focus (if any)
+  2. .remyx-recommendation/GUARDRAILS.md   — what you may and may not modify
+  3. .remyx-recommendation/ORIENTATION.md  — target repo's contributor
+                                              guide, PR template,
+                                              recent-merged-PR conventions,
+                                              lint/type config, and sample
+                                              files near likely call sites.
+                                              Use these patterns without
+                                              re-exploring them.
+{environment_file_ref}{repo_intel_ref}
+
+Scope discipline (same as paper mode):
+  - Identify the call site FIRST from the brief + orientation. Do NOT
+    broad-list `{package}/` or `tests/`.
+  - Open only the files the target function directly imports or calls.
+  - Skip generated, vendored, lockfile, data, notebook files, and any
+    file over ~1500 lines unless the call site is inside it.
+  - Once the call site is named, STOP exploring and implement.
+
+# Step 1 — decide: PR or Issue
+
+Open as PR only if BOTH hold:
+
+  (a) You can identify a SPECIFIC existing module/function in `{package}/`
+      where the brief's change lands (the "call site").
+
+  (b) The brief defines a concrete, scoped change — not "add feature X
+      end-to-end" spanning many surfaces, but a bounded edit at the
+      call site.
+
+Otherwise, write `.remyx-recommendation/{issue_fallback_filename}` with
+the change proposal + a note on why a PR wasn't the fit (e.g. the brief
+is too broad, no clear call site exists, the target infra is missing).
+The orchestrator will file the Issue.
+
+# Step 2 — implement
+
+Follow the target repo's conventions from ORIENTATION.md. Prefer editing
+existing files over creating new ones. Add tests that import from a
+pre-existing module in the package — not just the new code you wrote.
+The test-integration gate downstream will reject a PR whose new tests
+only self-test the new module.
+
+# Step 3 — self-review
+
+Before finishing, cite in a comment or the PR body:
+  - The call site you targeted (file + function)
+  - What the brief asked for vs. what you implemented (any deviations)
+  - Anything intentionally out of scope
+
+Distinguish "intentionally out of scope" from "stubbed / incomplete" —
+the latter routes to an Issue per the honesty rules.
+
+# CRITICAL: do not run git commands
+
+You MUST NOT run any `git` command during your session (`git init`,
+`git checkout`, `git stash`, `git reset`, `git commit`, `git add`,
+`git rm`, `git rebase`, etc. — none of them, including `git status`).
+The orchestrator manages all version control. Past runs have hit
+subtle issues where agents ran a `git checkout` to back out a
+half-edit and left the working tree in an orphan state that broke
+the PR — or committed their in-progress work on top of the default
+branch, which trips the ``commit_and_push`` sanity check that HEAD
+still matches ``origin/<base>`` and produces ``brief_failed``.
+
+If you need to back out an edit, use the file-edit tools to restore
+the file's content. Look up the original content via standard read
+tools — do not invoke git.
+"""
+
 
 # Two helper Claude prompts: PR/Issue routing pre-flight (§6) and the
 # post-implementation self-review (§4). Both are rendered with str.replace()
@@ -1436,6 +1552,35 @@ _Opened by the [Remyx Recommendation]({attribution_url}) orchestrator._
 """
 
 
+# Brief-mode PR body: no arXiv anchor, so no ``Implements [paper](arxiv)``
+# attribution and no "Discovery context" (there was no discovery — the
+# brief WAS the input). The brief itself lands in a "Design brief"
+# collapse so the maintainer can read what the agent was asked to do
+# without scrolling past the diff. ``issue_refs_line`` surfaces
+# GitHub issue links when the brief cites them (either as ``#N`` or
+# as full URLs) so the PR-Issue relation graph resolves.
+_PR_BODY_TEMPLATE_BRIEF = """\
+{test_section}
+{license_section}
+_Drafted from a design brief supplied at dispatch time. No arXiv anchor — the brief IS the spec._
+{issue_refs_line}
+<details>
+<summary><b>Design brief</b></summary>
+
+> Drafted by an autonomous coding loop — Remyx's Outrider action receives a design brief via workflow_dispatch, produces an implementation against this repo, and opens this PR for review. The brief is the sole input; there is no ranker-picked paper behind this PR.
+
+**Implementation by**: Claude Code as autonomous agent
+
+## Brief
+
+{suggested_experiment}
+
+</details>
+
+_Opened by the [Remyx Recommendation]({attribution_url}) orchestrator._
+"""
+
+
 # ─── Data classes ──────────────────────────────────────────────────────────
 
 
@@ -1705,9 +1850,291 @@ class Recommendation:
                                       # Carries the query text for provenance;
                                       # "" = broad pool. Drives the pool-
                                       # composition telemetry.
+    # Multi-license aggregation for brief-mode dispatches. A design
+    # brief may reference several external repos + model cards; this
+    # holds one entry per distinct URL (deduplicated, capped at
+    # _BRIEF_LICENSE_CAP). Each entry is (kind, slug, spdx,
+    # license_class) — same shape ``_render_multi_license_section``
+    # consumes. Empty on paper-anchored dispatches (single reference
+    # → single set of ``paper_*`` fields carries the signal).
+    referenced_licenses: list = field(default_factory=list)
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
+
+
+_ISSUE_URL_RE = re.compile(
+    r"https?://github\.com/([\w.-]+)/([\w.-]+)/issues/(\d+)"
+)
+_ISSUE_HASH_RE = re.compile(r"(?:^|[\s(])#(\d+)\b")
+
+
+def _extract_issue_refs(lead_content: str, target_repo: str) -> list[str]:
+    """Extract issue references from a design brief.
+
+    Returns a list of GitHub issue references in the form ``#N`` or
+    ``owner/repo#N`` (the latter when the URL points at a repo other
+    than ``target_repo`` — cross-repo refs must be qualified so the
+    PR-Issue link resolves correctly).
+
+    Matches two forms:
+      1. Full URLs: ``https://github.com/owner/repo/issues/N``
+      2. Short refs: ``#N`` inside prose (bracketed, whitespace-
+         prefixed, or line-start; avoids matching hex digits inside
+         hashes or arxiv IDs)
+
+    Deduplicated + order-preserving.
+    """
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    for match in _ISSUE_URL_RE.finditer(lead_content):
+        owner, repo, num = match.group(1), match.group(2), match.group(3)
+        ref = f"#{num}" if f"{owner}/{repo}" == target_repo else f"{owner}/{repo}#{num}"
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+
+    for match in _ISSUE_HASH_RE.finditer(lead_content):
+        ref = f"#{match.group(1)}"
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+
+    return refs
+
+
+# Cap on the number of referenced repos we license-check per dispatch.
+# A brief that legitimately cites more than this is either exceptional
+# or a copy-paste of a bibliography — in either case, five is a strong
+# signal to a reviewer; the tail rarely changes the adoption verdict
+# and each fetch is a network round-trip.
+_BRIEF_LICENSE_CAP = 5
+
+
+def _extract_all_referenced_repos(
+    lead_content: str, target_repo: str
+) -> list[tuple[str, str]]:
+    """Return an ordered, deduplicated list of ``(kind, slug)`` pairs
+    for every distinct GitHub or HuggingFace URL in the brief.
+
+    ``kind`` is ``"github"`` or ``"huggingface"``. Order matches the
+    brief's text order (first mention wins on dedup). Self-links to
+    ``target_repo`` are excluded — the target's own license is fetched
+    separately for the compat score. Capped at
+    ``_BRIEF_LICENSE_CAP``; anything past the cap is dropped and the
+    caller logs the truncation.
+    """
+    seen: set[tuple[str, str]] = set()
+    refs: list[tuple[str, str]] = []
+    for slug in _extract_github_urls(lead_content):
+        if slug == target_repo:
+            continue
+        key = ("github", slug)
+        if key not in seen:
+            seen.add(key)
+            refs.append(key)
+    for slug in _extract_huggingface_urls(lead_content):
+        key = ("huggingface", slug)
+        if key not in seen:
+            seen.add(key)
+            refs.append(key)
+    for slug in _extract_huggingface_dataset_urls(lead_content):
+        key = ("huggingface-dataset", slug)
+        if key not in seen:
+            seen.add(key)
+            refs.append(key)
+    return refs[:_BRIEF_LICENSE_CAP]
+
+
+def _fetch_referenced_license(kind: str, slug: str) -> str:
+    """Best-effort license fetch dispatch for a ``(kind, slug)`` pair.
+
+    Returns the SPDX id (or empty string on any fetch failure /
+    missing LICENSE). Never raises; the caller assembles the render
+    block from whatever comes back.
+    """
+    try:
+        if kind == "huggingface":
+            return _fetch_hf_license(slug) or ""
+        if kind == "huggingface-dataset":
+            return _fetch_hf_dataset_license(slug) or ""
+        if kind == "github":
+            return _fetch_repo_license(slug) or ""
+    except Exception:  # noqa: BLE001 — best-effort; advisory gate
+        return ""
+    return ""
+
+
+def _render_multi_license_section(
+    refs: list[tuple[str, str]],
+    fetched: list[tuple[str, str, str, str]],
+    target_class: str,
+) -> str:
+    """Render a compact multi-license block for a brief PR body.
+
+    ``fetched`` is a list of ``(kind, slug, spdx, license_class)``
+    matching the order of ``refs``. Rendered as one line per repo
+    with an emoji, the repo slug, the SPDX id, and the classifier
+    verdict — same emoji + class labels the single-license renderer
+    uses, so a reviewer scanning multiple refs sees one visual
+    grammar.
+
+    Returns ``"\\n"`` when no refs — brief PR body then reads the
+    same as before this feature landed. Returns a target-repo-license
+    diagnostic footer only when at least one referenced license
+    classifies differently from the target, so a permissive-only run
+    stays quiet.
+    """
+    if not refs:
+        return "\n"
+
+    lines = ["\n## License & code availability\n"]
+    any_non_permissive = False
+    for kind, slug, spdx, cls in fetched:
+        emoji = _LICENSE_CLASS_EMOJI.get(cls, "⚪")
+        if kind == "github":
+            url = f"https://github.com/{slug}"
+            label = slug
+        elif kind == "huggingface-dataset":
+            url = f"https://huggingface.co/datasets/{slug}"
+            label = f"datasets/{slug}"
+        else:
+            url = f"https://huggingface.co/{slug}"
+            label = slug
+        display_spdx = spdx or "(no LICENSE detected)"
+        lines.append(f"- {emoji} [{label}]({url}) — `{display_spdx}` ({cls})")
+        if cls not in ("permissive",):
+            any_non_permissive = True
+
+    if any_non_permissive:
+        lines.append(
+            "\n_At least one cited repo is not classified as permissive "
+            f"against this repo's own license ({target_class}). Review "
+            "compatibility before merging code derived from these sources._\n"
+        )
+    else:
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _enrich_brief_licenses(rec: "Recommendation", lead_content: str, target: "Target") -> None:
+    """Populate license fields on a brief-mode ``Recommendation`` from
+    URLs found in the design brief.
+
+    Multi-URL aware: collects every distinct GitHub + HuggingFace URL
+    up to ``_BRIEF_LICENSE_CAP``, fetches each license best-effort,
+    and stores the aggregated result on ``rec.referenced_licenses``
+    (a list of ``(kind, slug, spdx, license_class)`` tuples). The
+    single-license fields (``paper_license`` / ``license_class`` /
+    ``license_source``) are populated from the first non-empty fetch
+    so any legacy renderer that only reads those still gets a
+    reasonable signal.
+
+    When a brief references external repos with different licenses
+    (e.g. issue #31: HF dataset + moondream + gazelle), the PR body
+    lists each with its own classification. The paper-anchored path
+    already surfaces this per-paper via the ranker; brief mode was
+    silently skipping it.
+    """
+    all_refs = _extract_all_referenced_repos(lead_content, target.repo)
+
+    fetched: list[tuple[str, str, str, str]] = []
+    for kind, slug in all_refs:
+        spdx = _fetch_referenced_license(kind, slug)
+        cls = _classify_license(spdx) if spdx else "missing"
+        fetched.append((kind, slug, spdx, cls))
+
+    rec.referenced_licenses = fetched
+
+    if all_refs:
+        first_kind, first_slug = all_refs[0]
+        if first_kind == "github":
+            rec.paper_github_url = f"https://github.com/{first_slug}"
+        else:
+            rec.paper_huggingface_url = f"https://huggingface.co/{first_slug}"
+
+    # Populate the legacy single-license fields from the first non-empty
+    # fetch so `_render_license_section` (paper-mode) or any other
+    # single-license reader still gets a sensible signal.
+    for kind, slug, spdx, cls in fetched:
+        if spdx:
+            rec.paper_license = spdx
+            rec.license_class = cls
+            rec.license_source = "huggingface" if kind == "huggingface" else "github"
+            break
+    if not rec.paper_license:
+        rec.license_class = "no-code-link" if not all_refs else "missing"
+
+    # Target-repo license is fetched best-effort — matches the paper-
+    # anchored pipeline's advisory-gate semantics. Failure leaves the
+    # compat score at 0.0; the referenced-licenses list is still shown.
+    try:
+        target_spdx = _fetch_repo_license(target.repo)
+    except Exception:  # noqa: BLE001 — best-effort; advisory gate
+        target_spdx = ""
+    target_class = _classify_license(target_spdx)
+    rec.license_compat = _license_compat_score(rec.license_class, target_class)
+
+
+def _recommendation_from_brief(
+    lead_content: str, interest_context: str = ""
+) -> "Recommendation":
+    """Construct a synthetic ``Recommendation`` for lead-content-only mode.
+
+    In ``mode=brief``, no arXiv paper anchors the dispatch — the design
+    brief IS the spec. The rest of the pipeline (bundle writer, coding-
+    agent invocation, PR opener) is paper-shaped by history, so we
+    produce a ``Recommendation`` with paper fields blanked and the
+    brief occupying ``suggested_experiment`` (which the bundle writer
+    already treats as the primary implementation target when
+    ``INPUT_LEAD_CONTENT`` is set — see ``write_spec_bundle``).
+
+    Callers must guard downstream renderers that dereference paper
+    fields (``arxiv_id``, ``paper_abstract``, ``paper_title``,
+    license/HF fields) on the emptiness of ``arxiv_id`` — the
+    lead-content-mode PR body variant is what produces the maintainer-
+    facing evidence in place of the ``Implements arXiv:X`` attribution.
+
+    ``interest_context`` still flows in when available: brief-mode
+    dispatches on a configured repo carry the same ResearchInterest
+    body the paper-anchored path uses, so the coding agent gets the
+    same repo-shaping context regardless of anchor.
+    """
+    trimmed = (lead_content or "").strip()
+    if not trimmed:
+        raise ValueError(
+            "mode='brief' requires INPUT_LEAD_CONTENT to be a non-empty "
+            "design brief — the brief IS the spec in this mode"
+        )
+    # Title derivation: use the first non-empty line when it looks like a
+    # human-authored heading (5-100 chars, no trailing period). Otherwise
+    # a truncated marker so the branch name + PR title stay legible.
+    first_line = next(
+        (ln.strip() for ln in trimmed.splitlines() if ln.strip()), ""
+    )
+    if 5 <= len(first_line) <= 100 and not first_line.endswith("."):
+        title = first_line.lstrip("# ").strip()
+    else:
+        snippet = trimmed[:60].replace("\n", " ").strip()
+        title = f"Design brief: {snippet}…"
+    return Recommendation(
+        paper_title=title,
+        arxiv_id="",
+        tier="brief",
+        z_score=0.0,
+        spec_md="",
+        paper_abstract="",
+        domain_summary="",
+        raw_paper_md="",
+        reasoning=(
+            "(implementation drafted from a design brief supplied at "
+            "dispatch time; no arXiv paper anchors this run)"
+        ),
+        suggested_experiment=trimmed,
+        interest_context=interest_context or "",
+    )
 
 
 # Run-scoped cache for the self-minted remyx[bot] token — one mint attempt
@@ -2312,6 +2739,13 @@ _GITHUB_URL_RE = re.compile(
 _HUGGINGFACE_URL_RE = re.compile(
     r"https?://huggingface\.co/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)"
 )
+# HF dataset URLs live under a /datasets/ prefix — a shape the plain
+# model regex misses (owner=datasets, filtered as non-model). Separate
+# regex + fetcher pair so briefs citing datasets surface their license
+# alongside the model / GitHub references.
+_HUGGINGFACE_DATASET_URL_RE = re.compile(
+    r"https?://huggingface\.co/datasets/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)"
+)
 
 # Top-level GitHub paths that look like owner names in the URL but aren't
 # repos — skip them when scraping paper text for code links.
@@ -2319,6 +2753,13 @@ _GITHUB_NON_REPO_OWNERS = frozenset({
     "orgs", "topics", "marketplace", "settings", "notifications",
     "issues", "pulls", "explore", "trending", "features", "about",
     "search", "login", "signup", "new", "codespaces", "sponsors",
+    # github.com/user-attachments/assets/UUID — issue-body image uploads.
+    # Matched as "user-attachments/assets" and surfaced as a repo before
+    # this filter existed, producing a spurious "missing LICENSE" line
+    # on brief-mode PRs for any issue-attached image (VQASynth #31).
+    "user-attachments",
+    # Content-URL paths that share the owner/name shape but aren't repos.
+    "raw", "blob", "assets", "attachments", "enterprise",
 })
 
 # HuggingFace top-level paths that aren't model owners — same idea, the
@@ -2399,6 +2840,34 @@ def _extract_huggingface_urls(*texts: str) -> list[str]:
             # Trailing sentence punctuation can land inside the regex
             # match (the dot/underscore/hyphen char class is permissive)
             # — strip it so a URL that ends a sentence still resolves.
+            name = name.rstrip(".,;:!?-_")
+            if not name:
+                continue
+            slug = f"{owner}/{name}"
+            if slug not in seen:
+                seen.append(slug)
+    return seen
+
+
+def _extract_huggingface_dataset_urls(*texts: str) -> list[str]:
+    """Return de-duped ``owner/dataset`` slugs from HF Hub dataset URLs.
+
+    Brief-mode license enrichment needs to distinguish dataset URLs
+    (``huggingface.co/datasets/<owner>/<name>``) from model URLs — the
+    plain HF regex would match this as ``owner=datasets``, which gets
+    filtered by ``_HUGGINGFACE_NON_MODEL_OWNERS``. Without this
+    separate extractor, dataset citations like
+    ``huggingface.co/datasets/salma-remyx/PoseText`` never surface a
+    license, which is a real gap: dataset licensing (CC-BY variants,
+    ODbL, custom NC clauses) is the load-bearing signal for QA-pair
+    synthesis briefs.
+    """
+    seen: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for owner, name in _HUGGINGFACE_DATASET_URL_RE.findall(text):
+            name = re.sub(r"[^A-Za-z0-9._-].*$", "", name)
             name = name.rstrip(".,;:!?-_")
             if not name:
                 continue
@@ -3548,6 +4017,50 @@ def _fetch_hf_license(owner_model: str) -> str:
     else:
         spdx = ""
     _HF_LICENSE_CACHE[owner_model] = spdx
+    return spdx
+
+
+def _fetch_hf_dataset_license(owner_dataset: str) -> str:
+    """Return the SPDX-ish license id for an HF Hub dataset, or ``""``.
+
+    Sibling of ``_fetch_hf_license`` but for the datasets endpoint
+    (``/api/datasets/{owner}/{name}``). Same envelope shape:
+    ``cardData.license`` carries the SPDX (or free-text) license from
+    the dataset card's YAML frontmatter.
+
+    Best-effort, never raises. Same cache namespace as the models
+    fetcher would conflict on ``owner/name`` collisions between a
+    model and a dataset with the same slug — we prefix the cache key
+    to keep them disjoint.
+    """
+    if not owner_dataset:
+        return ""
+    cache_key = f"dataset:{owner_dataset}"
+    if cache_key in _HF_LICENSE_CACHE:
+        return _HF_LICENSE_CACHE[cache_key]
+    url = f"https://huggingface.co/api/datasets/{owner_dataset}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "feature-finder-orchestrator",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.load(resp)
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            OSError, json.JSONDecodeError):
+        _HF_LICENSE_CACHE[cache_key] = ""
+        return ""
+    raw = (payload.get("cardData") or {}).get("license") or ""
+    if isinstance(raw, list):
+        spdx = (str(raw[0]).strip() if raw else "")
+    elif isinstance(raw, str):
+        spdx = raw.strip()
+    else:
+        spdx = ""
+    _HF_LICENSE_CACHE[cache_key] = spdx
     return spdx
 
 
@@ -6323,24 +6836,36 @@ def write_spec_bundle(
                 log_msg += " · " + " · ".join(detail_parts)
         log.info(log_msg)
     effective_experiment = lead_content_override or (rec.suggested_experiment or "(none)")
-    (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
-        paper_title=rec.paper_title,
-        arxiv_id=rec.arxiv_id,
-        tier=rec.tier,
-        relevance_score=rec.relevance_score,
-        interest_name=rec.interest_name or "(unnamed interest)",
-        interest_context_block=interest_block,
-        reasoning=rec.reasoning or "(no reasoning provided)",
-        selection_block=selection_block,
-        suggested_experiment=effective_experiment,
-        paper_abstract=rec.paper_abstract or "(abstract unavailable)",
-    ))
+    # Brief mode (rec.arxiv_id == "") writes a paper-less SPEC and skips
+    # PAPER.md entirely — there's no paper to describe. The invocation
+    # + guardrails + orientation files still land, so the coding agent
+    # reads the same file set (minus PAPER.md) as the paper-anchored
+    # path. INVOCATION.md's file-list references PAPER.md conditionally
+    # (see below).
+    if not rec.arxiv_id:
+        (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE_BRIEF.format(
+            interest_context_block=interest_block,
+            suggested_experiment=effective_experiment,
+        ))
+    else:
+        (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
+            paper_title=rec.paper_title,
+            arxiv_id=rec.arxiv_id,
+            tier=rec.tier,
+            relevance_score=rec.relevance_score,
+            interest_name=rec.interest_name or "(unnamed interest)",
+            interest_context_block=interest_block,
+            reasoning=rec.reasoning or "(no reasoning provided)",
+            selection_block=selection_block,
+            suggested_experiment=effective_experiment,
+            paper_abstract=rec.paper_abstract or "(abstract unavailable)",
+        ))
 
-    (bundle / "PAPER.md").write_text(_PAPER_MD_TEMPLATE.format(
-        paper_title=rec.paper_title,
-        arxiv_id=rec.arxiv_id,
-        paper_abstract=rec.paper_abstract,
-    ))
+        (bundle / "PAPER.md").write_text(_PAPER_MD_TEMPLATE.format(
+            paper_title=rec.paper_title,
+            arxiv_id=rec.arxiv_id,
+            paper_abstract=rec.paper_abstract,
+        ))
 
     # CONTEXT.md — team's shipping history bullets,
     # fetched from the research-interests endpoint. Skipped entirely
@@ -6407,14 +6932,27 @@ def write_spec_bundle(
         else:
             log.info("  → maintain-state=true but no .remyx/repo_intel.yaml on origin/main; continuing without")
 
-    (bundle / "INVOCATION.md").write_text(_INVOCATION_MD_TEMPLATE.format(
-        package=package,
-        attribution_url=CANONICAL_ATTRIBUTION_URL,
-        issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
-        environment_file_ref=environment_file_ref,
-        research_findings_ref=research_findings_ref,
-        repo_intel_ref=repo_intel_ref,
-    ))
+    if not rec.arxiv_id:
+        # Brief-mode invocation: no PAPER.md reference, no Mode 1/2/3
+        # framing, no "research findings" (there wasn't a research
+        # phase). The brief carries scope; downstream gates are
+        # unchanged so the honesty discipline still applies.
+        (bundle / "INVOCATION.md").write_text(_INVOCATION_MD_TEMPLATE_BRIEF.format(
+            package=package,
+            attribution_url=CANONICAL_ATTRIBUTION_URL,
+            issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
+            environment_file_ref=environment_file_ref,
+            repo_intel_ref=repo_intel_ref,
+        ))
+    else:
+        (bundle / "INVOCATION.md").write_text(_INVOCATION_MD_TEMPLATE.format(
+            package=package,
+            attribution_url=CANONICAL_ATTRIBUTION_URL,
+            issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
+            environment_file_ref=environment_file_ref,
+            research_findings_ref=research_findings_ref,
+            repo_intel_ref=repo_intel_ref,
+        ))
 
     # ORIENTATION.md — target repo's contributor guides, PR template, recent
     # merged-PR conventions, lint/type config, detected verification stack,
@@ -9851,6 +10389,222 @@ def _resolve_external_candidate(selection: dict) -> "Recommendation | None":
     )
 
 
+def run_brief_mode(target: Target) -> dict:
+    """Draft a PR from a design brief supplied via ``INPUT_LEAD_CONTENT``.
+
+    Companion to :func:`process_target`'s paper-anchored recommend flow.
+    Skips the ranker / selection / paper-preflight — the brief IS the
+    spec. Composes existing leaf helpers so downstream gates
+    (path allowlist, integration check, stub density, self-review) and
+    telemetry surfaces (step summary, run cost) apply exactly as in the
+    paper-anchored path.
+
+    Flow:
+
+      1. Validate INPUT_LEAD_CONTENT is non-empty.
+      2. Construct a synthetic ``Recommendation`` with ``arxiv_id == ""``.
+      3. ``prepare_workdir(target)`` — clone target repo.
+      4. ``write_spec_bundle(workdir, target, rec, package, ...)`` — the
+         writer already gates on ``rec.arxiv_id``: SPEC.md renders from
+         ``_SPEC_MD_TEMPLATE_BRIEF``, PAPER.md is skipped entirely,
+         INVOCATION.md renders from ``_INVOCATION_MD_TEMPLATE_BRIEF``.
+      5. ``invoke_claude_code(workdir, timeout_s)`` — coding agent.
+      6. ``validate_changes(...)`` — path allowlist + always-blocked.
+      7. ``commit_and_push(...)`` — branch push (bundle dir is scrubbed).
+      8. ``build_pr_body(target, rec, ...)`` — gates on ``rec.arxiv_id``
+         and renders the brief variant.
+      9. ``open_pr(...)`` — draft PR on target repo.
+
+    Deliberately narrower than ``process_target``: no rate-limit guard
+    (brief mode is a manual dispatch, cadence is caller-controlled),
+    no candidate dedup (there's no candidate pool), no preflight-route
+    (the caller already decided this brief warrants a dispatch), no
+    inline refinement chain (the brief is the spec — no gap-analysis
+    stage to re-audit against a paper).
+
+    Returns a status dict shaped like ``process_target``'s so
+    ``main``'s telemetry, step-summary, and exit-status paths render
+    consistently across modes.
+    """
+    result: dict = {"repo": target.repo, "status": "error"}
+
+    lead_content = (os.environ.get("INPUT_LEAD_CONTENT") or "").strip()
+    if not lead_content:
+        log.error(
+            "mode='brief' requires INPUT_LEAD_CONTENT to be a non-empty "
+            "design brief — the brief IS the spec in this mode"
+        )
+        return {
+            "repo": target.repo,
+            "status": "skipped_brief_missing_lead_content",
+            "target_repo": target.repo,
+        }
+
+    # Lightweight interest fetch — no candidate ranking, just the
+    # customer's configured research-focus body + shipping-history
+    # bullets. Best-effort; on any failure the brief still ships,
+    # coding agent just loses that repo-shaping context. Skipped
+    # entirely when no interest_id is configured (self-hosted /
+    # setup-local paths that don't use the Remyx engine).
+    interest_name, interest_context, experiment_history = "", "", ""
+    if target.interest_id:
+        interest_name, interest_context, experiment_history = (
+            _fetch_interest_context(target.interest_id)
+        )
+    rec = _recommendation_from_brief(lead_content, interest_context=interest_context)
+    rec.interest_name = interest_name
+    rec.experiment_history = experiment_history
+
+    # License enrichment: URLs the brief references (external repos,
+    # model cards) get their licenses fetched so the PR body carries
+    # the same license warning the paper-anchored path renders.
+    # Best-effort; leaves defaults on any fetch failure.
+    _enrich_brief_licenses(rec, lead_content, target)
+    result["license_class"] = rec.license_class
+    if rec.paper_license:
+        result["referenced_license"] = rec.paper_license
+
+    # Issue-ref extraction: detect ``#N`` and full issue URLs in the
+    # brief so the PR body links back to the originating issue(s).
+    # Traceability for briefs that came from ``gh issue view`` output
+    # or a manual copy of an issue body.
+    issue_refs = _extract_issue_refs(lead_content, target.repo)
+    if issue_refs:
+        result["issue_refs"] = issue_refs
+    log.info(
+        f"  brief-mode dispatch: title={rec.paper_title!r} "
+        f"({len(lead_content)} chars in brief)"
+    )
+    result["brief_title"] = rec.paper_title
+    result["brief_chars"] = len(lead_content)
+
+    workdir = prepare_workdir(target)
+    try:
+        package = detect_package_name(workdir)
+        default_branch = detect_default_branch(workdir)
+        env_body = _load_environments_md(workdir)
+        log.info(
+            f"  detected package: {package}  default branch: {default_branch}"
+        )
+        result["package"] = package
+        result["base_branch"] = default_branch
+
+        # Bundle write — the writer's rec.arxiv_id branches emit the
+        # brief variants of SPEC.md / INVOCATION.md and skip PAPER.md.
+        write_spec_bundle(
+            workdir, target, rec, package,
+            selection_note="",
+            env_body=env_body,
+        )
+
+        # Coding-agent invocation. INVOCATION.md is already the brief
+        # variant (no Mode 1/2/3 framing; brief IS the spec).
+        claude_ok, claude_log = invoke_claude_code(
+            workdir, timeout_s=target.claude_timeout_s,
+        )
+        result["claude_log_tail"] = claude_log[-1000:]
+        if not claude_ok:
+            log.error("  ✗ claude CLI failed; no branch pushed, no PR opened")
+            result["status"] = "claude_failed"
+            return result
+
+        # Agent may have written OPEN_AS_ISSUE.md instead of code (the
+        # brief-mode INVOCATION.md offers this as the fallback path
+        # when the brief is too broad / no call site exists). Detect
+        # and short-circuit — the Issue-open path is a real project
+        # that reuses existing open_issue plumbing; not in this draft.
+        if (workdir / ISSUE_FALLBACK_FILENAME).exists():
+            log.info(
+                f"  agent wrote {ISSUE_FALLBACK_FILENAME}; brief was too "
+                f"broad for a PR. Issue-route from brief mode not yet "
+                f"wired — leaving the branch un-pushed for manual review."
+            )
+            result["status"] = "brief_declined_open_as_issue"
+            result["issue_fallback_body"] = (
+                workdir / ISSUE_FALLBACK_FILENAME
+            ).read_text()[:2000]
+            return result
+
+        # Diff validation (path allowlist + always-blocked). Same gate
+        # the paper-anchored path uses so brief-mode PRs can't touch
+        # .github/workflows/** or other guarded paths any more freely.
+        allowlisted, violations = validate_changes(workdir, target, package)
+        if not allowlisted:
+            log.error(
+                f"  ✗ path violations ({len(violations)}); no PR opened"
+            )
+            result["status"] = "rejected_path_violations"
+            result["path_violations"] = violations[:20]
+            return result
+
+        # Branch name: prefer the agent-written PR_TITLE.txt (already
+        # handled by format_pr_title with a workdir arg), fall back to
+        # a slug of the brief-derived title.
+        pr_title = format_pr_title(rec, workdir=workdir)
+        branch = _brief_branch_name(pr_title)
+        result["branch"] = branch
+        result["pr_title"] = pr_title
+
+        commit_and_push(
+            workdir, branch, pr_title, target.repo,
+            base_branch=default_branch,
+        )
+
+        # publish=branch short-circuits before ``open_pr`` — the branch
+        # is pushed for review, no PR object is created. Same semantics
+        # as the paper-anchored path uses for its own publish=branch
+        # branch; brief-mode was silently ignoring it in the first
+        # v1.7.46 draft.
+        publish_mode = (os.environ.get("INPUT_PUBLISH") or "pr").strip().lower()
+        if publish_mode == "branch":
+            branch_url = f"https://github.com/{target.repo}/tree/{branch}"
+            result["status"] = "branch_pushed_no_pr"
+            result["branch_url"] = branch_url
+            log.info(
+                f"  ✓ {result['status']}: {branch_url} "
+                f"(no PR opened; publish=branch)"
+            )
+            return result
+
+        # PR body: build_pr_body branches on rec.arxiv_id → brief
+        # variant (no "Implements paper" attribution, no discovery-
+        # context collapse; the brief itself lands in "Design brief").
+        pr_body = build_pr_body(
+            target, rec, tests_status="unvalidated", test_output="",
+        )
+        draft = target.draft_mode != "never"
+        pr_url, pr_number = open_pr(
+            target, branch, pr_title, pr_body, draft,
+            base=default_branch,
+        )
+        log.info(f"  ✓ opened brief-mode PR: {pr_url}")
+        result["status"] = "pr_opened_brief"
+        result["pr_url"] = pr_url
+        result["pr_number"] = pr_number
+        result["draft"] = draft
+        return result
+
+    finally:
+        if not os.environ.get("DEBUG_KEEP_WORKDIR"):
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _brief_branch_name(pr_title: str) -> str:
+    """Derive a branch name from a brief-mode PR title.
+
+    Same ``remyx-recommendation/`` prefix as the paper-anchored path so
+    downstream housekeeping (dedup, stale-branch cleanup) picks brief-
+    mode branches up on the same rules. Slug is a lowercased, hyphen-
+    joined, punctuation-stripped snippet of the title, capped at 40
+    chars so the branch remains readable in the GitHub UI.
+    """
+    import re
+    slug_source = pr_title.removeprefix(PR_TITLE_PREFIX).strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug_source.lower()).strip("-")
+    slug = slug[:40].rstrip("-") or "brief"
+    return f"{BRANCH_PREFIX}{slug}"
+
+
 def process_target(target: Target) -> dict:
     """Run the full discovery + implementation loop for one target.
     Returns a status dict suitable for logging / Slack notify.
@@ -11326,6 +12080,45 @@ def build_pr_body(
         if selection_note and not selection_note.startswith("(")
         else "\n"
     )
+    # Brief mode (rec.arxiv_id == "") renders a paper-less body: no
+    # "Implements arXiv:X" attribution, no "Discovery context" collapse
+    # (there was no discovery — the brief WAS the input). The brief
+    # itself carries the "why" narrative in place of reasoning +
+    # selection + interest. The license section IS rendered when the
+    # brief cites an external repo — the enrichment runs upstream in
+    # ``run_brief_mode``, and this passes it through the same
+    # ``_render_license_section`` the paper path uses. ``issue_refs``
+    # extracted from the brief become a ``Refs:`` line for
+    # PR-Issue link resolution.
+    if not rec.arxiv_id:
+        issue_refs = _extract_issue_refs(
+            rec.suggested_experiment or "", target.repo,
+        )
+        issue_refs_line = (
+            f"\nRefs: {', '.join(issue_refs)}\n" if issue_refs else ""
+        )
+        # Multi-license path: brief mode aggregates every cited repo's
+        # license into ``rec.referenced_licenses``. When populated (any
+        # non-target repo was cited in the brief), render the multi-
+        # entry block instead of the single-license one — which would
+        # only surface the first URL and hide the tail.
+        if rec.referenced_licenses:
+            target_spdx = _fetch_repo_license(target.repo)
+            target_class = _classify_license(target_spdx)
+            license_section = _render_multi_license_section(
+                [(k, s) for (k, s, _sp, _cl) in rec.referenced_licenses],
+                rec.referenced_licenses,
+                target_class,
+            )
+        else:
+            license_section = _render_license_section(rec)
+        return _PR_BODY_TEMPLATE_BRIEF.format(
+            suggested_experiment=rec.suggested_experiment or "(no brief provided)",
+            test_section=test_section,
+            license_section=license_section,
+            issue_refs_line=issue_refs_line,
+            attribution_url=CANONICAL_ATTRIBUTION_URL,
+        )
     return _PR_BODY_TEMPLATE.format(
         paper_title=rec.paper_title,
         arxiv_id=rec.arxiv_id,
@@ -16937,11 +17730,11 @@ def main():
     ).strip().lower().replace("_", "-")
     if mode not in (
         "recommend", "weekly-summary", "fidelity", "convention", "test",
-        "issue-convention",
+        "issue-convention", "brief",
     ):
         log.error(f"Unknown mode {mode!r}; must be 'recommend', "
                   f"'weekly-summary', 'fidelity', 'convention', 'test', "
-                  f"or 'issue-convention'.")
+                  f"'issue-convention', or 'brief'.")
         sys.exit(2)
 
     target = build_target_from_env()
@@ -17004,6 +17797,12 @@ def main():
         log.info(f"  mode=issue-convention  issue_number={issue_number}")
         runner = run_issue_convention_pass
         failure_status = "issue_convention_failed_claude"
+    elif mode == "brief":
+        # Paper-less path: INPUT_LEAD_CONTENT is the spec. See
+        # ``run_brief_mode`` for the landing zones the full flow needs.
+        log.info("  mode=brief  (lead-content is the spec; no arXiv anchor)")
+        runner = run_brief_mode
+        failure_status = "brief_failed"
     else:
         log.info(f"  min_confidence={target.min_confidence}  "
                  f"draft_mode={target.draft_mode}  "
