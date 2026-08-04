@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/4b22a207-d878-4b4d-a1f1-02e886a8e994
 
 
 
-Validating and comparing new methods against your own codebase is 10× the work of any single implementation. Schedule Outrider (or dispatch on demand) as a GitHub Action to wire arXiv methods (or your own design-doc leads) into real call sites, so your team can measure the change against the metrics you already track.
+Turn any brief — an arXiv paper, a search query, or your own design doc — into a review-ready draft PR. Outrider runs as a GitHub Action, wires the implementation into a real call site in your repo, and returns a PR whose body already carries the evidence a maintainer needs to review it: references cited, license flagged, tests written, honest scope discipline in the self-review, alignment with your repo's own conventions.
 
 ```yaml
 - uses: remyxai/outrider@v1
@@ -19,13 +19,29 @@ Each dispatch runs the coding agent in a fresh, ephemeral runner — candidates 
 <img width="2752" height="1536" alt="outrider-pipeline-diagram" src="https://github.com/user-attachments/assets/e7732730-9130-4f0f-96f7-d23c8047387d" />
 
 
+## Trigger patterns
+
+Four ways to specify what Outrider should implement — same harness downstream:
+
+| Trigger | Where the intent comes from | How to fire |
+|---|---|---|
+| **Alerts** | *System-sourced.* The ranker picks from arXiv against your ResearchInterest on a weekly cron. | Scheduled — no command needed |
+| **Search** | *Semi-sourced.* You supply a method-family query; the ranker returns the top arXiv hit. | `--search-method "riemannian preconditioning LoRA"` |
+| **Pin** | *Reproducible.* You name an exact arXiv id. | `--pin-arxiv 2410.20305v2` |
+| **Brief** | *Operator-sourced.* You write the design brief directly — an issue body, a Colab notebook, a hand-authored spec. No arXiv anchor required. | `--brief @design.md` or `--brief "add exp backoff to the HTTP client"` |
+
+Every pattern produces the same output shape: a draft PR with implementation + tests + license section + convention-aligned body + honest scope citations. **What differs is only where the "why" comes from.**
+
+Bring your own context — even when it's underspecified. The scaffolding fills in what the brief doesn't (references cited, license flagged, tests, convention alignment) so a two-line issue body still yields a review-ready PR.
+
+
 ## What you get
 
 - **Draft PRs** wired to an existing call site, with a self-review noting what was implemented vs. left out
-- **Issues** when preflight, validators, or self-review route the paper to discussion instead
+- **Issues** when preflight, validators, or self-review route the intent to discussion instead
 - **Branch-only mode** (`publish: branch`) — pushes to the fork without opening a PR or Issue; explore N candidates before committing to any one
 - **No duplicate work** — a paper isn't re-recommended once Outrider or a maintainer Issue references it
-- **A selection narrative** in the step summary — why this paper, or why nothing this run
+- **A selection narrative** in the step summary — why this candidate, or why nothing this run
 
 
 ## Model backends
@@ -51,11 +67,16 @@ Installs the action, writes the workflow, sets the secrets (`REMYX_API_KEY`, `AN
 Trigger an ad-hoc run:
 
 ```bash
+# Paper-anchored — exact arXiv id or a method-family search
 remyxai outrider trigger --repo owner/name --pin-arxiv 2410.20305v2
 remyxai outrider trigger --repo owner/name --search-method "riemannian preconditioning LoRA optimizer"
+
+# Brief-anchored — a design brief you supply directly, inline or from disk
+remyxai outrider trigger --repo owner/name --brief "add exponential backoff to the HTTP client"
+remyxai outrider trigger --repo owner/name --brief @design.md
 ```
 
-`--pin-arxiv` implements the exact paper; `--search-method` searches for the top hit. See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install and per-dispatch routing.
+`--pin-arxiv` implements the exact paper; `--search-method` searches for the top hit; `--brief` runs the paper-less flow where the design brief you supply IS the spec. See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install and per-dispatch routing.
 
 Setting up by hand instead of via the CLI? See [`docs/manual-install.md`](docs/manual-install.md).
 
