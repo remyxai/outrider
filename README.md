@@ -83,7 +83,7 @@ Setting up by hand instead of via the CLI? See [`docs/manual-install.md`](docs/m
 
 ## Examples
 
-### Case study: three-part contribution to `huggingface/peft`
+### Case study: three recent contributions to `huggingface/peft`
 
 Three parameter-efficient fine-tuning methods surfaced from arXiv, drafted on the `smellslikeml/peft` fork, and shepherded upstream to `huggingface/peft`:
 
