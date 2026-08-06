@@ -87,25 +87,24 @@ Setting up by hand instead of via the CLI? See [`docs/manual-install.md`](docs/m
 
 Three parameter-efficient fine-tuning methods surfaced from arXiv, drafted on the `smellslikeml/peft` fork, and shepherded upstream to `huggingface/peft`:
 
-| Method | Paper | Upstream PR | +LOC / Files | Status |
-|---|---|---|---:|---|
-| Riemannian Preconditioned LoRA | [arXiv:2402.02347](https://arxiv.org/abs/2402.02347) (Zhang & Pilanci) | [huggingface/peft#3382](https://github.com/huggingface/peft/pull/3382) | +401 / 6 | **merged 2026-08-03** — 32.7d review |
-| Super-Tuning & Supra | [arXiv:2607.09287](https://arxiv.org/abs/2607.09287) (Ilin, Zmushko & Richtárik) | [huggingface/peft#3518](https://github.com/huggingface/peft/pull/3518) | +1309 / 24 | in review — coord [#3450](https://github.com/huggingface/peft/issues/3450) |
-| Scaling DoRA (factored norm + fused Triton kernel) | [arXiv:2603.22276](https://arxiv.org/abs/2603.22276) (Zelenin & Zhuravlyova) | pending license clarification | — | internal draft ([smellslikeml/peft#18](https://github.com/smellslikeml/peft/pull/18)) |
+| <img src="docs/case-studies/peft/figures/riemannian_lora.png" width="340"> | <img src="docs/case-studies/peft/figures/supertuning.png" width="340"> | <img src="docs/case-studies/peft/figures/dora_factored_norm.png" width="340"> |
+|---|---|---|
+| **Riemannian Preconditioned LoRA** | **Super-Tuning & Supra** | **Scaling DoRA** (factored norm + fused kernel) |
+| [arXiv:2402.02347](https://arxiv.org/abs/2402.02347) — Zhang & Pilanci | [arXiv:2607.09287](https://arxiv.org/abs/2607.09287) — Ilin, Zmushko & Richtárik | [arXiv:2603.22276](https://arxiv.org/abs/2603.22276) — Zelenin & Zhuravlyova |
+| [huggingface/peft#3382](https://github.com/huggingface/peft/pull/3382) | [huggingface/peft#3518](https://github.com/huggingface/peft/pull/3518) | pending license clarification |
+| **merged 2026-08-03** — +401/6, 32.7d review | in review — +1309/24, coord [#3450](https://github.com/huggingface/peft/issues/3450) | internal draft — [smellslikeml/peft#18](https://github.com/smellslikeml/peft/pull/18) |
 
-![Composite PR #3382 analytics](docs/case-studies/peft/figures/composite_pr3382_analytics.png)
-
-Composite analytics for the merged Riemannian LoRA PR (six panels): size in cohort context, composition split, review latency, scope shape, contributor recurrence, and feature-utility signals. Full case study — per-method deep dives, cohort PR-shape comparison, coordination-issue-first workflow — at **[docs/case-studies/peft.md](docs/case-studies/peft.md)**.
+Full case study — per-method deep dives, PR-shape cohort comparison, coordination-issue-first workflow — at **[docs/case-studies/peft.md](docs/case-studies/peft.md)**.
 
 ### More examples
 
-Each PR below shows the **match** (what in the paper mapped to what in the repo) and the **shape** (how the wiring landed):
+Each PR below shows the **match** (paper → repo) and the **shape** (how the wiring landed):
 
-- **[OLMo-core #13](https://github.com/smellslikeml/OLMo-core/pull/13)** — Mechanism-driven preemptive instability monitor ([arXiv:2606.28116](https://arxiv.org/abs/2606.28116)). *Match:* `train/callbacks/` already has the reactive `StabilityMonitorCallback` shape; the preemptive variant registers alongside as a forward-hook + `record_metric` peer that fires thousands of steps before the loss diverges. *Shape:* `MechanismMonitorCallback` with QK spectral entropy + MoE routing entropy signals gated by a parameter-free rolling-window one-sided z-score detector; 12 tests covering GQA, layer/token sub-sampling, hook lifecycle, and state-dict window truncation. 
-- **[OpenRLHF #14](https://github.com/smellslikeml/OpenRLHF/pull/14)** — MRPO step-level reward penalty ([arXiv:2606.31825v1](https://arxiv.org/abs/2606.31825v1)). *Match:* PPO advantages already carry per-step weighting; MRPO's decay factor slots in as a second multiplier. *Shape:* new hook wired into `RemoteExperienceMaker.compute_advantages_and_returns`, opt-in flag, default-off byte-identical. PR body names the sibling papers in the same PPO cluster as follow-ups.
-- **[ag2 #9](https://github.com/smellslikeml/ag2/pull/9)** — Adaptive Context Elasticizer ([arXiv:2606.31564v1](https://arxiv.org/abs/2606.31564v1)). *Match:* `MiddlewareFactory` already extends the LLM-call pipeline; a new elastic middleware sits alongside `HistoryLimiter` / `TokenLimiter`. *Shape:* per-instance abstraction cache for reversibility, deterministic extractive digest keeps the middleware dependency-free.
-- **[lerobot #9](https://github.com/smellslikeml/lerobot/pull/9)** — Dense Embodied Chain-of-Thought supervision ([arXiv:2606.30552v1](https://arxiv.org/abs/2606.30552v1)). *Match:* the annotator has staged language modules (plan / vqa); ECoT slots in as another stage with the same I/O contract. *Shape:* new `EcotReasoningModule`, wired into the executor as phase 4.5.
-- **[atropos #16](https://github.com/smellslikeml/atropos/pull/16)** — Deterministic reward floor for reward-hacking mitigation ([arXiv:2606.27291v1](https://arxiv.org/abs/2606.27291v1)). *Match:* atropos exposes `RewardFunction` + `@registry.register` at `atroposlib/envs/reward_fns/`, the canonical extension point for reward-shape contributions in the RL environment framework. *Shape:* new `RewardFloor(RewardFunction)` with the paper's two rules (6-gram verbatim overlap + date-range lifted) — no invented detectors, uniform `-1.0` hard cap default, 28 tests covering rule triggers + registry integration + composition edge cases; docstring documents the grader-skip deviation (paper's other action doesn't map cleanly onto atropos's scalar reward contract).
+- **[OLMo-core #13](https://github.com/smellslikeml/OLMo-core/pull/13)** — Preemptive training instability monitor ([arXiv:2606.28116](https://arxiv.org/abs/2606.28116)). *Match:* `train/callbacks/` has the reactive `StabilityMonitorCallback`; the preemptive variant registers alongside. *Shape:* `MechanismMonitorCallback` with QK spectral entropy + MoE routing entropy, gated by a parameter-free rolling one-sided z-score; 12 tests.
+- **[OpenRLHF #14](https://github.com/smellslikeml/OpenRLHF/pull/14)** — MRPO step-level reward penalty ([arXiv:2606.31825v1](https://arxiv.org/abs/2606.31825v1)). *Match:* PPO advantages already carry per-step weighting. *Shape:* MRPO's decay factor slots into `RemoteExperienceMaker.compute_advantages_and_returns` as a second multiplier, opt-in flag, default-off byte-identical.
+- **[ag2 #9](https://github.com/smellslikeml/ag2/pull/9)** — Adaptive Context Elasticizer ([arXiv:2606.31564v1](https://arxiv.org/abs/2606.31564v1)). *Match:* `MiddlewareFactory` already extends the LLM-call pipeline. *Shape:* new elastic middleware alongside `HistoryLimiter` / `TokenLimiter`, per-instance abstraction cache for reversibility.
+- **[lerobot #9](https://github.com/smellslikeml/lerobot/pull/9)** — Dense Embodied Chain-of-Thought supervision ([arXiv:2606.30552v1](https://arxiv.org/abs/2606.30552v1)). *Match:* the annotator has staged language modules (plan / vqa). *Shape:* new `EcotReasoningModule` wired in as phase 4.5.
+- **[atropos #16](https://github.com/smellslikeml/atropos/pull/16)** — Deterministic reward floor for reward-hacking mitigation ([arXiv:2606.27291v1](https://arxiv.org/abs/2606.27291v1)). *Match:* `atroposlib/envs/reward_fns/` exposes `RewardFunction` + `@registry.register`. *Shape:* new `RewardFloor` implementing the paper's 6-gram + date-range rules with a `-1.0` cap; 28 tests.
 
 
 ## Documentation
