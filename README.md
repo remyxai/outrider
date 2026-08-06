@@ -83,10 +83,24 @@ Setting up by hand instead of via the CLI? See [`docs/manual-install.md`](docs/m
 
 ## Examples
 
+### Case study: three-part contribution to `huggingface/peft`
+
+Three parameter-efficient fine-tuning methods surfaced from arXiv, drafted on the `smellslikeml/peft` fork, and shepherded upstream to `huggingface/peft`:
+
+| Method | Paper | Upstream PR | +LOC / Files | Status |
+|---|---|---|---:|---|
+| Riemannian Preconditioned LoRA | [arXiv:2402.02347](https://arxiv.org/abs/2402.02347) (Zhang & Pilanci) | [huggingface/peft#3382](https://github.com/huggingface/peft/pull/3382) | +401 / 6 | **merged 2026-08-03** — 32.7d review |
+| Super-Tuning & Supra | [arXiv:2607.09287](https://arxiv.org/abs/2607.09287) (Ilin, Zmushko & Richtárik) | [huggingface/peft#3518](https://github.com/huggingface/peft/pull/3518) | +1309 / 24 | in review — coord [#3450](https://github.com/huggingface/peft/issues/3450) |
+| Scaling DoRA (factored norm + fused Triton kernel) | [arXiv:2603.22276](https://arxiv.org/abs/2603.22276) (Zelenin & Zhuravlyova) | pending license clarification | — | internal draft ([smellslikeml/peft#18](https://github.com/smellslikeml/peft/pull/18)) |
+
+![Composite PR #3382 analytics](docs/case-studies/peft/figures/composite_pr3382_analytics.png)
+
+Composite analytics for the merged Riemannian LoRA PR (six panels): size in cohort context, composition split, review latency, scope shape, contributor recurrence, and feature-utility signals. Full case study — per-method deep dives, cohort PR-shape comparison, coordination-issue-first workflow — at **[docs/case-studies/peft.md](docs/case-studies/peft.md)**.
+
+### More examples
+
 Each PR below shows the **match** (what in the paper mapped to what in the repo) and the **shape** (how the wiring landed):
 
-- **[peft #5](https://github.com/smellslikeml/peft/pull/5)** — Riemannian preconditioner for LoRA ([arXiv:2402.02347v3](https://arxiv.org/abs/2402.02347v3)). *Match:* the MetaMathQA benchmark already has a config-keyed optimizer dispatch. *Shape:* new `create_riemannian_optimizer`, +7/-2 wiring edit. _Human shepherded to [huggingface/peft #3382](https://github.com/huggingface/peft/pull/3382), coordinated via [issue #3380](https://github.com/huggingface/peft/issues/3380)._
-- **[peft #8](https://github.com/smellslikeml/peft/pull/8)** — Scaling DoRA factored weight-norm ([arXiv:2603.22276v1](https://arxiv.org/abs/2603.22276v1)). *Match:* `DoraLinearLayer.forward` already exposes the `ENABLE_DORA_CACHING` opt-in-flag convention; a factored-norm path slots in behind a sibling `USE_FACTORED_DORA_NORM` flag, no dense `B @ A` product materialized. *Shape:* new `factored_weight_norm.py`, ~110 LOC diff, 5 tests parametrized over scaling values plus an end-to-end `LoraConfig(use_dora=True)` check; numerically equivalent to the dense path. Coordinated via [sockeye44/dorafactors #1](https://github.com/sockeye44/dorafactors/issues/1) where the PEFT maintainer explicitly invited the algorithmic path.
 - **[OLMo-core #13](https://github.com/smellslikeml/OLMo-core/pull/13)** — Mechanism-driven preemptive instability monitor ([arXiv:2606.28116](https://arxiv.org/abs/2606.28116)). *Match:* `train/callbacks/` already has the reactive `StabilityMonitorCallback` shape; the preemptive variant registers alongside as a forward-hook + `record_metric` peer that fires thousands of steps before the loss diverges. *Shape:* `MechanismMonitorCallback` with QK spectral entropy + MoE routing entropy signals gated by a parameter-free rolling-window one-sided z-score detector; 12 tests covering GQA, layer/token sub-sampling, hook lifecycle, and state-dict window truncation. 
 - **[OpenRLHF #14](https://github.com/smellslikeml/OpenRLHF/pull/14)** — MRPO step-level reward penalty ([arXiv:2606.31825v1](https://arxiv.org/abs/2606.31825v1)). *Match:* PPO advantages already carry per-step weighting; MRPO's decay factor slots in as a second multiplier. *Shape:* new hook wired into `RemoteExperienceMaker.compute_advantages_and_returns`, opt-in flag, default-off byte-identical. PR body names the sibling papers in the same PPO cluster as follow-ups.
 - **[ag2 #9](https://github.com/smellslikeml/ag2/pull/9)** — Adaptive Context Elasticizer ([arXiv:2606.31564v1](https://arxiv.org/abs/2606.31564v1)). *Match:* `MiddlewareFactory` already extends the LLM-call pipeline; a new elastic middleware sits alongside `HistoryLimiter` / `TokenLimiter`. *Shape:* per-instance abstraction cache for reversibility, deterministic extractive digest keeps the middleware dependency-free.
