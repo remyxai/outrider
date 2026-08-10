@@ -271,6 +271,7 @@ def test_run_brief_mode_composes_leaves(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "validate_changes", fake_validate_changes)
     monkeypatch.setattr(run, "format_pr_title", fake_format_pr_title)
     monkeypatch.setattr(run, "commit_and_push", fake_commit_and_push)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     monkeypatch.setattr(run, "open_pr", fake_open_pr)
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")  # skip rmtree of tmp_path
 
@@ -312,6 +313,7 @@ def test_run_brief_mode_short_circuits_on_claude_failure(monkeypatch, tmp_path):
     def _push(*a, **kw): push_ran["v"] = True
     def _open(*a, **kw): open_pr_ran["v"] = True; return ("", 0)
     monkeypatch.setattr(run, "commit_and_push", _push)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     monkeypatch.setattr(run, "open_pr", _open)
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")
 
@@ -346,6 +348,7 @@ def test_run_brief_mode_routes_to_issue_fallback(monkeypatch, tmp_path):
     def _push(*a, **kw): push_ran["v"] = True
     def _open(*a, **kw): open_pr_ran["v"] = True; return ("", 0)
     monkeypatch.setattr(run, "commit_and_push", _push)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     monkeypatch.setattr(run, "open_pr", _open)
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")
 
@@ -386,6 +389,7 @@ def test_run_brief_mode_fetches_interest_context_when_id_set(monkeypatch, tmp_pa
     monkeypatch.setattr(run, "format_pr_title",
                         lambda rec, workdir=None: f"{run.PR_TITLE_PREFIX} T")
     monkeypatch.setattr(run, "commit_and_push", lambda *a, **kw: None)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     monkeypatch.setattr(run, "open_pr",
                         lambda *a, **kw: ("https://x/pull/1", 1))
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")
@@ -423,6 +427,7 @@ def test_run_brief_mode_skips_interest_fetch_when_no_id(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "format_pr_title",
                         lambda rec, workdir=None: f"{run.PR_TITLE_PREFIX} T")
     monkeypatch.setattr(run, "commit_and_push", lambda *a, **kw: None)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     monkeypatch.setattr(run, "open_pr",
                         lambda *a, **kw: ("https://x/pull/1", 1))
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")
@@ -456,6 +461,7 @@ def test_run_brief_mode_survives_interest_fetch_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "format_pr_title",
                         lambda rec, workdir=None: f"{run.PR_TITLE_PREFIX} T")
     monkeypatch.setattr(run, "commit_and_push", lambda *a, **kw: None)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     monkeypatch.setattr(run, "open_pr",
                         lambda *a, **kw: ("https://x/pull/1", 1))
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")
@@ -842,6 +848,7 @@ def test_run_brief_mode_honors_publish_branch(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "format_pr_title",
                         lambda rec, workdir=None: f"{run.PR_TITLE_PREFIX} T")
     monkeypatch.setattr(run, "commit_and_push", lambda *a, **kw: None)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     def _open(*a, **kw): open_pr_ran["v"] = True; return ("", 0)
     monkeypatch.setattr(run, "open_pr", _open)
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")
@@ -871,6 +878,7 @@ def test_run_brief_mode_rejects_path_violations(monkeypatch, tmp_path):
                         lambda w, t, p: (False, [".github/workflows/x.yml"]))
     def _push(*a, **kw): push_ran["v"] = True
     monkeypatch.setattr(run, "commit_and_push", _push)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
     monkeypatch.setenv("DEBUG_KEEP_WORKDIR", "1")
 
     result = run.run_brief_mode(_minimal_target())
