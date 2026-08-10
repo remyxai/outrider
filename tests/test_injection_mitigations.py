@@ -63,93 +63,47 @@ def test_canary_survives_missing_run_id_or_repo():
     assert len(a) == 16
 
 
-# ─── _check_canary_in_commits ─────────────────────────────────────────────
+# ─── _check_canary_ack_file ───────────────────────────────────────────────
 
-def _init_git_repo(path: Path):
-    subprocess.check_call(["git", "init", "-b", "main"], cwd=path,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.check_call(["git", "config", "user.email", "test@example.com"],
-                          cwd=path)
-    subprocess.check_call(["git", "config", "user.name", "test"], cwd=path)
-    (path / "seed.txt").write_text("seed\n")
-    subprocess.check_call(["git", "add", "seed.txt"], cwd=path)
-    subprocess.check_call(["git", "commit", "-m", "seed"], cwd=path,
-                          stdout=subprocess.DEVNULL)
+def _write_ack(workdir: Path, content: str) -> None:
+    """Emulate the coding agent writing .remyx-recommendation/SPEC_ACK.txt."""
+    (workdir / run.BUNDLE_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (workdir / run.BUNDLE_DIR_NAME / "SPEC_ACK.txt").write_text(content)
 
 
-def _commit_on_branch(path: Path, branch: str, msg: str):
-    subprocess.check_call(["git", "checkout", "-b", branch], cwd=path,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    safe = branch.replace("/", "_")
-    (path / f"file-{safe}.txt").write_text("data\n")
-    subprocess.check_call(["git", "add", "."], cwd=path)
-    subprocess.check_call(["git", "commit", "-m", msg], cwd=path,
-                          stdout=subprocess.DEVNULL)
-
-
-def test_check_canary_detects_present_trailer(tmp_path):
-    _init_git_repo(tmp_path)
+def test_check_canary_detects_present_token(tmp_path):
     canary = "abcdef0123456789"
-    _commit_on_branch(
-        tmp_path, "feat/x",
-        f"feat: add thing\n\nBody\n\nOutrider-Spec-Ack: {canary}",
-    )
-    assert run._check_canary_in_commits(tmp_path, "feat/x", "main", canary)
+    _write_ack(tmp_path, canary + "\n")
+    assert run._check_canary_ack_file(tmp_path, canary)
 
 
-def test_check_canary_detects_missing_trailer(tmp_path):
-    _init_git_repo(tmp_path)
-    _commit_on_branch(tmp_path, "feat/x", "feat: add thing (no trailer)")
-    assert not run._check_canary_in_commits(
-        tmp_path, "feat/x", "main", "abcdef0123456789",
-    )
+def test_check_canary_detects_missing_file(tmp_path):
+    # No bundle dir at all → helper returns False.
+    assert not run._check_canary_ack_file(tmp_path, "abcdef0123456789")
 
 
 def test_check_canary_rejects_wrong_token(tmp_path):
-    # Trailer PRESENT but with a different canary → still counts as
-    # missing (protects against attacker guessing the trailer format
-    # without knowing the per-run token).
-    _init_git_repo(tmp_path)
-    _commit_on_branch(
-        tmp_path, "feat/x",
-        "feat: adds thing\n\nOutrider-Spec-Ack: attackerguess",
-    )
-    assert not run._check_canary_in_commits(
-        tmp_path, "feat/x", "main", "abcdef0123456789",
-    )
+    # Attacker guesses the file location but not the per-run token.
+    _write_ack(tmp_path, "attackerguess\n")
+    assert not run._check_canary_ack_file(tmp_path, "abcdef0123456789")
 
 
-def test_check_canary_finds_trailer_in_any_commit_on_branch(tmp_path):
-    _init_git_repo(tmp_path)
-    subprocess.check_call(["git", "checkout", "-b", "feat/x"], cwd=tmp_path,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # First commit without trailer
-    (tmp_path / "a.txt").write_text("a")
-    subprocess.check_call(["git", "add", "."], cwd=tmp_path)
-    subprocess.check_call(["git", "commit", "-m", "wip"], cwd=tmp_path,
-                          stdout=subprocess.DEVNULL)
-    # Second (final) commit WITH trailer
+def test_check_canary_finds_token_in_verbose_ack_sentence(tmp_path):
+    # Substring match so the agent writing the full sentence still
+    # verifies as long as the token itself is present.
     canary = "fedcba9876543210"
-    (tmp_path / "b.txt").write_text("b")
-    subprocess.check_call(["git", "add", "."], cwd=tmp_path)
-    subprocess.check_call(
-        ["git", "commit", "-m", f"final\n\nOutrider-Spec-Ack: {canary}"],
-        cwd=tmp_path, stdout=subprocess.DEVNULL,
+    _write_ack(
+        tmp_path,
+        f"Task acknowledged. Spec token: {canary}. See INVOCATION.md.\n",
     )
-    assert run._check_canary_in_commits(tmp_path, "feat/x", "main", canary)
+    assert run._check_canary_ack_file(tmp_path, canary)
 
 
-def test_check_canary_empty_canary_returns_false():
-    # Defense against a caller passing "" — never approve empty trailer
-    # even if it's textually present in commits.
-    assert not run._check_canary_in_commits(Path("/does/not/matter"),
-                                            "b", "main", "")
-
-
-def test_check_canary_survives_git_failure(tmp_path):
-    # No git repo → git log errors → helper returns False (safe-fail).
-    assert not run._check_canary_in_commits(tmp_path, "b", "main",
-                                            "abcdef0123456789")
+def test_check_canary_empty_canary_returns_false(tmp_path):
+    # Defense against a caller passing "" — never approve empty token
+    # even if it's technically a substring of anything.
+    _write_ack(tmp_path, "anything at all")
+    assert not run._check_canary_ack_file(tmp_path, "")
 
 
 # ─── _wrap_untrusted_content ──────────────────────────────────────────────
@@ -286,7 +240,8 @@ def test_invocation_md_carries_run_specific_canary(tmp_path, monkeypatch):
     inv = (tmp_path / run.BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
     expected_canary = run._canary_for_run("abcdef", "owner/name")
     assert "Task completion acknowledgment" in inv
-    assert f"Outrider-Spec-Ack: {expected_canary}" in inv
+    assert "SPEC_ACK.txt" in inv
+    assert expected_canary in inv
 
 
 def test_invocation_md_canary_differs_per_run(tmp_path, monkeypatch):

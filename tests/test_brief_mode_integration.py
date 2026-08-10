@@ -300,7 +300,7 @@ def test_run_brief_mode_end_to_end_against_local_bare(
         )
         return ("https://example.test/pr/1", 1)
     monkeypatch.setattr(run, "open_pr", fake_open_pr)
-    monkeypatch.setattr(run, "_check_canary_in_commits", lambda *a: True)
+    monkeypatch.setattr(run, "_check_canary_ack_file", lambda *a: True)
 
     # Prevent the finally-block from wiping our fixture workdir before we
     # can inspect it.

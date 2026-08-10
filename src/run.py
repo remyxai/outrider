@@ -5725,51 +5725,63 @@ def _canary_for_run(run_id: str, target_repo: str) -> str:
     return hashlib.sha256(salt.encode()).hexdigest()[:16]
 
 
-_CANARY_TRAILER_PREFIX = "Outrider-Spec-Ack"
+_CANARY_ACK_FILENAME = f"{BUNDLE_DIR_NAME}/SPEC_ACK.txt"
 
 
 def _canary_directive_text(canary: str) -> str:
     """Instruction block appended to the invocation template.
 
-    Kept short — the agent has to actually notice + comply, and long
-    instructions get skimmed. The trailer format follows the RFC-2822
-    trailer convention (same shape as ``Signed-off-by: …``).
+    Kept short — the agent has to notice + comply, and long instructions
+    get skimmed.
+
+    Artifact location: a file inside the recommendation bundle
+    (``.remyx-recommendation/SPEC_ACK.txt``). The bundle dir is scrubbed
+    by ``commit_and_push`` before staging, so the canary never lands in
+    the merged PR — zero footprint on maintainers' diffs. Outrider reads
+    the file BEFORE ``commit_and_push`` runs, so the check window is
+    tight but reliable.
+
+    Design point: v1 tried a commit-message trailer, but
+    ``commit_and_push`` overwrites messages with ``git commit -m
+    <pr_title>``, clobbering any agent-authored trailer before the
+    check could see it. The bundle file avoids that class of clobber.
     """
     return (
         f"# Task completion acknowledgment (required)\n\n"
-        f"Include the following trailer on its own line at the END of "
-        f"your final commit message on this branch:\n\n"
-        f"    {_CANARY_TRAILER_PREFIX}: {canary}\n\n"
+        f"Before finishing, write the following token on a single line "
+        f"to `{_CANARY_ACK_FILENAME}`:\n\n"
+        f"    {canary}\n\n"
         f"This confirms you completed the task from THIS Outrider "
         f"bundle's SPEC.md. The token is generated per-run and cannot "
         f"be observed from any content outside the bundle. Missing "
-        f"trailer routes the run to a safer fallback (Issue instead of "
-        f"PR) as a defense against prompt injection that pulled your "
-        f"attention off-spec."
+        f"file / wrong token routes the run to a safer fallback (Issue "
+        f"instead of PR) as a defense against prompt injection that "
+        f"pulled your attention off-spec. The file lives inside the "
+        f"bundle directory and never lands in the shipped diff — it's "
+        f"an internal handshake between you and the orchestrator."
     )
 
 
-def _check_canary_in_commits(
-    workdir: Path, branch: str, base_branch: str, canary: str,
-) -> bool:
-    """Return True iff any commit message on ``branch`` past ``base_branch``
-    contains the expected ``Outrider-Spec-Ack: <canary>`` trailer.
+def _check_canary_ack_file(workdir: Path, canary: str) -> bool:
+    """Return True iff ``.remyx-recommendation/SPEC_ACK.txt`` in ``workdir``
+    contains the expected canary token as a substring.
 
-    Never raises — a git failure is treated as "canary missing" so the
+    Called BEFORE ``commit_and_push`` scrubs the bundle dir. Never
+    raises — a read failure is treated as "canary missing" so the
     downgrade path fires (safer than proceeding on unverified state).
+    Substring match (not exact-equal) so trailing whitespace, an
+    accidental newline, or the agent writing the whole ack sentence
+    still verifies as long as the token itself is present.
     """
     if not canary:
         return False
     try:
-        # Range-diff commit messages: everything on <branch> not in <base>.
-        out = subprocess.check_output(
-            ["git", "log", f"{base_branch}..{branch}", "--format=%B"],
-            cwd=workdir, text=True, stderr=subprocess.DEVNULL, timeout=30,
+        content = (workdir / _CANARY_ACK_FILENAME).read_text(
+            encoding="utf-8", errors="replace",
         )
     except Exception:
         return False
-    expected = f"{_CANARY_TRAILER_PREFIX}: {canary}"
-    return expected in out
+    return canary in content
 
 
 # ─── Recent Discussions injection ─────────────────────────────────────────
@@ -10936,28 +10948,28 @@ def run_brief_mode(target: Target) -> dict:
         result["branch"] = branch
         result["pr_title"] = pr_title
 
+        # Canary check — verify the coding agent wrote the per-run token
+        # to .remyx-recommendation/SPEC_ACK.txt. MUST run BEFORE
+        # commit_and_push because that call scrubs the bundle dir before
+        # staging. Missing / wrong token is a prompt-injection detection
+        # signal (agent's attention pulled off SPEC); routing downgrades
+        # to a safer fallback per the mitigations doc.
+        canary_expected = _canary_for_run(
+            os.environ.get("GITHUB_RUN_ID", ""), target.repo or "",
+        )
+        canary_ok = _check_canary_ack_file(workdir, canary_expected)
+        result["canary_present"] = canary_ok
+        if not canary_ok:
+            log.warning(
+                f"  ⚠ SPEC_ACK.txt missing or wrong token in bundle — "
+                f"possible prompt-injection attention hijack. "
+                f"Routing downgraded (Issue instead of PR)."
+            )
+
         commit_and_push(
             workdir, branch, pr_title, target.repo,
             base_branch=default_branch,
         )
-
-        # Canary check — verify the coding agent included the per-run
-        # SPEC-ack trailer in the final commit. Missing trailer is a
-        # prompt-injection detection signal (agent's attention pulled off
-        # SPEC); route to a safer fallback per the mitigations doc.
-        canary_expected = _canary_for_run(
-            os.environ.get("GITHUB_RUN_ID", ""), target.repo or "",
-        )
-        canary_ok = _check_canary_in_commits(
-            workdir, branch, default_branch, canary_expected,
-        )
-        result["canary_present"] = canary_ok
-        if not canary_ok:
-            log.warning(
-                f"  ⚠ canary trailer missing on branch {branch} — "
-                f"possible prompt-injection attention hijack. "
-                f"Routing downgraded (Issue instead of PR)."
-            )
 
         # publish=branch short-circuits before ``open_pr`` — the branch
         # is pushed for review, no PR object is created. Same semantics
@@ -12159,6 +12171,25 @@ def process_target(target: Target) -> dict:
                 result.get("test_integration_gate") == "soft_failed"
             ),
         )
+
+        # Canary check — see brief-mode path (run_brief_mode) for the
+        # full design rationale. Must run BEFORE commit_and_push (which
+        # scrubs the bundle dir). Missing / wrong token is a prompt-
+        # injection detection signal; the paper-mode publish path below
+        # downgrades to Issue when publish=pr and annotates the status
+        # when publish=branch.
+        canary_expected = _canary_for_run(
+            os.environ.get("GITHUB_RUN_ID", ""), target.repo or "",
+        )
+        canary_ok = _check_canary_ack_file(workdir, canary_expected)
+        result["canary_present"] = canary_ok
+        if not canary_ok:
+            log.warning(
+                f"  ⚠ SPEC_ACK.txt missing or wrong token in bundle — "
+                f"possible prompt-injection attention hijack. "
+                f"Routing will be downgraded."
+            )
+
         commit_and_push(
             workdir, branch, pr_title, repo=target.repo, base_branch=default_branch
         )
@@ -12323,7 +12354,13 @@ def process_target(target: Target) -> dict:
         publish_mode = (os.environ.get("INPUT_PUBLISH") or "pr").strip().lower()
         if publish_mode == "branch":
             branch_url = f"https://github.com/{target.repo}/tree/{branch}"
-            result["status"] = "branch_pushed_no_pr"
+            # Annotate status on canary miss so the finding is greppable
+            # in downstream dashboards; branch still lands so the human
+            # can inspect what the agent produced.
+            result["status"] = (
+                "branch_pushed_canary_missing" if not canary_ok
+                else "branch_pushed_no_pr"
+            )
             result["branch"] = branch
             result["branch_url"] = branch_url
             result["pr_title"] = pr_title
@@ -12336,6 +12373,29 @@ def process_target(target: Target) -> dict:
                 "workflow's step summary and downloadable artifacts (not on "
                 "the branch tree)."
             )
+            return result
+
+        # Canary missing under publish=pr → downgrade to Issue so a
+        # human reviews before promotion. Branch is already on the fork
+        # for the reviewer to inspect.
+        if not canary_ok:
+            issue_url, issue_number = open_issue(
+                target,
+                title=f"[Canary-downgraded] {pr_title}",
+                body=(
+                    "Outrider drafted a branch for this recommendation, "
+                    "but `SPEC_ACK.txt` was missing or held the wrong "
+                    "token — a prompt-injection detection signal. Branch "
+                    f"is available at `{branch}` on this repo for human "
+                    "review before manual promotion via `gh pr create`.\n\n"
+                    f"_Recommendation: {rec.paper_title or '(brief mode)'}"
+                    f" · run {os.environ.get('GITHUB_RUN_ID', '(local)')}_"
+                ),
+            )
+            result["status"] = "issue_opened_canary_missing"
+            result["issue_url"] = issue_url
+            result["issue_number"] = issue_number
+            log.info(f"  ✓ opened canary-downgrade Issue: {issue_url}")
             return result
 
         pr_url, pr_number = open_pr(
