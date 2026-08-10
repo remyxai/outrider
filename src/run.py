@@ -393,6 +393,7 @@ PR body, and commit messages. Do NOT re-explore these files yourself
 {contributor_guides_block}
 {pr_template_block}
 {recent_merged_prs_block}
+{recent_discussions_block}
 {tooling_config_block}
 {verification_stack_block}
 {nearby_files_block}
@@ -5639,6 +5640,224 @@ def _orient_recent_merged_prs(repo: str, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+# ─── Recent Discussions injection ─────────────────────────────────────────
+#
+# GitHub Discussions carry the *pre-implementation* rationale that Issues
+# and merged-PRs don't: RFC-style threads, "why we don't want X" debates,
+# design decisions that shipped only as a link in a much later PR. Feeding
+# a lexically-relevant slice into the orientation block lets the coding
+# agent avoid re-litigating settled design questions — the Edit-Bias
+# failure mode RepoProbe (2608.04783) names and quantifies.
+#
+# Discussions are per-repo, NOT inherited from a fork's parent. Fresh
+# forks (see [[outrider-forks-disable-issues]]) typically have Discussions
+# off. When the target repo lacks them, fall back to the parent — that's
+# where the design conversations actually happened.
+#
+# Ranking is lexical-only in v1: paper title + abstract → keyword set,
+# score each discussion by keyword hits (title weighted 2x). No LLM call;
+# this is context enrichment on the cheap side of Outrider's cost
+# discipline. Zero-signal discussions are dropped so the block is either
+# useful or absent — never noise.
+
+# Categories that consistently carry announcement / user-support / off-
+# topic content rather than design rationale. Based on a signal-quality
+# survey across peft/trl/torchtune/vllm/DeepSpeed (2026-08-10, n=5 repos
+# × 4 papers): every substantive design-thread hit was in Ideas / RFC /
+# General; every noise hit was in one of these excluded categories. The
+# rule earns its keep only on the SHAPE (design-thread-vs-not), not the
+# specific label — a repo that puts its design content in a custom
+# category (e.g. "Development") still surfaces through the negative
+# filter unchanged.
+_DROPPED_DISCUSSION_CATEGORIES = frozenset({
+    "Q&A", "Show and tell", "Announcements", "Polls", "Help",
+})
+
+
+_DISCUSSION_STOPWORDS = frozenset({
+    "with", "from", "that", "this", "have", "will", "your", "into", "when",
+    "which", "there", "these", "their", "than", "them", "then", "some",
+    "such", "what", "using", "just", "also", "would", "could", "should",
+    "about", "over", "each", "more", "very", "most", "many", "much", "only",
+    "does", "done", "make", "made", "been", "being", "here", "were", "where",
+    "paper", "abstract", "method", "methods", "results", "figure", "table",
+    "arxiv", "https", "http", "code", "github", "figures", "section",
+    "shown", "given", "based", "along", "under", "above", "below", "while",
+    "however", "therefore",
+})
+
+
+def _resolve_discussions_repo(target_repo: str) -> tuple[str, bool] | None:
+    """Where to look up Discussions for ``target_repo``.
+
+    Returns ``(owner_repo, is_fallback)`` — is_fallback True when the
+    target has Discussions off and we fell back to the parent repo.
+    Returns None when neither the target nor its parent (if any) has
+    Discussions enabled.
+    """
+    try:
+        meta = gh_api("GET", f"/repos/{target_repo}")
+    except Exception:
+        return None
+    if meta.get("has_discussions"):
+        return (target_repo, False)
+    parent = meta.get("parent") or {}
+    parent_slug = (parent.get("full_name") or "").strip()
+    if not parent_slug:
+        return None
+    try:
+        parent_meta = gh_api("GET", f"/repos/{parent_slug}")
+    except Exception:
+        return None
+    if parent_meta.get("has_discussions"):
+        return (parent_slug, True)
+    return None
+
+
+def _fetch_recent_discussions(repo: str, limit: int = 30) -> list[dict]:
+    """Newest ``limit`` Discussions on ``repo`` via GraphQL.
+
+    Returns list of dicts with ``title``, ``url``, ``category``,
+    ``excerpt`` (first ~500 chars of body). Empty list on any failure —
+    this is context enrichment, never load-bearing on the run.
+
+    Default limit of 30 (single GraphQL page) was chosen after a signal-
+    quality survey across peft/trl/torchtune/vllm/DeepSpeed: a pool of 15
+    let announcement/spam threads that share generic vocabulary with the
+    paper (`tool`, `models`, `contribution`) outscore substantive RFC
+    threads deeper in the recency list. Widening the pool gives the
+    lexical ranker more design-thread candidates to outscore the noise.
+    Top-k stays capped at 5 so the emitted block stays token-bounded.
+    """
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        return []
+    query = (
+        "query($owner: String!, $name: String!, $limit: Int!) {"
+        " repository(owner: $owner, name: $name) {"
+        " hasDiscussionsEnabled"
+        " discussions(first: $limit, orderBy:"
+        " {field: UPDATED_AT, direction: DESC}) {"
+        " nodes { title url bodyText category { name } } } } }"
+    )
+    try:
+        data = gh_graphql(query, {"owner": owner, "name": name, "limit": limit})
+    except Exception:
+        return []
+    repo_node = data.get("repository") or {}
+    if not repo_node.get("hasDiscussionsEnabled"):
+        return []
+    nodes = ((repo_node.get("discussions") or {}).get("nodes") or [])
+    out: list[dict] = []
+    for n in nodes:
+        title = (n.get("title") or "").strip()
+        url = (n.get("url") or "").strip()
+        body = (n.get("bodyText") or "").strip()
+        cat = ((n.get("category") or {}).get("name") or "").strip()
+        if not title or not url:
+            continue
+        if cat in _DROPPED_DISCUSSION_CATEGORIES:
+            continue
+        excerpt = body[:500] + ("…[truncated]" if len(body) > 500 else "")
+        out.append({"title": title, "url": url, "category": cat, "excerpt": excerpt})
+    return out
+
+
+def _paper_keywords(title: str, abstract: str, max_keywords: int = 40) -> list[str]:
+    """Alphanumeric tokens (len ≥ 4) from title + abstract, stopwords dropped.
+
+    Title tokens are counted twice so title-derived keywords stay near the
+    front of the ordered list.
+    """
+    text = f"{title} {title} {abstract}"
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", text):
+        low = tok.lower().strip("-")
+        if len(low) < 4 or low.isdigit():
+            continue
+        if low in _DISCUSSION_STOPWORDS:
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(low)
+        if len(out) >= max_keywords:
+            break
+    return out
+
+
+def _rank_discussions_by_paper(
+    discussions: list[dict], paper_title: str, paper_abstract: str,
+    top_k: int = 5,
+) -> list[dict]:
+    """Score each discussion by keyword overlap with the paper.
+
+    Score = 2 × hits-in-title + 1 × hits-in-excerpt. Zero-signal drops.
+    Ties broken by original order (which is UPDATED_AT desc, so recent
+    wins). Returns up to ``top_k`` entries, each augmented with an
+    ``_overlap`` int for downstream diagnostics.
+    """
+    kws = _paper_keywords(paper_title, paper_abstract)
+    if not kws or not discussions:
+        return []
+    scored: list[tuple[int, int, dict]] = []
+    for idx, d in enumerate(discussions):
+        title_low = (d.get("title") or "").lower()
+        body_low = (d.get("excerpt") or "").lower()
+        hits_title = sum(1 for k in kws if k in title_low)
+        hits_body = sum(1 for k in kws if k in body_low)
+        score = 2 * hits_title + hits_body
+        if score <= 0:
+            continue
+        scored.append((-score, idx, {**d, "_overlap": score}))
+    scored.sort()
+    return [entry for _, _, entry in scored[:top_k]]
+
+
+def _orient_recent_discussions(
+    target_repo: str, paper_title: str = "", paper_abstract: str = "",
+    limit: int = 30, top_k: int = 5,
+) -> str:
+    """Formatted markdown block: ranked Discussions relevant to the paper.
+
+    Empty when target/paper missing, Discussions unavailable, or no
+    lexical overlap. Falls back to the fork's parent repo when the target
+    has Discussions off.
+    """
+    if not target_repo or not paper_title:
+        return ""
+    resolved = _resolve_discussions_repo(target_repo)
+    if resolved is None:
+        return ""
+    discussions_repo, is_fallback = resolved
+    discussions = _fetch_recent_discussions(discussions_repo, limit=limit)
+    if not discussions:
+        return ""
+    ranked = _rank_discussions_by_paper(
+        discussions, paper_title, paper_abstract, top_k=top_k,
+    )
+    if not ranked:
+        return ""
+    if is_fallback:
+        origin = (f"`{discussions_repo}` (parent repo — target "
+                  f"`{target_repo}` has Discussions disabled)")
+    else:
+        origin = f"`{discussions_repo}`"
+    lines = [
+        f"Top {len(ranked)} recent Discussion(s) from {origin}, ranked by "
+        f"lexical overlap with the paper's title + abstract:\n",
+    ]
+    for d in ranked:
+        cat = f" _[{d['category']}]_" if d.get("category") else ""
+        lines.append(f"- [{d['title']}]({d['url']}){cat}")
+        excerpt = (d.get("excerpt") or "").strip()
+        if excerpt:
+            preview = "\n".join(excerpt.splitlines()[:2])[:280]
+            lines.append(f"  > {preview}")
+    return "\n".join(lines)
+
+
 def _orient_tooling_config(workdir: Path) -> str:
     """Extract lint/type/test config from common config files."""
     chunks: list[str] = []
@@ -5848,11 +6067,17 @@ def _orient_nearby_tests(workdir: Path, cap_files: int = 5) -> str:
     return "\n".join(lines)
 
 
-def _collect_repo_orientation(workdir: Path, target: Target, package: str) -> str:
+def _collect_repo_orientation(
+    workdir: Path, target: Target, package: str,
+    paper_title: str = "", paper_abstract: str = "",
+) -> str:
     """Assemble the repo orientation content for ORIENTATION.md.
 
     Returns the formatted markdown body. Returns "" if no orientation
     content could be gathered (e.g. fresh repo with no conventions).
+
+    ``paper_title`` + ``paper_abstract`` power the Recent Discussions
+    ranking block; when either is empty the block is skipped.
     """
     def _section(title: str, body: str) -> str:
         if not body.strip():
@@ -5870,6 +6095,11 @@ def _collect_repo_orientation(workdir: Path, target: Target, package: str) -> st
         "recent_merged_prs_block": _section(
             "Recent merged PRs (title + body convention)",
             _orient_recent_merged_prs(target.repo) if target.repo else "",
+        ),
+        "recent_discussions_block": _section(
+            "Recent architecture Discussions (design rationale)",
+            _orient_recent_discussions(target.repo, paper_title, paper_abstract)
+            if target.repo else "",
         ),
         "tooling_config_block": _section(
             "Tooling and lint/type config", _orient_tooling_config(workdir)
@@ -6965,7 +7195,11 @@ def write_spec_bundle(
     # and a few sample nearby files/tests. Pre-read so the agent doesn't
     # broad-explore the repo to rediscover conventions. Skipped entirely
     # when no orientation content can be gathered.
-    orientation_body = _collect_repo_orientation(workdir, target, package)
+    orientation_body = _collect_repo_orientation(
+        workdir, target, package,
+        paper_title=rec.paper_title or "",
+        paper_abstract=rec.paper_abstract or "",
+    )
     if orientation_body:
         (bundle / "ORIENTATION.md").write_text(orientation_body)
 
