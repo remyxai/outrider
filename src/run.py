@@ -5450,6 +5450,34 @@ def open_remyx_artifact_exists(target: Target) -> bool:
 # ─── Workdir + spec bundle ─────────────────────────────────────────────────
 
 
+def _preinstall_target_deps(workdir: Path) -> None:
+    """Best-effort install of the target's declared deps, from the pristine
+    clone, before the agent runs — so it can run the repo's tests to verify its
+    work (which it otherwise can't remedy mid-session, installs being denied).
+    Installs from the committed manifest, which an issue-body attacker can't have
+    touched. Gated to CI / explicit opt-in so it can't clobber a shared local
+    env. Never fatal.
+    """
+    if not (os.environ.get("INPUT_PREINSTALL") or os.environ.get("GITHUB_ACTIONS")):
+        return
+    cmds: list[list[str]] = []
+    if (workdir / "uv.lock").exists() and shutil.which("uv"):
+        cmds.append(["uv", "sync", "--frozen"])
+    elif (workdir / "poetry.lock").exists() and shutil.which("poetry"):
+        cmds.append(["poetry", "install", "--no-interaction", "--no-root"])
+    elif (workdir / "pyproject.toml").exists() or (workdir / "setup.py").exists():
+        cmds.append([sys.executable, "-m", "pip", "install", "-e", "."])
+    for req in ("requirements.txt", "requirements-dev.txt"):
+        if (workdir / req).exists():
+            cmds.append([sys.executable, "-m", "pip", "install", "-r", req])
+    for cmd in cmds:
+        try:
+            log.info("  → pre-installing target deps: %s", " ".join(cmd))
+            subprocess.run(cmd, cwd=workdir, check=True, capture_output=True, timeout=600)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            log.warning("  ⚠ pre-install step failed (non-fatal): %s", cmd[0])
+
+
 def prepare_workdir(target: Target) -> Path:
     """Clone the target repo, return the workdir.
 
@@ -5529,6 +5557,9 @@ def prepare_workdir(target: Target) -> Path:
         ["git", "config", "user.name", BOT_GIT_NAME],
         cwd=workdir, check=True,
     )
+    # Install the target's deps (from the pristine clone) so the agent can run
+    # its tests. Gated to CI / opt-in; see _preinstall_target_deps.
+    _preinstall_target_deps(workdir)
     return workdir
 
 
