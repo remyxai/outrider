@@ -9572,6 +9572,59 @@ def validate_changes(workdir: Path, target: Target, package: str) -> tuple[bool,
     return (not violations, violations)
 
 
+# ── Risky-surface signal (route-to-human, not block) ───────────────────────
+#
+# Indirect prompt injection (arXiv:2607.20759) most reliably abuses a small set
+# of file roles: dependency installs/manifests (96.6% attack success in the
+# paper), CI config, git hooks, and container/shell scripts. Rather than block
+# these (the ALWAYS_BLOCKED rationale above rejects per-fork blocking as
+# low-value whack-a-mole that also false-negatives legitimate changes), a diff
+# that touches them is FLAGGED: the PR is forced to draft, labelled, and the
+# files are listed in the PR body so a human confirms each change is intended.
+# Human review stays the control; this only aims their attention.
+RISKY_SURFACE_GLOBS = [
+    # dependency manifests / lockfiles
+    "**/requirements*.txt", "**/pyproject.toml", "**/setup.py", "**/setup.cfg",
+    "**/Pipfile", "**/Pipfile.lock", "**/poetry.lock", "**/uv.lock",
+    "**/environment.yml", "**/environment.yaml", "**/MANIFEST.in",
+    "**/package.json", "**/package-lock.json", "**/yarn.lock", "**/pnpm-lock.yaml",
+    "**/Cargo.toml", "**/Cargo.lock", "**/go.mod", "**/go.sum",
+    "**/Gemfile", "**/Gemfile.lock",
+    # CI / pipelines
+    ".github/workflows/**", ".github/actions/**", ".gitlab-ci.yml",
+    "azure-pipelines.yml", ".circleci/**", "**/Jenkinsfile",
+    # hooks / pre-commit
+    ".pre-commit-config.yaml", ".husky/**",
+    # container / build / shell
+    "**/Dockerfile", "**/*.dockerfile", "**/docker-compose*.yml",
+    "**/docker-compose*.yaml", "**/Makefile", "**/*.sh",
+]
+
+
+def risky_surface_files(workdir: Path) -> list[str]:
+    """Changed files whose role makes them a prompt-injection lever.
+
+    Pure detector over the same ``changed_files`` list the allowlist gate uses.
+    Returns matching paths (possibly empty); callers flag, never block.
+    """
+    return [p for p in changed_files(workdir) if path_matches_glob(p, RISKY_SURFACE_GLOBS)]
+
+
+def _render_risky_surface_note(files: list[str]) -> str:
+    """PR-body section flagging risky-surface changes for human review."""
+    items = "\n".join(f"- `{f}`" for f in sorted(files))
+    return (
+        "\n\n---\n\n"
+        "### ⚠️ Risky-surface changes — review before landing\n\n"
+        "This PR touches files whose role makes them the usual target of "
+        "prompt-injection attacks (dependency manifests, CI, git hooks, "
+        "container/shell scripts). Outrider does **not** block these — human "
+        "review is the control — but flags them so you can confirm each change "
+        "is intended and not directed by text in an issue/PR the agent read:\n\n"
+        f"{items}\n"
+    )
+
+
 # ─── Integration / stub-density / test-integration validators ──────────────
 #
 # These run AFTER the path-allowlist check passes. They enforce the
@@ -10061,6 +10114,18 @@ def open_pr(
         "draft": draft,
     })
     return pr["html_url"], pr["number"]
+
+
+def _best_effort_add_label(target: Target, number: int, label: str) -> None:
+    """Add a label to an issue/PR, swallowing failures (missing label, perms).
+
+    The label is a triage aid, not a gate — a 403/422 must never fail the run.
+    """
+    try:
+        gh_api("POST", f"/repos/{target.repo}/issues/{number}/labels",
+               {"labels": [label]})
+    except Exception as e:  # noqa: BLE001 — best-effort; never fatal
+        log.warning("  ⚠ could not add label %r to #%s: %s", label, number, e)
 
 
 def open_issue(
@@ -10983,6 +11048,18 @@ def run_brief_mode(target: Target) -> dict:
             result["path_violations"] = violations[:20]
             return result
 
+        # Risky-surface signal (route-to-human, not block) — same detector
+        # the paper-anchored path uses. The brief / lead-content path is the
+        # injection-relevant one, so flagging risky diffs matters most here.
+        risky_surface = risky_surface_files(workdir)
+        result["risky_surface"] = risky_surface
+        if risky_surface:
+            log.warning(
+                "  ⚠ diff touches %d risky-surface file(s) — flagged for "
+                "human review: %s",
+                len(risky_surface), ", ".join(sorted(risky_surface)),
+            )
+
         # Branch name: prefer the agent-written PR_TITLE.txt (already
         # handled by format_pr_title with a workdir arg), fall back to
         # a slug of the brief-derived title.
@@ -11066,11 +11143,16 @@ def run_brief_mode(target: Target) -> dict:
         pr_body = build_pr_body(
             target, rec, tests_status="unvalidated", test_output="",
         )
-        draft = target.draft_mode != "never"
+        if result.get("risky_surface"):
+            pr_body += _render_risky_surface_note(result["risky_surface"])
+        # Risky-surface touch forces draft even under draft_mode=never.
+        draft = target.draft_mode != "never" or bool(result.get("risky_surface"))
         pr_url, pr_number = open_pr(
             target, branch, pr_title, pr_body, draft,
             base=default_branch,
         )
+        if result.get("risky_surface"):
+            _best_effort_add_label(target, pr_number, "risky-surface")
         log.info(f"  ✓ opened brief-mode PR: {pr_url}")
         result["status"] = "pr_opened_brief"
         result["pr_url"] = pr_url
@@ -12059,6 +12141,19 @@ def process_target(target: Target) -> dict:
         result["diff_risk_score"] = risk.score
         result["diff_risk_band"] = risk.band
         result["diff_risk_factors"] = risk.factors
+
+        # Risky-surface signal: flag (never block) diffs touching the file roles
+        # prompt injection most abuses. Recorded here for telemetry; consumed at
+        # §10 (force draft) and §11 (PR-body note + label).
+        risky_surface = risky_surface_files(workdir)
+        result["risky_surface"] = risky_surface
+        if risky_surface:
+            log.warning(
+                "  ⚠ diff touches %d risky-surface file(s) — PR will be flagged "
+                "for human review: %s",
+                len(risky_surface), ", ".join(sorted(risky_surface)),
+            )
+
         if risk.band == "high":
             log.warning(f"  ✗ diff risk {risk.score:.2f} ≥ "
                         f"{DIFF_RISK_ISSUE_THRESHOLD:.2f} (high); → Issue")
@@ -12200,8 +12295,10 @@ def process_target(target: Target) -> dict:
 
         # RADAR risk-aware safety: an "elevated"-band diff stays a draft even
         # when tests pass, so a human reviews before it lands. Low-risk diffs
-        # are unaffected; "high" already routed to an Issue above.
-        if result.get("diff_risk_band") == "elevated":
+        # are unaffected; "high" already routed to an Issue above. A risky-surface
+        # touch also forces draft, independent of the numeric band, so it holds
+        # even under draft_mode=never/on_test_failure.
+        if result.get("diff_risk_band") == "elevated" or result.get("risky_surface"):
             draft = True
 
         # 11. Commit + push + PR
@@ -12214,6 +12311,8 @@ def process_target(target: Target) -> dict:
                 result.get("test_integration_gate") == "soft_failed"
             ),
         )
+        if result.get("risky_surface"):
+            pr_body += _render_risky_surface_note(result["risky_surface"])
 
         # Canary check — see brief-mode path (run_brief_mode) for the
         # full design rationale. Must run BEFORE commit_and_push (which
@@ -12447,6 +12546,8 @@ def process_target(target: Target) -> dict:
         result["status"] = "pr_opened_draft" if draft else "pr_opened"
         result["pr_url"] = pr_url
         result["pr_number"] = pr_number
+        if result.get("risky_surface"):
+            _best_effort_add_label(target, pr_number, "risky-surface")
         log.info(f"  ✓ {result['status']}: {pr_url}")
         return result
 
@@ -18181,6 +18282,9 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "diff_risk_band": result.get("diff_risk_band"),
         "diff_risk_score": result.get("diff_risk_score"),
         "diff_risk_factors": result.get("diff_risk_factors"),
+        "risky_surface": _compact_string_list_for_telemetry(
+            result.get("risky_surface")
+        ),
         "coverage_summary": (
             (result.get("coverage_summary") or "")[:2048] or None
         ),
