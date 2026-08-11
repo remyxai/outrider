@@ -5486,6 +5486,14 @@ def prepare_workdir(target: Target) -> Path:
         ["git", "clone", "--depth", "20", repo_url, str(workdir)],
         check=True, env=clone_env,
     )
+    # Cloning a token-bearing URL persists the token in .git/config, readable by
+    # anything running in the workdir. Rewrite origin token-less; the push
+    # re-authenticates ephemerally (see commit_and_push).
+    subprocess.run(
+        ["git", "remote", "set-url", "origin",
+         f"https://github.com/{target.repo}.git"],
+        cwd=workdir, check=True,
+    )
     # Refinement mode: when INPUT_START_FROM_REF names a branch /
     # tag / SHA on the fork, check that ref out on top of the default-branch
     # clone. Downstream: the sanity check in commit_and_push validates
@@ -7719,11 +7727,10 @@ _CLAUDE_ENV_WHITELIST: tuple[str, ...] = (
     "XDG_CACHE_HOME",
     "CI",
     "GITHUB_ACTIONS",
-    # Workflow built-in token — repo-scoped — for the agent's `gh`
-    # verification tooling. NOT the bot's installation token (that
-    # arrives via INPUT_GITHUB_TOKEN, which stays stripped). See the
-    # comment block above for the trade-off rationale.
-    "GITHUB_TOKEN",
+    # GITHUB_TOKEN is intentionally not exposed to the coding agent — a
+    # write-scoped token in the agent's context is an exfiltration risk. The
+    # orchestrator holds its own token separately (clone/push unaffected); the
+    # agent's `gh` reads use unauthenticated access (fine for public repos).
 )
 
 
@@ -10339,38 +10346,47 @@ def commit_and_push(
     else:
         log.info("  → no changes to commit (branch already clean); pushing as-is")
 
-    # Refresh origin's URL with a freshly-minted token before pushing.
-    # The URL baked into `origin` at clone time embeds the token (see
-    # prepare_workdir). Installation tokens have a 60-min TTL and long
-    # coding sessions (Kimi K3 thinking mode, GLM-5.2 reasoning) can
-    # extend the clone→push window past that. `_github_token()` re-mints
-    # on staleness (see `_BOT_TOKEN_MAX_AGE_S`) but the git remote URL
-    # stays frozen at clone time unless we explicitly rewrite it.
-    fresh_token = _github_token()
-    if fresh_token:
-        subprocess.run(
-            ["git", "remote", "set-url", "origin",
-             f"https://x-access-token:{fresh_token}@github.com/{repo}.git"],
-            cwd=workdir, check=True, capture_output=True,
+    # Scan the diff for credential shapes before pushing: the outbound-payload
+    # scrubber covers API bodies but not the git push channel, so a secret an
+    # agent wrote into a file would otherwise land on the branch. Fail closed.
+    pushed_diff = subprocess.run(
+        ["git", "diff", f"origin/{base_branch}..HEAD"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    ).stdout or subprocess.run(
+        ["git", "show", "--format=", "HEAD"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    ).stdout
+    secret_hits = _scan_for_secrets(pushed_diff)
+    if secret_hits:
+        raise RuntimeError(
+            f"Pre-push credential scan matched {secret_hits} in the diff — "
+            "refusing to push (possible credential exfiltration into a "
+            "committed file). No branch pushed."
         )
 
-    # Delete any orphan branch with the same name from the remote before
-    # pushing. Two reasons:
-    #   1. The existing-PR dedup gate already skipped if an OPEN PR for
-    #      this branch exists. By the time we get here, any remote branch
-    #      with the same name is from a CLOSED PR and is safe to remove.
-    #   2. `--force` push from a shallow clone (we use --depth 20)
-    #      confuses GitHub's PR validator — it treats the pushed branch
-    #      as rooted ("no history in common with main") and refuses PR
-    #      creation. Delete-then-plain-push avoids the force entirely.
-    # `check=False` because a non-existent branch is the common case and
-    # the delete is a no-op there.
+    # Authenticate the push via a one-shot URL argument instead of persisting
+    # the token in origin's config (`set-url`), so it never lands in .git/config
+    # where a later agent pass could read it. `_github_token()` re-mints on
+    # staleness — long coding sessions can outlast the token's TTL.
+    fresh_token = _github_token()
+    push_target = (
+        f"https://x-access-token:{fresh_token}@github.com/{repo}.git"
+        if fresh_token else "origin"
+    )
+
+    # Delete any orphan branch (a CLOSED-PR leftover; the OPEN-PR dedup gate
+    # already skipped). Delete-then-plain-push also avoids a shallow-clone
+    # --force that confuses GitHub's PR validator. check=False: non-existent
+    # branch is the no-op case.
     subprocess.run(
-        ["git", "push", "origin", "--delete", branch],
+        ["git", "push", push_target, "--delete", branch],
         cwd=workdir, check=False, capture_output=True,
     )
+    # No `-u`: setting upstream to a URL would re-persist the token into branch
+    # config. Push the ref explicitly; the API re-author below works via the
+    # REST API, not local upstream tracking.
     subprocess.run(
-        ["git", "push", "-u", "origin", branch],
+        ["git", "push", push_target, f"HEAD:refs/heads/{branch}"],
         cwd=workdir, check=True,
     )
 
