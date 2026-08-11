@@ -7743,6 +7743,49 @@ def _claude_subprocess_env() -> dict[str, str]:
     return env
 
 
+# Injection-hardening Bash gate for the SPAWNED agent. NOTE: the repo's own
+# .claude/hooks/pre-bash-gate.sh does NOT reach this agent (it governs only
+# Claude Code sessions working on this repo). The agent runs with cwd set to the
+# target checkout, so its hooks must be delivered explicitly via `--settings`.
+_AGENT_BASH_GATE = Path(__file__).with_name("agent_bash_gate.sh")
+
+
+def _agent_hardening_settings_arg() -> list[str]:
+    """`--settings` arg loading the injection-hardening PreToolUse Bash gate.
+
+    The gate (``agent_bash_gate.sh``) strips high-leverage Bash capabilities
+    (package installs, network egress, ``gh`` writes, ``git push``) so an agent
+    that *complies* with an instruction injected via untrusted issue/PR text
+    still can't reach them — the paper (arXiv:2607.20759) shows detecting the
+    intent doesn't work, so we remove the reach instead. PreToolUse hooks fire
+    in headless ``-p`` mode even under ``--dangerously-skip-permissions``
+    (verified).
+
+    Returns ``[]`` (with a loud error log) if the hook file is missing, so a
+    packaging error degrades to the prior open behavior rather than crashing
+    every dispatch. The hook shipping is a repo invariant, so this should never
+    fire in practice.
+    """
+    if not _AGENT_BASH_GATE.exists():
+        log.error(
+            "agent_bash_gate.sh missing at %s — coding session runs WITHOUT the "
+            "injection-hardening Bash gate.",
+            _AGENT_BASH_GATE,
+        )
+        return []
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": str(_AGENT_BASH_GATE)}],
+                }
+            ]
+        }
+    }
+    return ["--settings", json.dumps(settings)]
+
+
 def _format_agent_cli_failure(
     tool: str, returncode: int, stdout: str, stderr: str
 ) -> str:
@@ -8069,7 +8112,7 @@ def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, st
         (workdir / BUNDLE_DIR_NAME / "RESEARCH_INVOCATION.md").read_text()
     )
     log.info(f"  → invoking research phase (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     # Cap turns via the same knob the coding invocation honors, but with a
     # tighter default for the research phase (8 turns per the prompt's
     # bounded-budget instruction).
@@ -8106,7 +8149,7 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
         (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
     )
     log.info(f"  → invoking Claude Code (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
     if max_turns:
         cmd += ["--max-turns", max_turns]
@@ -8139,7 +8182,7 @@ def _run_claude_oneshot(
     `max_turns` caps tool-use rounds for agentic flows (selection now uses
     this to bound spend). None = no cap (matches prior behavior).
     """
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     return _run_claude_json(cmd, prompt, workdir, timeout_s)
@@ -8156,7 +8199,7 @@ def _run_claude_oneshot_streaming(
     selection pass uses this; the other one-shot callers (pre-flight,
     self-review, audit) stay on the cheaper single-envelope runner.
     """
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     return _run_claude_stream(cmd, prompt, workdir, timeout_s)
