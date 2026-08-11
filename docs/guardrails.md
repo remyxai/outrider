@@ -21,13 +21,15 @@ What Claude Code can and can't modify when Outrider drafts a PR.
 Extend the allowlist for your repo via the `guardrails-allowlist` input.
 
 
-## Always blocked (by role, not directory)
+## Always blocked
 
-- `.github/**` — CI / workflow config
-- `*Dockerfile`, `*Dockerfile.*`, `*.dockerfile`, `*.sh` — container builds and shell scripts
-- `*requirements*.txt`, `setup.py`, `setup.cfg`, `pyproject.toml`, `MANIFEST.in`, `*.lock` — dependency / build manifests
+- `.github/workflows/**` — an agent editing its own workflow file is the one change that compounds silently across future runs (expanding `permissions:`, swapping the interest-id, adding an exfil step), so it is the single hard block.
 
-The block list takes precedence over the allowlist. Non-`.py` config not on the block list (e.g. `pipelines/*.yaml`) simply isn't allowed either.
+That is the **entire** always-blocked list. Dockerfiles, `*.sh`, dependency/build manifests, and lockfiles are **not** blocked — they surface in the normal PR diff for human review. Per-fork blocking of these was found to add no safety over review while producing false-negatives on legitimate changes (task YAML, adapter JSON, `.gitignore`, `uv.lock` regeneration). Teams that want stricter blocking add globs via the `guardrails-blocklist` input; blocklist matches take precedence over the allowlist.
+
+## Risky-surface signal (route-to-human, not block)
+
+Indirect prompt injection (arXiv:2607.20759) most reliably abuses a small set of file roles — dependency manifests/installs, CI, git hooks, and container/shell scripts. A diff that touches any of those is **flagged**, not blocked: the PR is forced to draft, labelled `risky-surface`, and gets a "review before landing" section in its body listing the files. This directs a reviewer's attention without rejecting legitimate changes — a new method that genuinely needs a dependency still opens as a draft PR, just flagged. The matched roles are `RISKY_SURFACE_GLOBS` in `src/run.py`.
 
 
 ## Integration checks (enforced after the Claude session)

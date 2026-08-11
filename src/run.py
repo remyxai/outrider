@@ -5450,6 +5450,34 @@ def open_remyx_artifact_exists(target: Target) -> bool:
 # ─── Workdir + spec bundle ─────────────────────────────────────────────────
 
 
+def _preinstall_target_deps(workdir: Path) -> None:
+    """Best-effort install of the target's declared deps, from the pristine
+    clone, before the agent runs — so it can run the repo's tests to verify its
+    work (which it otherwise can't remedy mid-session, installs being denied).
+    Installs from the committed manifest, which an issue-body attacker can't have
+    touched. Gated to CI / explicit opt-in so it can't clobber a shared local
+    env. Never fatal.
+    """
+    if not (os.environ.get("INPUT_PREINSTALL") or os.environ.get("GITHUB_ACTIONS")):
+        return
+    cmds: list[list[str]] = []
+    if (workdir / "uv.lock").exists() and shutil.which("uv"):
+        cmds.append(["uv", "sync", "--frozen"])
+    elif (workdir / "poetry.lock").exists() and shutil.which("poetry"):
+        cmds.append(["poetry", "install", "--no-interaction", "--no-root"])
+    elif (workdir / "pyproject.toml").exists() or (workdir / "setup.py").exists():
+        cmds.append([sys.executable, "-m", "pip", "install", "-e", "."])
+    for req in ("requirements.txt", "requirements-dev.txt"):
+        if (workdir / req).exists():
+            cmds.append([sys.executable, "-m", "pip", "install", "-r", req])
+    for cmd in cmds:
+        try:
+            log.info("  → pre-installing target deps: %s", " ".join(cmd))
+            subprocess.run(cmd, cwd=workdir, check=True, capture_output=True, timeout=600)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            log.warning("  ⚠ pre-install step failed (non-fatal): %s", cmd[0])
+
+
 def prepare_workdir(target: Target) -> Path:
     """Clone the target repo, return the workdir.
 
@@ -5486,6 +5514,14 @@ def prepare_workdir(target: Target) -> Path:
         ["git", "clone", "--depth", "20", repo_url, str(workdir)],
         check=True, env=clone_env,
     )
+    # Cloning a token-bearing URL persists the token in .git/config, readable by
+    # anything running in the workdir. Rewrite origin token-less; the push
+    # re-authenticates ephemerally (see commit_and_push).
+    subprocess.run(
+        ["git", "remote", "set-url", "origin",
+         f"https://github.com/{target.repo}.git"],
+        cwd=workdir, check=True,
+    )
     # Refinement mode: when INPUT_START_FROM_REF names a branch /
     # tag / SHA on the fork, check that ref out on top of the default-branch
     # clone. Downstream: the sanity check in commit_and_push validates
@@ -5521,6 +5557,9 @@ def prepare_workdir(target: Target) -> Path:
         ["git", "config", "user.name", BOT_GIT_NAME],
         cwd=workdir, check=True,
     )
+    # Install the target's deps (from the pristine clone) so the agent can run
+    # its tests. Gated to CI / opt-in; see _preinstall_target_deps.
+    _preinstall_target_deps(workdir)
     return workdir
 
 
@@ -7719,11 +7758,10 @@ _CLAUDE_ENV_WHITELIST: tuple[str, ...] = (
     "XDG_CACHE_HOME",
     "CI",
     "GITHUB_ACTIONS",
-    # Workflow built-in token — repo-scoped — for the agent's `gh`
-    # verification tooling. NOT the bot's installation token (that
-    # arrives via INPUT_GITHUB_TOKEN, which stays stripped). See the
-    # comment block above for the trade-off rationale.
-    "GITHUB_TOKEN",
+    # GITHUB_TOKEN is intentionally not exposed to the coding agent — a
+    # write-scoped token in the agent's context is an exfiltration risk. The
+    # orchestrator holds its own token separately (clone/push unaffected); the
+    # agent's `gh` reads use unauthenticated access (fine for public repos).
 )
 
 
@@ -7741,6 +7779,49 @@ def _claude_subprocess_env() -> dict[str, str]:
         if v is not None:
             env[name] = v
     return env
+
+
+# Injection-hardening Bash gate for the SPAWNED agent. NOTE: the repo's own
+# .claude/hooks/pre-bash-gate.sh does NOT reach this agent (it governs only
+# Claude Code sessions working on this repo). The agent runs with cwd set to the
+# target checkout, so its hooks must be delivered explicitly via `--settings`.
+_AGENT_BASH_GATE = Path(__file__).with_name("agent_bash_gate.sh")
+
+
+def _agent_hardening_settings_arg() -> list[str]:
+    """`--settings` arg loading the injection-hardening PreToolUse Bash gate.
+
+    The gate (``agent_bash_gate.sh``) strips high-leverage Bash capabilities
+    (package installs, network egress, ``gh`` writes, ``git push``) so an agent
+    that *complies* with an instruction injected via untrusted issue/PR text
+    still can't reach them — the paper (arXiv:2607.20759) shows detecting the
+    intent doesn't work, so we remove the reach instead. PreToolUse hooks fire
+    in headless ``-p`` mode even under ``--dangerously-skip-permissions``
+    (verified).
+
+    Returns ``[]`` (with a loud error log) if the hook file is missing, so a
+    packaging error degrades to the prior open behavior rather than crashing
+    every dispatch. The hook shipping is a repo invariant, so this should never
+    fire in practice.
+    """
+    if not _AGENT_BASH_GATE.exists():
+        log.error(
+            "agent_bash_gate.sh missing at %s — coding session runs WITHOUT the "
+            "injection-hardening Bash gate.",
+            _AGENT_BASH_GATE,
+        )
+        return []
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": str(_AGENT_BASH_GATE)}],
+                }
+            ]
+        }
+    }
+    return ["--settings", json.dumps(settings)]
 
 
 def _format_agent_cli_failure(
@@ -8069,7 +8150,7 @@ def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, st
         (workdir / BUNDLE_DIR_NAME / "RESEARCH_INVOCATION.md").read_text()
     )
     log.info(f"  → invoking research phase (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     # Cap turns via the same knob the coding invocation honors, but with a
     # tighter default for the research phase (8 turns per the prompt's
     # bounded-budget instruction).
@@ -8106,7 +8187,7 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
         (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
     )
     log.info(f"  → invoking Claude Code (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
     if max_turns:
         cmd += ["--max-turns", max_turns]
@@ -8139,7 +8220,7 @@ def _run_claude_oneshot(
     `max_turns` caps tool-use rounds for agentic flows (selection now uses
     this to bound spend). None = no cap (matches prior behavior).
     """
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     return _run_claude_json(cmd, prompt, workdir, timeout_s)
@@ -8156,7 +8237,7 @@ def _run_claude_oneshot_streaming(
     selection pass uses this; the other one-shot callers (pre-flight,
     self-review, audit) stay on the cheaper single-envelope runner.
     """
-    cmd = ["claude", "--dangerously-skip-permissions"]
+    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     return _run_claude_stream(cmd, prompt, workdir, timeout_s)
@@ -9529,6 +9610,59 @@ def validate_changes(workdir: Path, target: Target, package: str) -> tuple[bool,
     return (not violations, violations)
 
 
+# ── Risky-surface signal (route-to-human, not block) ───────────────────────
+#
+# Indirect prompt injection (arXiv:2607.20759) most reliably abuses a small set
+# of file roles: dependency installs/manifests (96.6% attack success in the
+# paper), CI config, git hooks, and container/shell scripts. Rather than block
+# these (the ALWAYS_BLOCKED rationale above rejects per-fork blocking as
+# low-value whack-a-mole that also false-negatives legitimate changes), a diff
+# that touches them is FLAGGED: the PR is forced to draft, labelled, and the
+# files are listed in the PR body so a human confirms each change is intended.
+# Human review stays the control; this only aims their attention.
+RISKY_SURFACE_GLOBS = [
+    # dependency manifests / lockfiles
+    "**/requirements*.txt", "**/pyproject.toml", "**/setup.py", "**/setup.cfg",
+    "**/Pipfile", "**/Pipfile.lock", "**/poetry.lock", "**/uv.lock",
+    "**/environment.yml", "**/environment.yaml", "**/MANIFEST.in",
+    "**/package.json", "**/package-lock.json", "**/yarn.lock", "**/pnpm-lock.yaml",
+    "**/Cargo.toml", "**/Cargo.lock", "**/go.mod", "**/go.sum",
+    "**/Gemfile", "**/Gemfile.lock",
+    # CI / pipelines
+    ".github/workflows/**", ".github/actions/**", ".gitlab-ci.yml",
+    "azure-pipelines.yml", ".circleci/**", "**/Jenkinsfile",
+    # hooks / pre-commit
+    ".pre-commit-config.yaml", ".husky/**",
+    # container / build / shell
+    "**/Dockerfile", "**/*.dockerfile", "**/docker-compose*.yml",
+    "**/docker-compose*.yaml", "**/Makefile", "**/*.sh",
+]
+
+
+def risky_surface_files(workdir: Path) -> list[str]:
+    """Changed files whose role makes them a prompt-injection lever.
+
+    Pure detector over the same ``changed_files`` list the allowlist gate uses.
+    Returns matching paths (possibly empty); callers flag, never block.
+    """
+    return [p for p in changed_files(workdir) if path_matches_glob(p, RISKY_SURFACE_GLOBS)]
+
+
+def _render_risky_surface_note(files: list[str]) -> str:
+    """PR-body section flagging risky-surface changes for human review."""
+    items = "\n".join(f"- `{f}`" for f in sorted(files))
+    return (
+        "\n\n---\n\n"
+        "### ⚠️ Risky-surface changes — review before landing\n\n"
+        "This PR touches files whose role makes them the usual target of "
+        "prompt-injection attacks (dependency manifests, CI, git hooks, "
+        "container/shell scripts). Outrider does **not** block these — human "
+        "review is the control — but flags them so you can confirm each change "
+        "is intended and not directed by text in an issue/PR the agent read:\n\n"
+        f"{items}\n"
+    )
+
+
 # ─── Integration / stub-density / test-integration validators ──────────────
 #
 # These run AFTER the path-allowlist check passes. They enforce the
@@ -10020,6 +10154,18 @@ def open_pr(
     return pr["html_url"], pr["number"]
 
 
+def _best_effort_add_label(target: Target, number: int, label: str) -> None:
+    """Add a label to an issue/PR, swallowing failures (missing label, perms).
+
+    The label is a triage aid, not a gate — a 403/422 must never fail the run.
+    """
+    try:
+        gh_api("POST", f"/repos/{target.repo}/issues/{number}/labels",
+               {"labels": [label]})
+    except Exception as e:  # noqa: BLE001 — best-effort; never fatal
+        log.warning("  ⚠ could not add label %r to #%s: %s", label, number, e)
+
+
 def open_issue(
     target: Target, title: str, body: str, *, footer_override: str = "",
 ) -> tuple[str, int]:
@@ -10231,38 +10377,47 @@ def commit_and_push(
     else:
         log.info("  → no changes to commit (branch already clean); pushing as-is")
 
-    # Refresh origin's URL with a freshly-minted token before pushing.
-    # The URL baked into `origin` at clone time embeds the token (see
-    # prepare_workdir). Installation tokens have a 60-min TTL and long
-    # coding sessions (Kimi K3 thinking mode, GLM-5.2 reasoning) can
-    # extend the clone→push window past that. `_github_token()` re-mints
-    # on staleness (see `_BOT_TOKEN_MAX_AGE_S`) but the git remote URL
-    # stays frozen at clone time unless we explicitly rewrite it.
-    fresh_token = _github_token()
-    if fresh_token:
-        subprocess.run(
-            ["git", "remote", "set-url", "origin",
-             f"https://x-access-token:{fresh_token}@github.com/{repo}.git"],
-            cwd=workdir, check=True, capture_output=True,
+    # Scan the diff for credential shapes before pushing: the outbound-payload
+    # scrubber covers API bodies but not the git push channel, so a secret an
+    # agent wrote into a file would otherwise land on the branch. Fail closed.
+    pushed_diff = subprocess.run(
+        ["git", "diff", f"origin/{base_branch}..HEAD"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    ).stdout or subprocess.run(
+        ["git", "show", "--format=", "HEAD"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    ).stdout
+    secret_hits = _scan_for_secrets(pushed_diff)
+    if secret_hits:
+        raise RuntimeError(
+            f"Pre-push credential scan matched {secret_hits} in the diff — "
+            "refusing to push (possible credential exfiltration into a "
+            "committed file). No branch pushed."
         )
 
-    # Delete any orphan branch with the same name from the remote before
-    # pushing. Two reasons:
-    #   1. The existing-PR dedup gate already skipped if an OPEN PR for
-    #      this branch exists. By the time we get here, any remote branch
-    #      with the same name is from a CLOSED PR and is safe to remove.
-    #   2. `--force` push from a shallow clone (we use --depth 20)
-    #      confuses GitHub's PR validator — it treats the pushed branch
-    #      as rooted ("no history in common with main") and refuses PR
-    #      creation. Delete-then-plain-push avoids the force entirely.
-    # `check=False` because a non-existent branch is the common case and
-    # the delete is a no-op there.
+    # Authenticate the push via a one-shot URL argument instead of persisting
+    # the token in origin's config (`set-url`), so it never lands in .git/config
+    # where a later agent pass could read it. `_github_token()` re-mints on
+    # staleness — long coding sessions can outlast the token's TTL.
+    fresh_token = _github_token()
+    push_target = (
+        f"https://x-access-token:{fresh_token}@github.com/{repo}.git"
+        if fresh_token else "origin"
+    )
+
+    # Delete any orphan branch (a CLOSED-PR leftover; the OPEN-PR dedup gate
+    # already skipped). Delete-then-plain-push also avoids a shallow-clone
+    # --force that confuses GitHub's PR validator. check=False: non-existent
+    # branch is the no-op case.
     subprocess.run(
-        ["git", "push", "origin", "--delete", branch],
+        ["git", "push", push_target, "--delete", branch],
         cwd=workdir, check=False, capture_output=True,
     )
+    # No `-u`: setting upstream to a URL would re-persist the token into branch
+    # config. Push the ref explicitly; the API re-author below works via the
+    # REST API, not local upstream tracking.
     subprocess.run(
-        ["git", "push", "-u", "origin", branch],
+        ["git", "push", push_target, f"HEAD:refs/heads/{branch}"],
         cwd=workdir, check=True,
     )
 
@@ -10940,6 +11095,18 @@ def run_brief_mode(target: Target) -> dict:
             result["path_violations"] = violations[:20]
             return result
 
+        # Risky-surface signal (route-to-human, not block) — same detector
+        # the paper-anchored path uses. The brief / lead-content path is the
+        # injection-relevant one, so flagging risky diffs matters most here.
+        risky_surface = risky_surface_files(workdir)
+        result["risky_surface"] = risky_surface
+        if risky_surface:
+            log.warning(
+                "  ⚠ diff touches %d risky-surface file(s) — flagged for "
+                "human review: %s",
+                len(risky_surface), ", ".join(sorted(risky_surface)),
+            )
+
         # Branch name: prefer the agent-written PR_TITLE.txt (already
         # handled by format_pr_title with a workdir arg), fall back to
         # a slug of the brief-derived title.
@@ -11023,11 +11190,16 @@ def run_brief_mode(target: Target) -> dict:
         pr_body = build_pr_body(
             target, rec, tests_status="unvalidated", test_output="",
         )
-        draft = target.draft_mode != "never"
+        if result.get("risky_surface"):
+            pr_body += _render_risky_surface_note(result["risky_surface"])
+        # Risky-surface touch forces draft even under draft_mode=never.
+        draft = target.draft_mode != "never" or bool(result.get("risky_surface"))
         pr_url, pr_number = open_pr(
             target, branch, pr_title, pr_body, draft,
             base=default_branch,
         )
+        if result.get("risky_surface"):
+            _best_effort_add_label(target, pr_number, "risky-surface")
         log.info(f"  ✓ opened brief-mode PR: {pr_url}")
         result["status"] = "pr_opened_brief"
         result["pr_url"] = pr_url
@@ -12016,6 +12188,19 @@ def process_target(target: Target) -> dict:
         result["diff_risk_score"] = risk.score
         result["diff_risk_band"] = risk.band
         result["diff_risk_factors"] = risk.factors
+
+        # Risky-surface signal: flag (never block) diffs touching the file roles
+        # prompt injection most abuses. Recorded here for telemetry; consumed at
+        # §10 (force draft) and §11 (PR-body note + label).
+        risky_surface = risky_surface_files(workdir)
+        result["risky_surface"] = risky_surface
+        if risky_surface:
+            log.warning(
+                "  ⚠ diff touches %d risky-surface file(s) — PR will be flagged "
+                "for human review: %s",
+                len(risky_surface), ", ".join(sorted(risky_surface)),
+            )
+
         if risk.band == "high":
             log.warning(f"  ✗ diff risk {risk.score:.2f} ≥ "
                         f"{DIFF_RISK_ISSUE_THRESHOLD:.2f} (high); → Issue")
@@ -12157,8 +12342,10 @@ def process_target(target: Target) -> dict:
 
         # RADAR risk-aware safety: an "elevated"-band diff stays a draft even
         # when tests pass, so a human reviews before it lands. Low-risk diffs
-        # are unaffected; "high" already routed to an Issue above.
-        if result.get("diff_risk_band") == "elevated":
+        # are unaffected; "high" already routed to an Issue above. A risky-surface
+        # touch also forces draft, independent of the numeric band, so it holds
+        # even under draft_mode=never/on_test_failure.
+        if result.get("diff_risk_band") == "elevated" or result.get("risky_surface"):
             draft = True
 
         # 11. Commit + push + PR
@@ -12171,6 +12358,8 @@ def process_target(target: Target) -> dict:
                 result.get("test_integration_gate") == "soft_failed"
             ),
         )
+        if result.get("risky_surface"):
+            pr_body += _render_risky_surface_note(result["risky_surface"])
 
         # Canary check — see brief-mode path (run_brief_mode) for the
         # full design rationale. Must run BEFORE commit_and_push (which
@@ -12404,6 +12593,8 @@ def process_target(target: Target) -> dict:
         result["status"] = "pr_opened_draft" if draft else "pr_opened"
         result["pr_url"] = pr_url
         result["pr_number"] = pr_number
+        if result.get("risky_surface"):
+            _best_effort_add_label(target, pr_number, "risky-surface")
         log.info(f"  ✓ {result['status']}: {pr_url}")
         return result
 
@@ -18138,6 +18329,9 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "diff_risk_band": result.get("diff_risk_band"),
         "diff_risk_score": result.get("diff_risk_score"),
         "diff_risk_factors": result.get("diff_risk_factors"),
+        "risky_surface": _compact_string_list_for_telemetry(
+            result.get("risky_surface")
+        ),
         "coverage_summary": (
             (result.get("coverage_summary") or "")[:2048] or None
         ),
