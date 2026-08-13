@@ -17,7 +17,7 @@ defeat all of them to cause harm. The durable controls sit **outside** the model
 influence (deterministic code, stripped env, path enforcement); the model-facing layers
 (input wrapping, canary) are treated as *signals*, never guarantees.
 
-![Outrider agent-harness defense-in-depth](security/figures/defense-in-depth.png)
+![Outrider agent-harness defense-in-depth](https://github.com/user-attachments/assets/180c6573-ad42-4502-b474-df79e7515034)
 
 ## The layers
 
