@@ -49,7 +49,20 @@ on:
         default: ''
 
 concurrency:
-  group: outrider
+  # Keyed by what THIS dispatch works on, not a flat "outrider". GitHub allows
+  # exactly one *pending* run per group, and when a third arrives it cancels the
+  # one already waiting — not the newcomer — with no error and no annotation. So
+  # a batch of dispatches at one repo silently lost work: four targets produced
+  # one run, one survivor, and two cancellations that read as CI flakes.
+  #
+  # Per-target keys let distinct papers/branches run in parallel (they touch
+  # different branches), while a genuine duplicate of the same target still
+  # queues behind its predecessor. Unpinned runs fall back to run_id: never
+  # cancel a dispatch we can't prove is a duplicate.
+  #
+  # Index syntax, not dot: a bad workflow-level expression invalidates the whole
+  # workflow, and hyphenated property names are only documented as safe indexed.
+  group: outrider-${{ inputs['pin-arxiv'] || inputs['start-from-ref'] || github.run_id }}
   cancel-in-progress: false
 
 jobs:
