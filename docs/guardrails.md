@@ -12,13 +12,17 @@ timestamp: 2026-06-30T03:57:23Z
 What Claude Code can and can't modify when Outrider drafts a PR.
 
 
-## Allowed paths (defaults)
+## Path policy (permissive by default)
 
-- `*.py` — any Python source, anywhere in the repo
-- `.remyx-recommendation/**` — the spec bundle (scrubbed before commit)
-- `**/*.md` — Markdown anywhere (README, CHANGELOG, docs/, ADR notes)
-
-Extend the allowlist for your repo via the `guardrails-allowlist` input.
+As of v1.7.24 the path **allowlist is permissive** (`**/*`): the agent may touch any path
+*except* the block list below. The narrow per-type allowlist earlier versions used
+(`*.py`, `**/*.md`, the spec bundle) was retired — it produced false-negatives on
+legitimate changes (task YAML, adapter JSON, `.gitignore`, `uv.lock` regeneration) while
+adding no safety over the downstream layers: risky-surface routing, the integration gate,
+self-review, and human review of every PR (see [Security](security.md) for the full
+defense-in-depth picture). The `guardrails-allowlist` input is therefore **deprecated and
+a no-op** (removal planned in v2); use `guardrails-blocklist` to add paths you want
+blocked.
 
 
 ## Always blocked
@@ -42,6 +46,6 @@ Historical note: a per-existing-file line-count cap was removed after observatio
 
 ## What enforcement looks like
 
-If Claude touches a path outside the allowlist, the run terminates with `rejected_path_violations` rather than opening a malformed PR. The validation runs after the Claude session and before any git push, so violations are caught locally — nothing reaches your repo.
+If Claude touches a blocked path (the hard block, or a `guardrails-blocklist` entry — matches take precedence over the permissive allowlist), the run terminates with `rejected_path_violations` rather than opening a malformed PR. The validation runs after the Claude session and before any git push, so violations are caught locally — nothing reaches your repo.
 
 The integration validator catches the "added code that nothing invokes" failure mode and downgrades to `issue_opened_no_integration`. That's the same signal as self-review's orphan check, but earlier in the pipeline.

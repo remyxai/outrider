@@ -113,6 +113,7 @@ Each PR below shows the **match** (paper → repo) and the **shape** (how the wi
 - **[Customization](docs/customization.md)** — tailor Outrider to your repo + signals it reads
 - **[Architecture](docs/architecture.md)** — selection taxonomy, pipeline, refinement chain
 - **[Guardrails](docs/guardrails.md)** — what the agent can and can't modify
+- **[Security](docs/security.md)** — the agent-harness defense-in-depth model (prompt-injection & credential-leak controls)
 - **[Model backends](docs/backends.md)** — full backend/auth matrix + per-dispatch switching template
 - **[Environments](docs/environments.md)** — describe workflow-attached tooling via `ENVIRONMENTS.md`
 - **[Weekly summary mode](docs/weekly-summary.md)** — opt-in rolling digest comments
