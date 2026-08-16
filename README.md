@@ -96,6 +96,12 @@ Three parameter-efficient fine-tuning methods surfaced from arXiv, drafted on th
 
 Full case study — per-method deep dives, PR-shape cohort comparison, coordination-issue-first workflow — at **[docs/case-studies/peft.md](docs/case-studies/peft.md)**.
 
+### Case study: a community pipeline for `huggingface/diffusers`
+
+**[huggingface/diffusers#14480](https://github.com/huggingface/diffusers/pull/14480)** (in review) adds **HRDiT** — training-free high-resolution generation (up to 4096²) for off-the-shelf **FLUX.1-dev**. Users get 4K straight from the base checkpoint — no fine-tuning, no new weights — instead of the generate-then-upscale or train-a-high-res-model workarounds.
+
+The port was staged to where complexity actually pays off: a minimal position-alignment port first, then NTK RoPE scaling and structure guidance layered onto only the stages that needed them — landing as a self-contained community pipeline with no core-library changes.
+
 ### More examples
 
 Each PR below shows the **match** (paper → repo) and the **shape** (how the wiring landed):
