@@ -96,12 +96,16 @@ Three parameter-efficient fine-tuning methods surfaced from arXiv, drafted on th
 
 Full case study — per-method deep dives, PR-shape cohort comparison, coordination-issue-first workflow — at **[docs/case-studies/peft.md](docs/case-studies/peft.md)**.
 
-### Case study: a community pipeline for `huggingface/diffusers`
+### Case study: two training-free high-resolution methods for `huggingface/diffusers`
 
-**[huggingface/diffusers#14480](https://github.com/huggingface/diffusers/pull/14480)** (in review) adds **HRDiT** — training-free high-resolution generation (up to 4096²) for off-the-shelf **FLUX.1-dev**. Users get 4K straight from the base checkpoint — no fine-tuning, no new weights — instead of the generate-then-upscale or train-a-high-res-model workarounds.
+Two complementary routes to 4K generation from off-the-shelf **FLUX** checkpoints — no fine-tuning, no new weights — surfaced from arXiv and shaped to diffusers' own conventions:
 
-The port began as a minimal position-alignment port first, then NTK RoPE scaling and structure guidance layered onto only the stages that needed them — landing as a self-contained community pipeline with no core-library changes.
+- **HRDiT** — **[huggingface/diffusers#14480](https://github.com/huggingface/diffusers/pull/14480)** (in review). NTK RoPE scaling + structure guidance for up to 4096², landed as a self-contained **community pipeline** with no core-library changes. Built minimal-first: a position-alignment port, then NTK scaling and structure guidance layered only onto the stages that needed them.
+- **DyPE (+ optional spectral attention)** — proposed via **[huggingface/diffusers#14520](https://github.com/huggingface/diffusers/issues/14520)**. A training-free positional-embedding **hook** (`apply_dype`) that reproduces the reference bit-for-bit (Δ=0) and adds an optional spectral-attention mode which cuts residual 4K speckle ~6× while keeping fine detail. Offload-robust, a no-op at/below the trained resolution.
 
+The pair puts the same problem — training-free high-res on a RoPE DiT — into two different diffusers shapes. Choosing *which* shape is itself the contribution: HRDiT self-contains as a community pipeline, while DyPE sits closer to the core hooks (`apply_faster_cache`, `apply_pyramid_attention_broadcast`). Because precedent points both ways for DyPE, that placement is raised with maintainers in #14520 rather than assumed.
+
+Full case study — per-method detail, the placement question, validation figures — at **[docs/case-studies/diffusers.md](docs/case-studies/diffusers.md)**.
 ### More examples
 
 Each PR below shows the **match** (paper → repo) and the **shape** (how the wiring landed):
