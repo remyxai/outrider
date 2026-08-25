@@ -1623,6 +1623,13 @@ FAILURE_EXIT_STATUSES = {
     "convention_failed_patch",
     "convention_failed_push",
     "test_failed_setup",
+    # Brief mode ("lead-content is the spec") and issue-convention mode set
+    # these as their `failure_status` when the runner throws — e.g. a rejected
+    # `git push`. Without them a real failure (agent produced nothing, or the
+    # push was rejected) exits 0 and the run looks green with no PR/branch,
+    # indistinguishable from a graceful "declined to publish". Fail visibly.
+    "brief_failed",
+    "issue_convention_failed_claude",
     # Outbound credential-scrubber abort. Not a graceful skip — the
     # operator needs to investigate the body-assembly path (whatever
     # upstream content produced credential-shaped text). Surfaces red
@@ -9610,6 +9617,33 @@ def validate_changes(workdir: Path, target: Target, package: str) -> tuple[bool,
     return (not violations, violations)
 
 
+def _strip_blocked_paths(workdir: Path, blocklist: list[str]) -> list[str]:
+    """Discard changes to ``blocklist`` paths from the working tree.
+
+    The branch push is authenticated with a token that has no ``workflows``
+    permission, so a single changed file under ``.github/workflows/**`` makes
+    GitHub reject the ENTIRE push (not just that file) — losing the whole
+    diff. Files matching :data:`ALWAYS_BLOCKED` are never a wanted agent edit
+    (see the constant's rationale), so revert them (tracked) or remove them
+    (newly created) before staging, and return what was dropped so the caller
+    can surface it for human review. This makes the push structurally safe
+    regardless of whether an upstream gate happened to catch the edit.
+    """
+    dropped: list[str] = []
+    for p in changed_files(workdir):
+        if not path_matches_glob(p, blocklist):
+            continue
+        if _file_is_new(workdir, p):
+            (workdir / p).unlink(missing_ok=True)
+        else:
+            subprocess.run(
+                ["git", "checkout", "HEAD", "--", p],
+                cwd=workdir, check=False, capture_output=True,
+            )
+        dropped.append(p)
+    return dropped
+
+
 # ── Risky-surface signal (route-to-human, not block) ───────────────────────
 #
 # Indirect prompt injection (arXiv:2607.20759) most reliably abuses a small set
@@ -10272,8 +10306,13 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
 
 def commit_and_push(
     workdir: Path, branch: str, title: str, repo: str, base_branch: str = "main",
-) -> None:
+) -> list[str]:
     """Stage all changes, commit (if any), and push the branch to origin.
+
+    Returns the list of ALWAYS_BLOCKED paths (e.g. ``.github/workflows/**``)
+    that were dropped from the branch before staging — empty in the common
+    case. Callers surface these for human review; the token structurally
+    cannot push them, so including them would fail the whole push.
 
     When the session made no edits — a valid outcome for warm-start
     refinements that judge the curated branch already clean — the commit
@@ -10359,6 +10398,18 @@ def commit_and_push(
     if bundle_path.exists():
         shutil.rmtree(bundle_path, ignore_errors=True)
 
+    # Discard changes to ALWAYS_BLOCKED paths before staging. The push token
+    # has no `workflows` permission, so a single .github/workflows/** change
+    # makes GitHub reject the whole push and lose the entire diff. These paths
+    # are never a wanted agent edit; drop them and keep the rest.
+    dropped_blocked = _strip_blocked_paths(workdir, ALWAYS_BLOCKED)
+    if dropped_blocked:
+        log.warning(
+            "  → dropped %d unpushable blocked path(s) before staging "
+            "(agent may not author workflow files): %s",
+            len(dropped_blocked), ", ".join(dropped_blocked),
+        )
+
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
     # An empty staged diff means the session reviewed the branch and
     # changed nothing — a valid (best-case) outcome for warm-start
@@ -10432,6 +10483,8 @@ def commit_and_push(
     # commit on top.
     if has_changes:
         _recommit_via_api(workdir, repo, branch, title, parent_sha=head_sha)
+
+    return dropped_blocked
 
 
 def _recommit_via_api(
@@ -11133,10 +11186,16 @@ def run_brief_mode(target: Target) -> dict:
                 f"Routing downgraded (Issue instead of PR)."
             )
 
-        commit_and_push(
+        dropped_blocked = commit_and_push(
             workdir, branch, pr_title, target.repo,
             base_branch=default_branch,
         )
+        result["branch"] = branch
+        if dropped_blocked:
+            # Un-pushable paths (e.g. .github/workflows/**) the agent touched
+            # and we stripped before pushing. Surface in the step summary so
+            # the human knows what was dropped and can apply it manually.
+            result["dropped_blocked_paths"] = dropped_blocked
 
         # publish=branch short-circuits before ``open_pr`` — the branch
         # is pushed for review, no PR object is created. Same semantics
@@ -17951,6 +18010,12 @@ def _write_step_summary(result: dict) -> None:
     emoji = {
         "pr_opened":               "🟢",
         "pr_opened_draft":         "🟢",
+        "pr_opened_brief":         "🟢",
+        "branch_pushed_no_pr":     "🟢",
+        "branch_pushed_canary_missing": "🟡",
+        "issue_opened_canary_missing":  "🟡",
+        "brief_failed":            "❌",
+        "issue_convention_failed_claude": "❌",
         "issue_opened":            "🟡",
         "issue_opened_preflight":  "🟡",
         "issue_opened_no_integration":     "🟡",
@@ -17990,6 +18055,35 @@ def _write_step_summary(result: dict) -> None:
     discussion_url = result.get("discussion_comment_url") or ""
     if discussion_url:
         lines.append(f"**Discussion comment**: {discussion_url}\n")
+
+    # Branch-mode (publish=branch, incl. brief mode): no PR object is
+    # created, so the branch link is the only pointer to the drafted work.
+    # Render it plus the "you open the PR" nudge that matches the human-in-
+    # the-loop operating model.
+    branch_url = result.get("branch_url") or ""
+    if branch_url:
+        branch_name = result.get("branch") or branch_url.split("/tree/", 1)[-1]
+        lines.append(f"**Branch**: {branch_url}\n")
+        lines.append(
+            f"_Pushed in `publish=branch` mode — no PR opened. Review the "
+            f"branch, then open the PR yourself when ready: "
+            f"`gh pr create --head {branch_name}`._\n"
+        )
+
+    # Un-pushable paths stripped before the push (e.g. .github/workflows/**
+    # the token can't author). Surfaced so the drop isn't silent — the human
+    # applies them manually if any were actually intended.
+    dropped_blocked = result.get("dropped_blocked_paths") or []
+    if dropped_blocked:
+        items = ", ".join(f"`{p}`" for p in dropped_blocked)
+        lines.append(
+            "\n### ⚠️ Un-pushable paths dropped from the branch\n\n"
+            "The agent modified workflow/CI files the push token is not "
+            "permitted to author, so they were **removed before pushing** — "
+            "otherwise GitHub rejects the entire push and the whole draft is "
+            "lost. Review whether any were actually needed and apply them "
+            f"manually if so:\n\n{items}\n"
+        )
 
     # When the dedup gate fires (open OR closed prior Issue), surface
     # the existing-Issue context inline so the maintainer sees at a
