@@ -6,7 +6,9 @@ https://github.com/user-attachments/assets/4b22a207-d878-4b4d-a1f1-02e886a8e994
 
 
 
-Turn any brief — an arXiv paper, a search query, or your own design doc — into a review-ready draft PR. Outrider runs as a GitHub Action, wires the implementation into a real call site in your repo, and returns a PR whose body already carries the evidence a maintainer needs to review it: references cited, license flagged, tests written, honest scope discipline in the self-review, alignment with your repo's own conventions.
+**Keep the systems you maintain improving — discover, implement, and validate your next great idea, delivered as a review-ready PR.**
+
+Outrider runs as a GitHub Action. It finds the next high-fit change, wires it into a real call site in *your* repo, and returns a draft PR whose body already carries the evidence a maintainer needs — references cited, license flagged, tests written, scope kept honest, and the implementation anchored on your repo's own merged history and conventions. **Discovery is the tool, drafting is the agent, the judgment is yours:** every run produces a branch you review, run, and decide on. Run after run, the loop compounds — **discover → implement → validate → decide** — and your repo accumulates a record of what actually fits it.
 
 ```yaml
 - uses: remyxai/outrider@v1
