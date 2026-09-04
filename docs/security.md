@@ -55,6 +55,15 @@ either a **draft PR** or a **human-review Issue**. The run also fails closed —
 match or a guard trip aborts rather than filing — and a maintainer can disable the
 workflow outright.
 
+## Where the model key lives
+
+The provider key is a repo Actions secret, decrypted only inside the ephemeral
+runner. Installing with `remyxai outrider init --github-secrets-only` seals it
+against that repo's own Actions public key on your machine, so it reaches
+GitHub as ciphertext and no copy is stored anywhere else. A manual install
+(see [manual-install.md](manual-install.md)) has the same property — you set
+the secret yourself.
+
 ## What we deliberately do not rely on
 
 The two model-facing layers (L1 wrapping, L4 canary) are **signals**, not guarantees — a
