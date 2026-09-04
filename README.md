@@ -66,6 +66,8 @@ remyxai outrider init --repo owner/name --auto-interest
 
 Installs the action, writes the workflow, sets the secrets (`REMYX_API_KEY`, `ANTHROPIC_API_KEY`). Scheduled cron handles the weekly cadence from there.
 
+Add `--github-secrets-only` to keep your provider key in one place: it is encrypted on your machine, written to the repo's Actions secrets, and no copy is stored anywhere else.
+
 Trigger an ad-hoc run:
 
 ```bash

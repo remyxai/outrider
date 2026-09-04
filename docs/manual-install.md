@@ -12,6 +12,10 @@ The [`remyxai` CLI](https://github.com/remyxai/remyxai-cli) sets Outrider up in 
    - `REMYX_API_KEY` — from step 2
    - `ANTHROPIC_API_KEY` — your key from [console.anthropic.com](https://console.anthropic.com)
 
+   Setting these by hand means the keys only ever exist in your repo.
+   `remyxai outrider init --github-secrets-only` gets you the same thing
+   without the manual steps: it seals the key locally before sending it.
+
 4. **Allow Actions to open PRs**: *Settings → Actions → General → Workflow permissions* → ☑ *Allow GitHub Actions to create and approve pull requests*. (Without this, the action returns `HTTP 403` at PR creation.)
 
 5. **Add the workflow** at `.github/workflows/outrider.yml`:
