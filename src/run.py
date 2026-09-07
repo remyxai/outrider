@@ -8691,17 +8691,25 @@ def _selection_coverage_from_events(events: list) -> dict:
     file_reads = 0
     visible_lines = 0
     read_ids: set[str] = set()
+
+    # Two passes, because the pairing is by id and event ORDER is not a
+    # contract: Claude Code emits tool_use before its tool_result, but R-CLI
+    # emits tool:result *before* the tool:requested that carries the call's
+    # structured input. A single ordered pass silently scored every R-CLI run
+    # at visible_lines=0 — the exact signal the coverage gate keys on.
     for ev in events:
-        if getattr(ev, "kind", None) == "tool_use":
-            classes = _classify_tool_use(ev.tool, ev.command)
-            searches += classes.count("search")
-            reads = classes.count("file_read")
-            file_reads += reads
-            if reads and ev.id:
-                read_ids.add(ev.id)
-        elif getattr(ev, "kind", None) == "tool_result":
-            if ev.id in read_ids:
-                visible_lines += ev.lines
+        if getattr(ev, "kind", None) != "tool_use":
+            continue
+        classes = _classify_tool_use(ev.tool, ev.command)
+        searches += classes.count("search")
+        reads = classes.count("file_read")
+        file_reads += reads
+        if reads and ev.id:
+            read_ids.add(ev.id)
+
+    for ev in events:
+        if getattr(ev, "kind", None) == "tool_result" and ev.id in read_ids:
+            visible_lines += ev.lines
     coverage = {
         "searches": searches,
         "file_reads": file_reads,

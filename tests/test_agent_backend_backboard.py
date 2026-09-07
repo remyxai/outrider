@@ -262,3 +262,33 @@ def test_unguarded_run_is_surfaced(backend):
     assert not backend.can(Capability.GUARDRAIL_POLICY)
     note = backend.guardrail_note()
     assert note and "backboard" in note
+
+
+# ─── event ordering is not a contract ───────────────────────────────────────
+
+def test_results_precede_requests_in_real_output(backend):
+    """R-CLI emits tool:result BEFORE the tool:requested that describes it.
+
+    Captured live. Claude Code emits the pair the other way round, so any
+    parser that assumes tool_use-then-tool_result scores every R-CLI run at
+    visible_lines=0 — which is the signal the coverage gate blocks on.
+    """
+    import json as _json
+    order = []
+    for line in load("reads_out_of_order").splitlines():
+        if not line.strip():
+            continue
+        etype = _json.loads(line).get("type")
+        if etype in ("tool:requested", "tool:result"):
+            order.append(etype)
+    assert order.index("tool:result") < order.index("tool:requested")
+
+
+def test_visible_lines_survive_that_ordering(backend):
+    import run as _run
+
+    result = backend.parse(0, load("reads_out_of_order"), "", stream=True)
+    coverage = _run._selection_coverage_from_events(result.events)
+    assert coverage["file_reads"] == 2
+    # "Read 3 lines" + "Read 4 lines"
+    assert coverage["visible_lines"] == 7
