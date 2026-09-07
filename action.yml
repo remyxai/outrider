@@ -386,6 +386,34 @@ inputs:
       covered by the `provider` shortlist.
     required: false
     default: ''
+  agent:
+    description: |
+      Which coding-agent CLI runs the implementation. This is a separate
+      axis from `provider`, which selects the *model* backend: the same
+      agent can route at several models, and not every pair is meaningful.
+
+      Recognized values:
+        - `` (empty, default) or `claude`: Claude Code. Existing behavior,
+          byte-for-byte — every pre-existing workflow keeps this path.
+        - `codex`: OpenAI Codex (`codex exec`). Requires `CODEX_API_KEY` in
+          the caller's env block. Reports tokens but no dollar figure, and
+          has no round-limit flag, so `claude-timeout` is the only spend
+          bound — keep it tight.
+        - `backboard`: Backboard R-CLI. Requires `BACKBOARD_API_KEY` in the
+          caller's env block. Reports authoritative cost. Also has no
+          round-limit flag.
+
+      Only `claude` supports the `provider` shortlist (it routes over
+      Anthropic-Messages-compatible endpoints). `codex` and `backboard`
+      carry their own model routing — set `CODEX_MODEL` / `BACKBOARD_MODEL`
+      in the env block instead of `model`.
+
+      Capability differences degrade telemetry, never the run: a backend
+      that reports no dollars is recorded as `cost_basis: unavailable`
+      rather than $0.00, and one that reports no tool transcript runs the
+      selection coverage gate in observe mode instead of failing every pick.
+    required: false
+    default: ''
   provider:
     description: |
       Which Anthropic-Messages-compatible backend to route the coding
@@ -490,16 +518,42 @@ runs:
       with:
         python-version: '3.11'
 
-    - name: Set up Node (for Claude Code CLI)
+    - name: Set up Node (for the agent CLI)
       uses: actions/setup-node@v4
       with:
         node-version: '20'
 
-    - name: Install Claude Code CLI
+    - name: Install the coding-agent CLI
       shell: bash
+      # One agent per run. Installing only the selected CLI keeps the common
+      # (Claude Code) path's install time unchanged.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
       run: |
-        npm install -g @anthropic-ai/claude-code
-        claude --version
+        set -eu
+        case "${INPUT_AGENT:-}" in
+          ''|claude)
+            npm install -g @anthropic-ai/claude-code
+            claude --version
+            ;;
+          codex)
+            npm install -g @openai/codex
+            codex --version
+            ;;
+          backboard)
+            # Native binary (~99 MB), not an npm package. BACKBOARD_INSTALL
+            # keeps it out of $HOME so the installer never edits shell rc
+            # files on the runner.
+            BACKBOARD_INSTALL="$RUNNER_TEMP/backboard" \
+              curl -fsSL https://app.backboard.io/api/cli | sh
+            echo "$RUNNER_TEMP/backboard/bin" >> "$GITHUB_PATH"
+            "$RUNNER_TEMP/backboard/bin/backboard" --version
+            ;;
+          *)
+            echo "::error::unknown agent '$INPUT_AGENT'; must be one of: claude, codex, backboard" >&2
+            exit 1
+            ;;
+        esac
 
     - name: Install pytest + remyxai CLI + pyyaml (validation + selection-pass tool-use + repo-intel loader)
       shell: bash
@@ -587,8 +641,21 @@ runs:
         git config --global user.name "remyx-ai[bot]"
         git config --global user.email "289541483+remyx-ai[bot]@users.noreply.github.com"
 
+    - name: Validate the agent / provider pair
+      if: ${{ inputs.provider != '' && inputs.agent != '' && inputs.agent != 'claude' }}
+      shell: bash
+      # Not a free cross-product: `provider` only means something for Claude
+      # Code. Failing loudly beats routing at a backend the caller didn't ask
+      # for, which is the same reason `provider=custom` requires a base URL.
+      run: |
+        echo "::error::agent='${{ inputs.agent }}' does not support the 'provider' input (that shortlist routes Claude Code at Anthropic-Messages-compatible endpoints). Set CODEX_MODEL / BACKBOARD_MODEL in your env block instead." >&2
+        exit 1
+
     - name: Configure backend from provider input
-      if: ${{ inputs.provider != '' }}
+      # `provider` routes Claude Code at an Anthropic-Messages-compatible
+      # endpoint. Codex and R-CLI carry their own model routing, so the
+      # pair is validated rather than silently ignored.
+      if: ${{ inputs.provider != '' && (inputs.agent == '' || inputs.agent == 'claude') }}
       shell: bash
       # Consolidates the per-fork Configure step that previously mapped
       # `provider` → (auth env var, base URL, secret name). Runs only when
@@ -707,6 +774,8 @@ runs:
         # Inline refinement chain toggle (recommend mode continues into
         # fidelity → convention → test by default; 'false' opts out).
         INPUT_CHAIN: ${{ inputs.chain }}
+        # Which coding-agent CLI run.py drives. Empty = Claude Code.
+        INPUT_AGENT: ${{ inputs.agent }}
         # Weekly Discussion summary (opt-in second scheduled job).
         REMYX_MODE: ${{ inputs.mode }}
         REMYX_WEEKLY_DISCUSSION_ID: ${{ inputs.weekly-discussion-id }}

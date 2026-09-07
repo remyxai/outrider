@@ -184,3 +184,51 @@ def test_claude_capability_set():
 
 def test_claude_is_registered():
     assert "claude" in available()
+
+
+# ─── action.yml wiring ──────────────────────────────────────────────────────
+
+def _action_yaml():
+    import yaml
+
+    path = Path(__file__).resolve().parent.parent / "action.yml"
+    return yaml.safe_load(path.read_text())
+
+
+def test_agent_input_exists_and_defaults_to_empty():
+    """Empty default is what keeps every existing workflow on Claude Code."""
+    spec = _action_yaml()["inputs"]["agent"]
+    assert spec["default"] == ""
+    assert spec["required"] is False
+
+
+def test_agent_input_documents_every_registered_backend():
+    description = _action_yaml()["inputs"]["agent"]["description"]
+    for name in available():
+        assert f"`{name}`" in description, f"{name} undocumented in action.yml"
+
+
+def test_provider_input_values_are_not_removed():
+    """Version discipline: `provider` values are additive-only forever."""
+    description = _action_yaml()["inputs"]["provider"]["description"]
+    for value in ("anthropic", "zai", "moonshot", "custom"):
+        assert f"`{value}`" in description
+
+
+def test_agent_is_threaded_into_the_recommend_step():
+    steps = _action_yaml()["runs"]["steps"]
+    env_blocks = [s.get("env") or {} for s in steps]
+    assert any(
+        block.get("INPUT_AGENT") for block in env_blocks
+    ), "INPUT_AGENT must reach run.py"
+
+
+def test_install_step_covers_every_registered_backend():
+    """A backend the registry knows but the action can't install is a trap:
+    the run would fail at `not found on PATH` deep into a dispatch."""
+    steps = _action_yaml()["runs"]["steps"]
+    install = next(
+        s for s in steps if s.get("name") == "Install the coding-agent CLI"
+    )
+    for backend in (resolve(n) for n in available()):
+        assert backend.name in install["run"], f"{backend.name} not installed"

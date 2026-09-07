@@ -18564,11 +18564,18 @@ def main():
     # gh-secret-set ambiguity, whitespace, mutual-exclusion on non-
     # default backends) that otherwise surface as opaque 401s after a
     # full run's worth of clone + spec-bundle work.
-    auth_ok, auth_warnings = _validate_claude_auth_env()
+    if _BACKEND.name == "claude":
+        auth_ok, auth_warnings = _validate_claude_auth_env()
+    else:
+        # Each backend knows its own credential. Checking here, before any
+        # clone or prompt build, keeps a missing key from costing a full
+        # dispatch's setup before failing.
+        auth_ok, auth_warnings = _BACKEND.preflight()
     for w in auth_warnings:
         log.warning("  ⚠ auth check: %s", w)
     if not auth_ok:
         sys.exit(2)
+    log.info("  agent=%s (%s)", _BACKEND.name, _BACKEND.display_name)
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
     if mode == "weekly-summary":
