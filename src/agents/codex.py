@@ -115,13 +115,16 @@ class CodexBackend(AgentBackend):
             "cache_read_input_tokens": 0,
         }
         turns = 0
+        turn_index = 0
         saw_usage = False
         norm: list[Event] = []
 
         for ev in raw:
             etype = ev.get("type") or ""
 
-            if etype == "turn.completed":
+            if etype == "turn.started":
+                turn_index += 1
+            elif etype == "turn.completed":
                 turns += 1
                 usage = ev.get("usage") or {}
                 if usage:
@@ -150,7 +153,9 @@ class CodexBackend(AgentBackend):
                 if item_type == "agent_message" and etype == "item.completed":
                     text = item.get("text") or text
                 elif etype == "item.completed":
-                    norm.extend(_normalize_item(item_type, item))
+                    norm.extend(
+                        _normalize_item(item_type, item, turn_index)
+                    )
 
         ok = (not failed) and returncode == 0
         if not ok:
@@ -190,7 +195,9 @@ def _parse_jsonl(stdout: str) -> list[dict]:
     return out
 
 
-def _normalize_item(item_type: str, item: dict) -> list[Event]:
+def _normalize_item(
+    item_type: str, item: dict, turn: int = 0
+) -> list[Event]:
     """One completed Codex item → normalized events.
 
     A ``file_change`` names every path it touched; a ``command_execution``
@@ -224,10 +231,14 @@ def _normalize_item(item_type: str, item: dict) -> list[Event]:
     return [
         Event(
             kind="tool_use",
+            turn=turn,
             id=str(item.get("id") or ""),
             tool=tool,
             paths=paths,
             command=command,
         ),
-        Event(kind="tool_result", id=str(item.get("id") or ""), lines=lines),
+        Event(
+            kind="tool_result", turn=turn,
+            id=str(item.get("id") or ""), lines=lines,
+        ),
     ]

@@ -154,11 +154,12 @@ class BackboardBackend(AgentBackend):
                 model = usage.get("model") or model
             elif etype == "tool:requested":
                 rounds += 1
-                norm.extend(_normalize_requested(payload))
+                norm.extend(_normalize_requested(payload, rounds))
             elif etype == "tool:result":
                 norm.append(
                     Event(
                         kind="tool_result",
+                        turn=rounds,
                         id=str(payload.get("toolCallId") or ""),
                         lines=_result_lines(payload),
                     )
@@ -213,7 +214,7 @@ def _parse_jsonl(stdout: str) -> list[dict]:
     return out
 
 
-def _normalize_requested(payload: dict) -> list[Event]:
+def _normalize_requested(payload: dict, turn: int) -> list[Event]:
     """One ``tool:requested`` payload → normalized tool_use events.
 
     This is the only event carrying structured input; ``tool:start`` has just
@@ -228,6 +229,7 @@ def _normalize_requested(payload: dict) -> list[Event]:
         events.append(
             Event(
                 kind="tool_use",
+                turn=turn,
                 id=str(call.get("id") or ""),
                 tool=_TOOL_MAP.get(raw_name, "other"),
                 paths=_paths_of(raw_name, inp),

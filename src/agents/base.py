@@ -119,6 +119,11 @@ class Event:
     command: str | None = None
     #: Payload size in lines — the ``visible_lines`` coverage signal.
     lines: int = 0
+    #: Index of the agent turn this call belongs to. Turn grouping is what
+    #: makes `linearity` / `parallel_turns` meaningful: a turn issuing several
+    #: reads at once is branching exploration, several turns issuing one read
+    #: each is linear. A flat event list cannot express that difference.
+    turn: int = 0
 
 
 @dataclass

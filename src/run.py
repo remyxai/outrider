@@ -8659,65 +8659,49 @@ def _classify_shell_command(cmd: str) -> list[str]:
     return out
 
 
-def _classify_tool_use(name: str, inp: dict) -> list[str]:
-    """Classifications for one ``tool_use`` block (Bash, Read, Grep, …)."""
-    if name == "Bash":
-        return _classify_shell_command((inp or {}).get("command") or "")
-    if name in ("Read", "WebFetch"):
+def _classify_tool_use(tool: str, command: str | None = None) -> list[str]:
+    """Coverage classes for one normalized tool call.
+
+    ``tool`` is the neutral verb the backend emitted (read / search / glob /
+    execute / web_fetch / …), not a vendor tool name, so this stays identical
+    across agents. Shell commands still get their own classification because a
+    `grep`-shaped command is a search regardless of which CLI ran it.
+    """
+    if tool == "execute":
+        return _classify_shell_command(command or "")
+    if tool in ("read", "web_fetch"):
         return ["file_read"]
-    if name in ("Grep", "Glob"):
+    if tool in ("search", "glob"):
         return ["search"]
     return []
 
 
-def _count_result_lines(content: object) -> int:
-    """Line count of a ``tool_result`` payload (string or text-block list)."""
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        text = "\n".join(
-            b.get("text", "") for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
-    else:
-        text = str(content)
-    return len(text.splitlines()) if text else 0
-
-
-def _selection_coverage_from_events(events: list[dict]) -> dict:
-    """Parse a stream-json transcript into per-run exploration coverage.
+def _selection_coverage_from_events(events: list) -> dict:
+    """Parse a normalized transcript into per-run exploration coverage.
 
     Pairs each file-read ``tool_use`` with its ``tool_result`` by id so
     ``visible_lines`` reflects content the agent actually saw. Returns
     ``searches`` / ``file_reads`` / ``visible_lines`` / ``search_to_read_ratio``.
+
+    Consumes :class:`agents.base.Event`, so every backend's transcript is
+    measured the same way — the vendor-specific shapes were absorbed by the
+    adapter that produced them.
     """
     searches = 0
     file_reads = 0
     visible_lines = 0
     read_ids: set[str] = set()
     for ev in events:
-        msg = ev.get("message") if isinstance(ev, dict) else None
-        content = (msg or {}).get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type")
-            if btype == "tool_use":
-                classes = _classify_tool_use(
-                    block.get("name") or "", block.get("input") or {}
-                )
-                searches += classes.count("search")
-                reads = classes.count("file_read")
-                file_reads += reads
-                if reads and block.get("id"):
-                    read_ids.add(block["id"])
-            elif btype == "tool_result":
-                if block.get("tool_use_id") in read_ids:
-                    visible_lines += _count_result_lines(block.get("content"))
+        if getattr(ev, "kind", None) == "tool_use":
+            classes = _classify_tool_use(ev.tool, ev.command)
+            searches += classes.count("search")
+            reads = classes.count("file_read")
+            file_reads += reads
+            if reads and ev.id:
+                read_ids.add(ev.id)
+        elif getattr(ev, "kind", None) == "tool_result":
+            if ev.id in read_ids:
+                visible_lines += ev.lines
     coverage = {
         "searches": searches,
         "file_reads": file_reads,
@@ -8767,6 +8751,19 @@ def _apply_coverage_gate(
         "REMYX_SELECTION_COVERAGE_GATE", "observe"
     ).lower().strip()
     if mode == "off":
+        return data
+    if not _BACKEND.can(Capability.STREAM_TRANSCRIPT):
+        # No transcript means visible_lines is 0, which is below every floor —
+        # enforcing here would downgrade *every* pick to a skip and the run
+        # would read as "the model found nothing worth doing" rather than
+        # "this agent can't report coverage". Degrade to observe and say why.
+        coverage["basis"] = "unavailable"
+        if mode == "enforce":
+            log.warning(
+                "⚠ selection coverage gate: %s reports no tool transcript, so "
+                "coverage can't be measured; running in observe mode instead "
+                "of downgrading every pick.", _BACKEND.name,
+            )
         return data
     if higher_floor:
         floor = int(os.environ.get(

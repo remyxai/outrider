@@ -170,3 +170,41 @@ def test_events_without_paths_pass_through(tmp_path):
 
 def test_empty_transcript_is_fine(tmp_path):
     assert run._relativize_events([], tmp_path) == []
+
+
+# ─── the coverage gate must not punish a backend for being quiet ────────────
+
+class _NoTranscript(BackboardBackend):
+    """A backend that reports no tool transcript."""
+    capabilities = frozenset({Capability.ONESHOT_JSON, Capability.TOKEN_USAGE})
+
+
+def test_enforce_does_not_zero_out_a_transcript_less_backend(monkeypatch):
+    """The trap: visible_lines is 0 without a transcript, below every floor.
+
+    Enforcing would downgrade every pick to skipped_by_selection_verification,
+    so the run would look like the model found nothing worth doing rather than
+    like the agent can't report coverage.
+    """
+    monkeypatch.setattr(run, "_BACKEND", _NoTranscript())
+    monkeypatch.setenv("REMYX_SELECTION_COVERAGE_GATE", "enforce")
+
+    data = {"chosen_index": 2}
+    coverage = {"visible_lines": 0}
+    out = run._apply_coverage_gate(data, coverage, higher_floor=False)
+
+    assert out["chosen_index"] == 2, "the pick must survive"
+    assert "under_explored" not in out
+    assert coverage["basis"] == "unavailable"
+
+
+def test_enforce_still_gates_a_backend_that_does_report(monkeypatch):
+    """Capability-awareness must not become a blanket exemption."""
+    monkeypatch.setattr(run, "_BACKEND", ClaudeCodeBackend())
+    monkeypatch.setenv("REMYX_SELECTION_COVERAGE_GATE", "enforce")
+
+    data = {"chosen_index": 2}
+    out = run._apply_coverage_gate(data, {"visible_lines": 3}, higher_floor=False)
+
+    assert out["chosen_index"] == -1
+    assert out["under_explored"] is True

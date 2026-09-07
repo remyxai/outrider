@@ -36,8 +36,8 @@ _TOOL_MAP = {
     "grep": "search",
     "glob": "glob",
     "bash": "execute",
-    "websearch": "web",
-    "webfetch": "web",
+    "websearch": "web_search",
+    "webfetch": "web_fetch",
 }
 
 # Where each path-bearing tool keeps its target path.
@@ -239,7 +239,7 @@ def normalize_events(raw_events: list[dict]) -> list[Event]:
     parser can still see how the agent moved between subsystems.
     """
     events: list[Event] = []
-    for raw in raw_events:
+    for turn, raw in enumerate(raw_events):
         message = raw.get("message") or {}
         content = message.get("content")
         if not isinstance(content, list):
@@ -254,6 +254,7 @@ def normalize_events(raw_events: list[dict]) -> list[Event]:
                 events.append(
                     Event(
                         kind="tool_use",
+                        turn=turn,
                         id=str(block.get("id") or ""),
                         tool=_TOOL_MAP.get(name.lower(), "other"),
                         paths=_paths_of(name, inp),
@@ -268,6 +269,7 @@ def normalize_events(raw_events: list[dict]) -> list[Event]:
                 events.append(
                     Event(
                         kind="tool_result",
+                        turn=turn,
                         id=str(block.get("tool_use_id") or ""),
                         lines=_result_lines(block.get("content")),
                     )
