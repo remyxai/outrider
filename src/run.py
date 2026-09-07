@@ -77,6 +77,8 @@ from exploration_structure import (
 )
 from instruction_files import render_instruction_files
 
+from agents import Capability, resolve as _resolve_agent
+
 # ─── Configuration ─────────────────────────────────────────────────────────
 
 # Mirror REMYX_API_KEY → REMYXAI_API_KEY so the `remyxai` CLI authenticates
@@ -7737,98 +7739,45 @@ def _record_claude_usage(env: dict) -> None:
 # explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
 # wildcards — future Anthropic env vars may carry telemetry tokens the
 # agent shouldn't see verbatim.
-_CLAUDE_ENV_WHITELIST: tuple[str, ...] = (
-    "ANTHROPIC_API_KEY",
-    # ANTHROPIC_AUTH_TOKEN — used by Claude Code as a Bearer credential
-    # for non-default backends (z.ai's GLM Coding Plan requires this:
-    # https://docs.z.ai/devpack/tool/claude). When set, Claude Code sends
-    # "Authorization: Bearer <token>" instead of "x-api-key: <key>". z.ai's
-    # gateway rejects x-api-key with HTTP 401, so without this whitelist
-    # entry, any glm-routed run fails at auth.
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_MODEL",
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "TERM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "CI",
-    "GITHUB_ACTIONS",
-    # GITHUB_TOKEN is intentionally not exposed to the coding agent — a
-    # write-scoped token in the agent's context is an exfiltration risk. The
-    # orchestrator holds its own token separately (clone/push unaffected); the
-    # agent's `gh` reads use unauthenticated access (fine for public repos).
-)
+# The active coding-agent backend, resolved once at startup from the `agent`
+# action input. Unset resolves to Claude Code, so every pre-port run keeps its
+# exact argv and env — the invariant pinned by test_agent_backend_invariant.py.
+_BACKEND = _resolve_agent(os.environ.get("INPUT_AGENT"))
+
+# Back-compat alias: this tuple was module-level in run.py before the agent
+# port and tests assert on it directly. The whitelist and its security
+# rationale now live on the backend that owns those auth vars.
+_CLAUDE_ENV_WHITELIST: tuple[str, ...] = _BACKEND.env_whitelist()
 
 
 def _claude_subprocess_env() -> dict[str, str]:
-    """Build the env dict for Claude CLI subprocess invocations.
+    """Build the env dict for agent CLI subprocess invocations.
 
-    Returns a minimal whitelist of the parent env, stripping every var
-    not on ``_CLAUDE_ENV_WHITELIST``. Defense in depth at the launch
-    boundary — the v1.6.4 outbound-body scrubber catches secrets at
-    egress; this stops them from entering the agent's context at all.
+    Returns a minimal whitelist of the parent env, stripping every var not on
+    the active backend's whitelist. Defense in depth at the launch boundary —
+    the v1.6.4 outbound-body scrubber catches secrets at egress; this stops
+    them from entering the agent's context at all.
     """
-    env: dict[str, str] = {}
-    for name in _CLAUDE_ENV_WHITELIST:
-        v = os.environ.get(name)
-        if v is not None:
-            env[name] = v
-    return env
+    return _BACKEND.subprocess_env()
 
 
-# Injection-hardening Bash gate for the SPAWNED agent. NOTE: the repo's own
-# .claude/hooks/pre-bash-gate.sh does NOT reach this agent (it governs only
-# Claude Code sessions working on this repo). The agent runs with cwd set to the
-# target checkout, so its hooks must be delivered explicitly via `--settings`.
-_AGENT_BASH_GATE = Path(__file__).with_name("agent_bash_gate.sh")
+def _agent_base_cmd() -> list[str]:
+    """argv prefix for the active backend, including its guardrail policy.
 
+    For Claude Code that policy is a `--settings` PreToolUse Bash gate which
+    strips high-leverage capabilities (package installs, network egress, `gh`
+    writes, `git push`) so an agent that *complies* with an instruction
+    injected via untrusted issue/PR text still can't reach them — detecting
+    the intent doesn't work (arXiv:2607.20759), so we remove the reach.
 
-def _agent_hardening_settings_arg() -> list[str]:
-    """`--settings` arg loading the injection-hardening PreToolUse Bash gate.
-
-    The gate (``agent_bash_gate.sh``) strips high-leverage Bash capabilities
-    (package installs, network egress, ``gh`` writes, ``git push``) so an agent
-    that *complies* with an instruction injected via untrusted issue/PR text
-    still can't reach them — the paper (arXiv:2607.20759) shows detecting the
-    intent doesn't work, so we remove the reach instead. PreToolUse hooks fire
-    in headless ``-p`` mode even under ``--dangerously-skip-permissions``
-    (verified).
-
-    Returns ``[]`` (with a loud error log) if the hook file is missing, so a
-    packaging error degrades to the prior open behavior rather than crashing
-    every dispatch. The hook shipping is a repo invariant, so this should never
-    fire in practice.
+    A backend that can't express such a policy is not silently accepted: the
+    note is logged loudly so an unguarded run is visible in the job log.
     """
-    if not _AGENT_BASH_GATE.exists():
-        log.error(
-            "agent_bash_gate.sh missing at %s — coding session runs WITHOUT the "
-            "injection-hardening Bash gate.",
-            _AGENT_BASH_GATE,
-        )
-        return []
-    settings = {
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": str(_AGENT_BASH_GATE)}],
-                }
-            ]
-        }
-    }
-    return ["--settings", json.dumps(settings)]
+    cmd = _BACKEND.base_cmd()
+    note = _BACKEND.guardrail_note()
+    if note:
+        log.warning("\u26a0 %s", note)
+    return cmd
 
 
 def _format_agent_cli_failure(
@@ -7861,110 +7810,71 @@ def _format_agent_cli_failure(
     return "\n".join(parts)
 
 
-def _run_claude_json(
-    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
-) -> tuple[bool, str]:
-    """Run `claude … --output-format json -p <prompt>`, accumulate token/cost
-    usage into _RUN_COST, and return (ok, model_text).
+def _run_agent(
+    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int,
+    *, stream: bool = False,
+) -> tuple[bool, str, list]:
+    """Run the active agent CLI once and normalize the result.
 
-    With --output-format json the CLI prints a single envelope object
-    ({result, total_cost_usd, usage, num_turns, is_error, …}); the model's
-    actual answer is in `result`, so callers that parse a JSON decision out
-    of the answer get the inner text, not the envelope. Falls back to raw
-    stdout (no usage recorded) if the envelope doesn't parse.
+    Returns ``(ok, text, events)``. ``text`` is the agent's final message;
+    ``events`` is the normalized transcript (empty unless ``stream`` and the
+    backend has STREAM_TRANSCRIPT). Token/cost usage is accumulated into
+    ``_RUN_COST`` here, so every backend is accounted identically.
+
+    Output that can't be parsed at all falls through to
+    ``_format_agent_cli_failure``, which puts the CLI's stderr last so the
+    real cause survives the caller's tail-slice.
     """
-    cmd = [*cmd_prefix, "--output-format", "json", "-p", prompt]
+    cmd, stdin_text = _BACKEND.finalize_cmd(cmd_prefix, prompt, stream=stream)
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, env=_claude_subprocess_env(),
-            capture_output=True, text=True, timeout=timeout_s,
+            input=stdin_text, capture_output=True, text=True,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return False, f"claude CLI timed out after {timeout_s}s"
+        return False, _BACKEND.timeout_message(timeout_s), []
     except FileNotFoundError:
-        return False, ("claude CLI not found on PATH "
-                       "(install: npm install -g @anthropic-ai/claude-code)")
-    raw = (proc.stdout or "").strip()
-    try:
-        env = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        env = None
-    if isinstance(env, dict):
-        _record_claude_usage(env)
-        text = env.get("result") or ""
-        is_error = bool(env.get("is_error")) or proc.returncode != 0
-        # On error, always append the CLI stderr — the envelope's `result`
-        # often omits the operational cause (e.g. usage limit) that stderr
-        # carries. Skip if stderr is already echoed inside `result`.
-        if is_error and proc.stderr and proc.stderr.strip() not in text:
-            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
-        return (not is_error), text
-    # Envelope didn't parse — surface the CLI's exit code and stderr so the
-    # real failure cause reaches `claude_log_tail`. No usage recorded (no
-    # envelope to account).
-    return proc.returncode == 0, _format_agent_cli_failure(
-        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
+        return False, _BACKEND.not_found_message(), []
+
+    result = _BACKEND.parse(
+        proc.returncode, proc.stdout or "", proc.stderr or "", stream=stream
     )
+    if result is None:
+        return (
+            proc.returncode == 0,
+            _format_agent_cli_failure(
+                cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
+            ),
+            [],
+        )
+    for envelope in result.usage_envelopes:
+        _record_claude_usage(envelope)
+    return result.ok, result.text, result.events
+
+
+def _run_claude_json(
+    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
+) -> tuple[bool, str]:
+    """One-shot agent call returning ``(ok, final_message)``.
+
+    Name kept from before the agent port — it is a monkeypatch seam in a large
+    number of tests.
+    """
+    ok, text, _events = _run_agent(cmd_prefix, prompt, cwd, timeout_s)
+    return ok, text
 
 
 def _run_claude_stream(
     cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
-) -> tuple[bool, str, list[dict]]:
-    """Like ``_run_claude_json`` but with the full tool transcript.
+) -> tuple[bool, str, list]:
+    """Like :func:`_run_claude_json` but also returns the tool transcript.
 
-    Runs ``claude … --output-format stream-json --verbose -p <prompt>`` and
-    parses the JSONL event stream. Returns ``(ok, text, events)`` where
-    ``text`` is the final result event's answer string (same string the json
-    envelope's ``result`` field carries, so verdict parsing is unchanged) and
-    ``events`` is every parsed stream event — the selection coverage parser
-    walks the ``tool_use`` / ``tool_result`` blocks in it.
-
-    Token/cost usage is recorded exactly once, off the terminal
-    ``{"type": "result", …}`` event (same shape as the json envelope), so
-    accounting matches ``_run_claude_json``. ``--verbose`` is required by the
-    CLI when ``stream-json`` is paired with ``-p``.
+    ``events`` is the normalized transcript the selection-coverage and
+    exploration-structure parsers walk. Name kept from before the agent port
+    for the same monkeypatch-seam reason.
     """
-    cmd = [*cmd_prefix, "--output-format", "stream-json", "--verbose",
-           "-p", prompt]
-    try:
-        proc = subprocess.run(
-            cmd, cwd=cwd, env=_claude_subprocess_env(),
-            capture_output=True, text=True, timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"claude CLI timed out after {timeout_s}s", []
-    except FileNotFoundError:
-        return False, ("claude CLI not found on PATH "
-                       "(install: npm install -g @anthropic-ai/claude-code)"), []
-    events: list[dict] = []
-    for line in (proc.stdout or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(ev, dict):
-            events.append(ev)
-    final = next(
-        (e for e in reversed(events) if e.get("type") == "result"), None
-    )
-    if final is not None:
-        _record_claude_usage(final)
-        text = final.get("result") or ""
-        is_error = bool(final.get("is_error")) or proc.returncode != 0
-        # On error, always append the CLI stderr — the result event's text
-        # often omits the operational cause (e.g. usage limit) that stderr
-        # carries. Skip if stderr is already echoed inside the result text.
-        if is_error and proc.stderr and proc.stderr.strip() not in text:
-            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
-        return (not is_error), text, events
-    # No terminal result event — surface exit code + stderr so the real
-    # failure cause reaches `claude_log_tail`.
-    return proc.returncode == 0, _format_agent_cli_failure(
-        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
-    ), events
+    return _run_agent(cmd_prefix, prompt, cwd, timeout_s, stream=True)
 
 
 def _strip_leading_frontmatter(text: str) -> str:
@@ -8157,13 +8067,13 @@ def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, st
         (workdir / BUNDLE_DIR_NAME / "RESEARCH_INVOCATION.md").read_text()
     )
     log.info(f"  → invoking research phase (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
+    cmd = _agent_base_cmd()
     # Cap turns via the same knob the coding invocation honors, but with a
     # tighter default for the research phase (8 turns per the prompt's
     # bounded-budget instruction).
     max_turns = os.environ.get("REMYX_RESEARCH_MAX_TURNS", "8").strip()
     if max_turns:
-        cmd += ["--max-turns", max_turns]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
     findings_path = workdir / BUNDLE_DIR_NAME / "web_findings.json"
     if ok and not findings_path.exists():
@@ -8194,10 +8104,10 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
         (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
     )
     log.info(f"  → invoking Claude Code (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
+    cmd = _agent_base_cmd()
     max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
     if max_turns:
-        cmd += ["--max-turns", max_turns]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
     if not ok:
         # The returned `text` is tail-truncated downstream (telemetry keeps
@@ -8227,9 +8137,9 @@ def _run_claude_oneshot(
     `max_turns` caps tool-use rounds for agentic flows (selection now uses
     this to bound spend). None = no cap (matches prior behavior).
     """
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
+    cmd = _agent_base_cmd()
     if max_turns is not None:
-        cmd += ["--max-turns", str(max_turns)]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     return _run_claude_json(cmd, prompt, workdir, timeout_s)
 
 
@@ -8244,9 +8154,9 @@ def _run_claude_oneshot_streaming(
     selection pass uses this; the other one-shot callers (pre-flight,
     self-review, audit) stay on the cheaper single-envelope runner.
     """
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
+    cmd = _agent_base_cmd()
     if max_turns is not None:
-        cmd += ["--max-turns", str(max_turns)]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     return _run_claude_stream(cmd, prompt, workdir, timeout_s)
 
 
