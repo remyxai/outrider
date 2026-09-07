@@ -178,6 +178,22 @@ class AgentBackend:
             f"apply."
         )
 
+    # ── cost attribution ──────────────────────────────────────────────────
+
+    #: Human-readable name for this agent in the step summary and telemetry.
+    display_name: str = ""
+
+    def cost_label(self, model: str = "") -> str:
+        """What served this run, for the ``model_backend`` telemetry field.
+
+        Kept distinct from :attr:`name` (the *agent*) because the two are
+        separate axes: the same agent can route at several model backends, and
+        collapsing them makes a Codex-on-OpenAI run indistinguishable from a
+        Claude-on-Anthropic one in the fleet report.
+        """
+        label = self.display_name or self.name
+        return f"{label} ({model})" if model else label
+
     # ── environment ───────────────────────────────────────────────────────
 
     def env_whitelist(self) -> tuple[str, ...]:

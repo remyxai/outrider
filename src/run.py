@@ -62,6 +62,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -7674,6 +7675,31 @@ def _record_claude_usage(env: dict) -> None:
     # var (what we requested) — same in practice, but envelope wins when
     # both are present.
     model = env.get("model") or os.environ.get("ANTHROPIC_MODEL", "")
+
+    if _BACKEND.name != "claude":
+        # Non-Claude agents don't speak ANTHROPIC_BASE_URL, so the base-url
+        # sniff would silently attribute every run to "Anthropic". Resolve on
+        # the agent axis instead: trust the envelope's dollars when the CLI
+        # reports them, else the rate table, else say so rather than emit a
+        # figure the agent never produced.
+        _RUN_COST["model_backend"] = _BACKEND.cost_label(model)
+        if _BACKEND.can(Capability.COST_USD):
+            _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
+            _RUN_COST["cost_basis"] = "agent_envelope"
+            return
+        _, rates = _detect_backend(base_url, model)
+        if rates is not None:
+            rate_in, rate_out, rate_cache = rates
+            _RUN_COST["cost_usd"] += (
+                in_tok * rate_in + out_tok * rate_out + cache_in * rate_cache
+            ) / 1_000_000
+            _RUN_COST["cost_basis"] = "backend_rate_table"
+        else:
+            # Token counts stay accurate; dollars are simply not knowable for
+            # this (agent, model) pair yet. Never fabricate them.
+            _RUN_COST["cost_basis"] = "unavailable"
+        return
+
     backend_name, rates = _detect_backend(base_url, model)
     if rates is not None and "api.anthropic.com" not in base_url:
         # Compute from tokens × backend rates (USD per million).
@@ -7810,6 +7836,45 @@ def _format_agent_cli_failure(
     return "\n".join(parts)
 
 
+def _relativize_events(events: list, cwd: Path) -> list:
+    """Rewrite absolute tool paths as repo-relative.
+
+    Agents report the paths they touched as absolute (Claude Code's
+    `file_path`, R-CLI's resolved `read` target). The exploration-structure
+    parser derives a subsystem from the *first* path segment, so an absolute
+    path files every read under `tmp` (or `home`) instead of `src` — the
+    domain-coverage signal silently collapses to one bucket. Relativizing
+    once here keeps that fix in a single place for every backend.
+    """
+    if not events:
+        return events
+    try:
+        root = str(Path(cwd).resolve())
+    except OSError:
+        return events
+    prefix = root.rstrip("/") + "/"
+    out = []
+
+    def rel(path: str) -> str:
+        # The workdir root itself is a legitimate target (a directory glob or
+        # listing). Left absolute it files under `tmp` / `home` and pollutes
+        # the domain histogram, so it becomes the repo root marker instead.
+        if path.rstrip("/") == root:
+            return "."
+        return path[len(prefix):] if path.startswith(prefix) else path
+
+    for event in events:
+        if not event.paths:
+            out.append(event)
+            continue
+        rewritten = tuple(rel(p) for p in event.paths)
+        out.append(
+            event if rewritten == event.paths
+            else dataclasses.replace(event, paths=rewritten)
+        )
+    return out
+
+
 def _run_agent(
     cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int,
     *, stream: bool = False,
@@ -7850,7 +7915,7 @@ def _run_agent(
         )
     for envelope in result.usage_envelopes:
         _record_claude_usage(envelope)
-    return result.ok, result.text, result.events
+    return result.ok, result.text, _relativize_events(result.events, cwd)
 
 
 def _run_claude_json(
@@ -18162,7 +18227,7 @@ def _write_step_summary(result: dict) -> None:
 
     if status == "claude_failed":
         lines.extend(_agent_failure_blocks(
-            agent="claude",
+            agent=_BACKEND.name,
             log_tail=result.get("claude_log_tail") or "",
             claude_calls=claude_calls,
         ))
@@ -18601,7 +18666,7 @@ def main():
     # Bedrock" / etc. when ANTHROPIC_BASE_URL routes elsewhere. cost_basis
     # tells the step summary whether cost was computed from a known rate
     # card or trusted from the CLI's envelope.
-    result["agent"] = "Claude Code"
+    result["agent"] = _BACKEND.display_name
     result["model_backend"] = _RUN_COST.get("model_backend", "Anthropic")
     result["cost_basis"] = _RUN_COST.get("cost_basis", "claude_code_envelope")
     result["envelopes_without_usage"] = _RUN_COST.get(

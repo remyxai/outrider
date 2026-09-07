@@ -15,12 +15,16 @@ from agents.base import (  # noqa: F401 — re-exported for callers
     Event,
     PromptDelivery,
 )
+from agents.backboard import BackboardBackend
 from agents.claude import ClaudeCodeBackend
+from agents.codex import CodexBackend
 
 DEFAULT_AGENT = "claude"
 
 _REGISTRY: dict[str, type[AgentBackend]] = {
     ClaudeCodeBackend.name: ClaudeCodeBackend,
+    CodexBackend.name: CodexBackend,
+    BackboardBackend.name: BackboardBackend,
 }
 
 

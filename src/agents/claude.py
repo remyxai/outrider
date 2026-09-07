@@ -54,6 +54,7 @@ _PATH_KEYS = {
 class ClaudeCodeBackend(AgentBackend):
     name = "claude"
     tool = "claude"
+    display_name = "Claude Code"
     install_hint = "npm install -g @anthropic-ai/claude-code"
     billing_url = "https://console.anthropic.com/settings/billing"
     keys_url = "https://console.anthropic.com/settings/keys"
