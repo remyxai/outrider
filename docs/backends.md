@@ -9,7 +9,9 @@ timestamp: 2026-07-16T00:00:00Z
 
 # Model backends
 
-Outrider's coding-agent step shells out to the `claude` CLI. Anything Claude Code can authenticate against, Outrider can route through.
+Outrider's coding-agent step shells out to a coding-agent CLI — `claude` by default, or `codex` / `backboard` via the [`agent`](#coding-agents-the-agent-input) input. Anything that agent can authenticate against, Outrider can route through.
+
+This page covers the **model** axis. The `agent` axis, and which combinations of the two work, is in [Coding agents](#coding-agents-the-agent-input) below.
 
 By default Outrider talks to Anthropic's hosted API. To route at any other Anthropic-Messages-compatible backend — z.ai's GLM Coding Plan, Moonshot's Kimi, AWS Bedrock with Claude, GCP Vertex with Claude, an on-prem proxy — set the `model-base-url` action input. The Outrider engine doesn't care which backend served the response; the spec bundle, validators, refinement chain, and selection pass are all backend-agnostic.
 
@@ -108,6 +110,8 @@ Outrider tracks token counts straight from each Claude Code response envelope. C
 | `claude_code_envelope` | Default Anthropic path — the CLI's `total_cost_usd` field is authoritative because the CLI knows Anthropic's rates |
 | `backend_rate_table` | Outrider has per-model rate rows for the configured backend (currently: `api.z.ai` covers `glm-5.2`/`glm-4.6`; `api.moonshot.ai` covers `kimi-k3`/`kimi-k2.7-code`/`kimi-k2.7-code-highspeed`). Cost is computed from `tokens × per-model rates`, keyed by `ANTHROPIC_MODEL` (or the envelope's `model` field when present) and overriding the CLI's Anthropic-rate estimate |
 | (none + step-summary warning) | Backend isn't in the rate table; falling back to the CLI's value with a "may be approximate" annotation. Token counts stay accurate; dollars are approximate by however much the backend's pricing differs from Anthropic's |
+| `agent_envelope` | A non-Claude agent reported authoritative dollars itself (R-CLI's `usage` event carries `costUsd`), so its figure is used directly |
+| `unavailable` | The agent reports tokens but no dollars, and the endpoint host has no rate row — Outrider reports no cost rather than a fabricated `$0.00`. Token counts stay exact |
 
 When `ANTHROPIC_MODEL` names a model not in the host's rate row (e.g. a newly-released tier we haven't added yet), cost is computed at the host's default-tier rates (glm-5.2 for z.ai; kimi-k3 for Moonshot) — closer than nothing, but off by the tier delta (3-4x on tier pairs). Customers routing at a backend Outrider doesn't yet recognize see accurate token counts and a step-summary annotation flagging the cost approximation.
 
@@ -163,6 +167,79 @@ rm -f /tmp/key
 
 If the direct probe returns 200 but the action still gets 401, check whether Claude Code's bundled client has its own auth-config precedence (some versions may prefer cached OAuth credentials over env vars).
 
+
+
+<!-- BEGIN GENERATED: agent-axis (scripts/gen_backends_doc.py) -->
+
+## Coding agents (the `agent` input)
+
+`provider` selects a **model** backend; `agent` selects the **coding-agent CLI** that drives the implementation. They are separate axes, and each agent speaks exactly one model-API family — so which providers an agent can reach follows from that, rather than from a list someone maintains by hand.
+
+```
+agent --speaks--> API family <--serves-- provider
+```
+
+| `agent` | Speaks | Install |
+|---|---|---|
+| `backboard` | native-router | `BACKBOARD_INSTALL=<dir> curl -fsSL https://app.backboard.io/api/cli \| sh` |
+| `claude` | anthropic-messages | `npm install -g @anthropic-ai/claude-code` |
+| `codex` | openai-responses | `npm install -g @openai/codex` |
+
+Leave `agent` empty for Claude Code — every existing workflow keeps its exact behavior.
+
+### Which pairs work
+
+| `agent` | `provider` | Secret you set | Endpoint | Default model | Verified |
+|---|---|---|---|---|---|
+| `backboard` | `(any — agent-resolved)` | `BACKBOARD_API_KEY` | — | _(agent default)_ | yes |
+| `claude` | `anthropic` | `ANTHROPIC_API_KEY` | (vendor default) | _(agent default)_ | yes |
+| `claude` | `zai` | `ZAI_API_KEY` | https://api.z.ai/api/anthropic | glm-5.3 | yes |
+| `claude` | `moonshot` | `MOONSHOT_API_KEY` | https://api.moonshot.ai/anthropic | kimi-k3 | yes |
+| `claude` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |
+| `codex` | `openai` | `OPENAI_API_KEY` | (vendor default) | _(agent default)_ | yes |
+| `codex` | `zai` | `ZAI_API_KEY` | https://api.z.ai/api/paas/v4 | glm-5.3 | **not verified** |
+| `codex` | `moonshot` | `MOONSHOT_API_KEY` | https://api.moonshot.ai/v1 | kimi-k3 | yes |
+| `codex` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |
+
+"Verified" means a real run reached that vendor's endpoint end-to-end. An unverified pair still runs, but the action logs a warning naming the `provider: custom` + gateway workaround rather than claiming support it hasn't demonstrated.
+
+Two rejections are deliberate rather than missing: `agent: codex` with `provider: anthropic` fails because Anthropic serves the Messages API, not OpenAI Responses — and the reverse for `agent: claude` with `provider: openai`. Both errors name the agent that *does* serve the provider.
+
+This table and [`agent-matrix.json`](agent-matrix.json) are generated from the same registry, so they cannot drift from the code. The JSON is the machine-readable contract the `remyxai` CLI and the engine read.
+
+### Capabilities, and what happens when one is missing
+
+A backend may be partially capable and still usable — the affected telemetry degrades, the run does not fail.
+
+| Capability | `backboard` | `claude` | `codex` |
+|---|---|---|---|
+| `cost_usd` | yes | yes | — |
+| `guardrail_policy` | — | yes | — |
+| `oneshot_json` | yes | yes | yes |
+| `output_schema` | — | — | yes |
+| `stream_transcript` | yes | yes | yes |
+| `token_usage` | yes | yes | yes |
+| `turn_cap` | — | yes | — |
+| `web_research` | yes | yes | yes |
+
+| Missing | Effect on the run |
+|---|---|
+| `turn_cap` | `claude-timeout` becomes the only spend bound. Neither Codex nor R-CLI has a round-limit flag, so keep the timeout tight on cron-driven installs. |
+| `cost_usd` | Cost resolves from the per-host rate table instead of the CLI's own figure (`cost_basis: backend_rate_table`); with no rate row it reports `cost_basis: unavailable` rather than a fabricated `$0.00`. Token counts stay exact either way. |
+| `stream_transcript` | Selection coverage reports `basis: unavailable` and the coverage gate runs in `observe` mode, so a quiet agent is not punished for being quiet. |
+| `web_research` | The staged research phase is skipped; the coding session runs without web context. |
+| `guardrail_policy` | The injection-hardening tool gate that Claude Code runs get is **not** in effect, and the run logs a warning saying so. The post-hoc diff validators still apply. |
+| `output_schema` | Verdict passes fall back to extracting JSON from the model's prose. |
+
+### Model selection per agent
+
+All three agents take the same `model` input. R-CLI addresses models as `<provider>/<model>`, so the action composes `provider` and `model` into that form for you — `provider: openai` + `model: gpt-5.5` becomes `--model openai/gpt-5.5`. An already-qualified `model` is left alone.
+
+### Codex and Chat-Completions providers
+
+`codex exec` 0.151.0 removed Chat-Completions support: a provider must serve an OpenAI **Responses** endpoint. A Chat-only provider (or a local ollama) needs a translating gateway in front of it, reached via `provider: custom` plus `model-base-url`.
+
+<!-- END GENERATED: agent-axis -->
 
 ## Related
 

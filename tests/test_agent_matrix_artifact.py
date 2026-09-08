@@ -50,3 +50,25 @@ def test_pairs_name_their_secret():
     doc = json.loads(ARTIFACT.read_text())
     for pair in doc["pairs"]:
         assert pair["secret"], pair
+
+
+def test_backends_doc_agent_section_is_not_stale():
+    """docs/backends.md's agent tables are generated from the same registry.
+
+    The prose around them is hand-written; only the marked block is
+    generated, so the tables cannot drift while the explanation stays
+    editable.
+    """
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "gen_backends_doc.py"), "--check"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_backends_doc_documents_the_new_cost_basis_values():
+    """A reader hitting `unavailable` in telemetry must be able to look it
+    up; it is a value this branch introduced."""
+    doc = (ROOT / "docs" / "backends.md").read_text()
+    for value in ("agent_envelope", "unavailable"):
+        assert f"`{value}`" in doc, f"{value} undocumented"
