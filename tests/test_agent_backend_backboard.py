@@ -343,3 +343,104 @@ def test_web_search_is_available(backend):
     """Verified live: the agent reaches a web_search tool, so the staged
     research phase can run on this backend."""
     assert backend.can(Capability.WEB_RESEARCH)
+
+
+# ─── model preflight: fail in seconds, not two minutes ──────────────────────
+
+PROVIDERS_OK = {"providers": ["anthropic", "openai", "openrouter", "cerebras"]}
+OPENROUTER_MODELS = {"models": [
+    {"name": "~z-ai/glm-latest"}, {"name": "~z-ai/glm-flash-latest"},
+    {"name": "~anthropic/claude-fable-latest"},
+]}
+
+
+def _catalogue(monkeypatch, providers=PROVIDERS_OK, models=OPENROUTER_MODELS):
+    """Stub the catalogue so tests never touch the network."""
+    def fetch(url, key):
+        return providers if url.endswith("/providers") else models
+    monkeypatch.setattr(BackboardBackend, "_fetch", staticmethod(fetch))
+
+
+def test_a_model_from_another_agents_vocabulary_fails_fast(monkeypatch, backend):
+    """`provider: zai` + `model: glm-5.3` is the *Claude Code* vocabulary.
+
+    Left to the router this failed two minutes into the run with thousands of
+    model names echoed back. It now fails at preflight, naming the providers
+    that do exist and where z.ai models actually live.
+    """
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk")
+    monkeypatch.setenv("BACKBOARD_MODEL", "zai/glm-5.3")
+    _catalogue(monkeypatch)
+
+    ok, messages = backend.preflight()
+    assert not ok
+    blob = " ".join(messages)
+    assert "'zai' is not a Backboard provider" in blob
+    assert "openrouter" in blob, "must point at where z.ai models live"
+
+
+def test_a_valid_model_passes(monkeypatch, backend):
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk")
+    monkeypatch.setenv("BACKBOARD_MODEL", "openrouter/~z-ai/glm-latest")
+    _catalogue(monkeypatch)
+    assert backend.preflight() == (True, [])
+
+
+def test_an_unknown_model_suggests_near_matches(monkeypatch, backend):
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk")
+    monkeypatch.setenv("BACKBOARD_MODEL", "openrouter/glm-nope")
+    _catalogue(monkeypatch)
+    ok, messages = backend.preflight()
+    assert not ok
+    assert "glm" in " ".join(messages), "should surface the glm candidates"
+
+
+def test_an_unprefixed_model_warns_but_does_not_block(monkeypatch, backend):
+    """Composition normally supplies the prefix; a bare id reaching here is
+    worth flagging, but it is not worth failing a dispatch over."""
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk")
+    monkeypatch.setenv("BACKBOARD_MODEL", "glm-5.3")
+    _catalogue(monkeypatch)
+    ok, messages = backend.preflight()
+    assert ok
+    assert any("<provider>/<model>" in m for m in messages)
+
+
+def test_no_model_configured_skips_the_check(monkeypatch, backend):
+    """The account default is a legitimate choice and needs no validation."""
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk")
+    monkeypatch.delenv("BACKBOARD_MODEL", raising=False)
+    called = []
+    monkeypatch.setattr(
+        BackboardBackend, "_fetch",
+        staticmethod(lambda url, key: called.append(url)),
+    )
+    assert backend.preflight() == (True, [])
+    assert not called, "must not call the catalogue when no model is set"
+
+
+def test_an_unreachable_catalogue_never_blocks_a_run(monkeypatch, backend):
+    """A catalogue lookup must not be the reason a dispatch dies."""
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk")
+    monkeypatch.setenv("BACKBOARD_MODEL", "openrouter/~z-ai/glm-latest")
+    monkeypatch.setattr(
+        BackboardBackend, "_fetch", staticmethod(lambda url, key: None)
+    )
+    assert backend.preflight() == (True, [])
+
+
+def test_a_malformed_catalogue_response_never_blocks(monkeypatch, backend):
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk")
+    monkeypatch.setenv("BACKBOARD_MODEL", "openrouter/x")
+    monkeypatch.setattr(
+        BackboardBackend, "_fetch", staticmethod(lambda url, key: ["not", "a", "dict"])
+    )
+    assert backend.preflight() == (True, [])
+
+
+def test_missing_key_still_takes_precedence(monkeypatch, backend):
+    monkeypatch.delenv("BACKBOARD_API_KEY", raising=False)
+    monkeypatch.setenv("BACKBOARD_MODEL", "openrouter/~z-ai/glm-latest")
+    ok, messages = backend.preflight()
+    assert not ok
+    assert "BACKBOARD_API_KEY" in " ".join(messages)

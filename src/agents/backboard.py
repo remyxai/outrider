@@ -97,13 +97,86 @@ class BackboardBackend(AgentBackend):
         Capability.WEB_RESEARCH,
     })
 
+    #: Backboard's own catalogue. Queried at preflight so a bad model id
+    #: fails in seconds with a short suggestion list, instead of two minutes
+    #: in with the router echoing thousands of model names.
+    CATALOGUE_URL = "https://app.backboard.io/api/models"
+
     def preflight(self) -> tuple[bool, list[str]]:
-        if not (os.environ.get("BACKBOARD_API_KEY") or "").strip():
+        key = (os.environ.get("BACKBOARD_API_KEY") or "").strip()
+        if not key:
             return False, [
                 "agent=backboard requires BACKBOARD_API_KEY in the caller's "
                 "env block (browser `backboard login` cannot work on a runner)"
             ]
-        return True, []
+        model = (os.environ.get(self.model_env) or "").strip()
+        if not model:
+            return True, []
+        return self._validate_model(model, key)
+
+    def _validate_model(self, model: str, key: str) -> tuple[bool, list[str]]:
+        """Check a `<provider>/<model>` id against Backboard's catalogue.
+
+        Fails **soft** on anything ambiguous — a network blip, a shape we
+        don't recognise, an unreachable API — because a catalogue lookup must
+        never be the reason a dispatch dies. It only rejects on a definitive
+        "that provider/model is not in the catalogue", which is the common
+        case: an id written in another agent's vocabulary.
+
+        Note that catalogue presence does not guarantee routability (verified:
+        `cerebras/z-ai/glm-4.7` is listed but answers "No endpoints found"), so
+        this narrows the failure window rather than closing it.
+        """
+        if "/" not in model:
+            return True, [
+                f"model '{model}' has no provider prefix; Backboard addresses "
+                f"models as <provider>/<model>. Set the `provider` input, or "
+                f"pass the fully-qualified id."
+            ]
+        provider_id, _, bare = model.partition("/")
+        providers = self._fetch(f"{self.CATALOGUE_URL}/providers", key)
+        if not isinstance(providers, dict) or "providers" not in providers:
+            return True, []  # can't tell — let the run proceed
+        known = providers.get("providers") or []
+        if provider_id not in known:
+            return False, [
+                f"'{provider_id}' is not a Backboard provider. Available: "
+                + ", ".join(sorted(known))
+                + ". (Provider names differ per agent — z.ai models are "
+                  "reached through `openrouter` here, not `zai`.)"
+            ]
+        listing = self._fetch(f"{self.CATALOGUE_URL}?provider={provider_id}", key)
+        if not isinstance(listing, dict) or "models" not in listing:
+            return True, []
+        names = [m.get("name") for m in listing.get("models") or []
+                 if isinstance(m, dict)]
+        if bare in names:
+            return True, []
+        stem = bare.split("/")[-1].split("-")[0].lower()
+        near = [n for n in names if stem and stem in (n or "").lower()][:8]
+        hint = (" Closest under this provider: " + ", ".join(near)) if near else ""
+        return False, [
+            f"model '{bare}' is not in Backboard's `{provider_id}` catalogue."
+            + hint
+        ]
+
+    @staticmethod
+    def _fetch(url: str, key: str):
+        """GET one catalogue page. Returns None on any failure.
+
+        The API authenticates with `X-API-Key`; an `Authorization: Bearer`
+        header returns "Invalid or expired session".
+        """
+        import json as _json
+        import urllib.error
+        import urllib.request
+
+        try:
+            req = urllib.request.Request(url, headers={"X-API-Key": key})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return _json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            return None
 
     def routing(self, provider, family, model: str, base_url: str, env: dict):
         """R-CLI resolves models itself, so `provider` qualifies the model.
