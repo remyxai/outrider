@@ -231,3 +231,41 @@ def test_exec_failure_is_a_normal_agent_failure(monkeypatch, tmp_path):
     assert events == []
     assert "could not be started" in text
     assert "Argument list too long" in text
+
+
+# ─── defaults before any usage is recorded ──────────────────────────────────
+
+def test_cost_defaults_describe_the_configured_agent():
+    """A run that fails before any usage lands still reports telemetry.
+
+    Defaulting to Anthropic / claude_code_envelope would file a failed Codex
+    or R-CLI dispatch as Anthropic spend — the same mis-attribution the
+    success path had.
+    """
+    assert run._initial_cost_attribution(CodexBackend()) == (
+        "Codex", "unavailable",
+    )
+    label, basis = run._initial_cost_attribution(BackboardBackend())
+    assert "Backboard" in label and basis == "unavailable"
+
+
+def test_claude_cost_defaults_are_unchanged():
+    assert run._initial_cost_attribution(ClaudeCodeBackend()) == (
+        "Anthropic", "claude_code_envelope",
+    )
+    assert run._RUN_COST["model_backend"] == "Anthropic"
+    assert run._RUN_COST["cost_basis"] == "claude_code_envelope"
+
+
+def test_guardrail_note_is_logged_once_per_run(monkeypatch, caplog):
+    """A dispatch makes half a dozen agent calls; repeating the warning on
+    each one buries the rest of the log."""
+    import logging
+
+    monkeypatch.setattr(run, "_BACKEND", CodexBackend())
+    monkeypatch.setattr(run, "_GUARDRAIL_NOTE_LOGGED", False)
+    with caplog.at_level(logging.WARNING):
+        for _ in range(4):
+            run._agent_base_cmd()
+    notes = [r for r in caplog.records if "guardrail policy" in r.getMessage()]
+    assert len(notes) == 1

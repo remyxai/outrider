@@ -1,15 +1,21 @@
 """OpenAI Codex adapter.
 
-**Fixture provenance.** Unlike the Backboard tests, these transcripts are
-*synthesized*, not captured: this machine has codex-cli 0.151.0 installed but
-not authenticated, so no live session could be recorded. The event names,
-item types and usage field names below were read out of the shipped binary's
-strings (``turn.completed``, ``turn.failed``, ``item.completed``,
-``command_execution``, ``file_change``, ``agent_message``, ``web_search``,
-``input_tokens``, ``cached_input_tokens``, ``reasoning_output_tokens``), and
-the flags from ``codex exec --help``. The *nesting* of those fields is the
-part that is inferred rather than observed, so a first live run should be
-diffed against these fixtures before the backend is trusted in production.
+**Fixture provenance.** Mixed, and the difference is called out per test.
+
+``turn_failed_no_credits.jsonl`` is a *real* codex-cli 0.151.0 transcript:
+the CLI accepts ``CODEX_API_KEY`` and reached the API, which then refused for
+lack of org credits. It confirms the envelope shapes first-hand —
+``thread.started`` carries ``thread_id``, ``turn.started`` is bare,
+``turn.failed`` nests ``error.message``, and an item is keyed ``type`` (not
+``item_type``).
+
+The success-path transcripts below are still *synthesized*, because no run
+has yet completed a turn. Their event names, item types and usage field names
+were read out of the shipped binary's strings and their item key corrected
+against the real capture — but the success-item nesting
+(``command_execution``, ``file_change``, ``agent_message`` payloads) remains
+inferred. Diff it against a first billed run before trusting Codex cost
+numbers in production.
 """
 import json
 import sys
@@ -31,14 +37,14 @@ SESSION = jsonl(
     {"type": "thread.started", "thread_id": "0199a213-81c0-7800-8aa1"},
     {"type": "turn.started"},
     {"type": "item.completed", "item": {
-        "id": "it_1", "item_type": "command_execution",
+        "id": "it_1", "type": "command_execution",
         "command": "ls src",
         "aggregated_output": "calc.py\nmul.py\n"}},
     {"type": "item.completed", "item": {
-        "id": "it_2", "item_type": "file_change",
+        "id": "it_2", "type": "file_change",
         "changes": [{"path": "src/mul.py", "kind": "add"}]}},
     {"type": "item.completed", "item": {
-        "id": "it_3", "item_type": "agent_message",
+        "id": "it_3", "type": "agent_message",
         "text": "Added src/mul.py."}},
     {"type": "turn.completed", "usage": {
         "input_tokens": 5473, "cached_input_tokens": 4608,
@@ -204,3 +210,45 @@ def test_output_schema_is_available(backend):
 def test_unguarded_run_is_surfaced(backend):
     assert not backend.can(Capability.GUARDRAIL_POLICY)
     assert "codex" in (backend.guardrail_note() or "")
+
+
+# ─── real transcript: auth works, the org had no credits ────────────────────
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "agents" / "codex"
+
+
+def real(name: str) -> str:
+    return (FIXTURES / f"{name}.jsonl").read_text()
+
+
+def test_real_turn_failed_is_parsed(backend):
+    """Captured from codex-cli 0.151.0 against the live API."""
+    result = backend.parse(1, real("turn_failed_no_credits"), "")
+    assert result is not None
+    assert not result.ok
+
+
+def test_real_failure_surfaces_an_actionable_cause(backend):
+    """The operator needs the billing cause, not a generic non-zero exit."""
+    result = backend.parse(1, real("turn_failed_no_credits"), "")
+    assert "no credits remaining" in result.text.lower()
+
+
+def test_no_usage_is_claimed_for_a_failed_turn(backend):
+    """A turn that never completed has no tokens to account."""
+    result = backend.parse(1, real("turn_failed_no_credits"), "")
+    assert result.usage_envelopes == []
+
+
+def test_transient_error_events_do_not_crash_the_parser(backend):
+    """The real stream carries top-level {"type":"error"} retry events and an
+    item.completed whose item type is "error" — neither is modeled, and
+    neither may break parsing."""
+    import json as _json
+
+    types = {
+        _json.loads(line).get("type")
+        for line in real("turn_failed_no_credits").splitlines() if line.strip()
+    }
+    assert "error" in types
+    assert backend.parse(1, real("turn_failed_no_credits"), "") is not None

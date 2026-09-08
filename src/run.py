@@ -178,6 +178,11 @@ def _mark_bundle_gitignored(workdir) -> None:
 # recognizable cause. Currently Anthropic-only; when alternative agent CLIs
 # land, these become a per-agent lookup (`_AGENT_URLS = {"claude": ...,
 # "aider": ...}`) keyed by the agent type recorded in the result dict.
+# The active coding-agent backend, resolved once at startup from the `agent`
+# action input. Unset resolves to Claude Code, so every pre-port run keeps its
+# exact argv and env — the invariant pinned by test_agent_backend_invariant.py.
+_BACKEND = _resolve_agent(os.environ.get("INPUT_AGENT"))
+
 _ANTHROPIC_BILLING_URL = "https://console.anthropic.com/settings/billing"
 _ANTHROPIC_KEYS_URL = "https://console.anthropic.com/settings/keys"
 
@@ -7422,6 +7427,19 @@ def write_spec_bundle(
 # Per-run token/cost totals, accumulated across every `claude` call in a
 # run (pre-flight, selection, implementation, self-review) and surfaced in
 # the RUN SUMMARY + $GITHUB_OUTPUT.
+def _initial_cost_attribution(backend) -> tuple[str, str]:
+    """Starting ``(model_backend, cost_basis)`` for a run on ``backend``.
+
+    Only meaningful when a run ends before any usage envelope is recorded —
+    an auth failure, a missing binary, an oversized prompt. Claude Code keeps
+    its historical defaults; any other agent starts at "unavailable" rather
+    than claiming Anthropic spend it never made.
+    """
+    if backend.name == "claude":
+        return "Anthropic", "claude_code_envelope"
+    return backend.cost_label(), "unavailable"
+
+
 _RUN_COST = {
     "cost_usd": 0.0,
     "input_tokens": 0,
@@ -7436,8 +7454,11 @@ _RUN_COST = {
     # rate card, or "claude_code_envelope" when we trusted the CLI's
     # total_cost_usd field (correct for Anthropic, approximate for
     # unknown backends).
-    "model_backend": "Anthropic",
-    "cost_basis": "claude_code_envelope",
+    # Defaults describe the *configured* agent, not Claude Code: a run that
+    # fails before any usage is recorded would otherwise report a Codex or
+    # R-CLI failure as Anthropic spend. See _initial_cost_attribution.
+    "model_backend": _initial_cost_attribution(_BACKEND)[0],
+    "cost_basis": _initial_cost_attribution(_BACKEND)[1],
     # Number of `--output-format json` envelopes that parsed cleanly,
     # were not error envelopes, but carried no input/output token counts.
     # Observed against some non-Anthropic backends where the CLI's
@@ -7765,11 +7786,6 @@ def _record_claude_usage(env: dict) -> None:
 # explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
 # wildcards — future Anthropic env vars may carry telemetry tokens the
 # agent shouldn't see verbatim.
-# The active coding-agent backend, resolved once at startup from the `agent`
-# action input. Unset resolves to Claude Code, so every pre-port run keeps its
-# exact argv and env — the invariant pinned by test_agent_backend_invariant.py.
-_BACKEND = _resolve_agent(os.environ.get("INPUT_AGENT"))
-
 # Back-compat alias: this tuple was module-level in run.py before the agent
 # port and tests assert on it directly. The whitelist and its security
 # rationale now live on the backend that owns those auth vars.
@@ -7787,6 +7803,9 @@ def _claude_subprocess_env() -> dict[str, str]:
     return _BACKEND.subprocess_env()
 
 
+_GUARDRAIL_NOTE_LOGGED = False
+
+
 def _agent_base_cmd() -> list[str]:
     """argv prefix for the active backend, including its guardrail policy.
 
@@ -7799,10 +7818,14 @@ def _agent_base_cmd() -> list[str]:
     A backend that can't express such a policy is not silently accepted: the
     note is logged loudly so an unguarded run is visible in the job log.
     """
+    global _GUARDRAIL_NOTE_LOGGED
     cmd = _BACKEND.base_cmd()
     note = _BACKEND.guardrail_note()
-    if note:
+    if note and not _GUARDRAIL_NOTE_LOGGED:
+        # Once per run, not once per invocation — a dispatch makes half a
+        # dozen agent calls and repeating this buries the rest of the log.
         log.warning("\u26a0 %s", note)
+        _GUARDRAIL_NOTE_LOGGED = True
     return cmd
 
 
