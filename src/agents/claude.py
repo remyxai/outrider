@@ -77,6 +77,7 @@ class ClaudeCodeBackend(AgentBackend):
     # orchestrator holds its own token separately (clone/push unaffected); the
     # agent's `gh` reads use unauthenticated access (fine for public repos).
 
+    skills_home = ".claude/skills"
     api_family = ApiFamily.ANTHROPIC_MESSAGES
     key_env = "ANTHROPIC_API_KEY"
     base_url_env = "ANTHROPIC_BASE_URL"
@@ -93,6 +94,13 @@ class ClaudeCodeBackend(AgentBackend):
         Capability.WEB_RESEARCH,
         Capability.GUARDRAIL_POLICY,
     })
+
+    def tool_invocation_hint(self, executable: str) -> str:
+        return (
+            f"Available as a Claude Code skill and as `{executable}` on the "
+            f"shell; invocable via the /{executable} slash command or "
+            f"ambiently."
+        )
 
     # ── model routing ─────────────────────────────────────────────────────
 

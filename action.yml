@@ -599,56 +599,50 @@ runs:
         install -m 0755 "${{ github.action_path }}/src/gh_graph.py" /usr/local/bin/gh-graph
         gh-graph --selftest
 
-    - name: Install cocoindex-code as Claude Code skill
-      if: ${{ inputs.enable-cocoindex == 'true' }}
+    - name: Install cocoindex-code AST search
       shell: bash
-      # Attach cocoindex-code as a Claude Code skill so the Outrider agent
-      # can perform AST-based semantic code search during selection and
-      # implementation, and so the convention-precedents enrichment on
-      # Issue bodies has ccc on PATH to enumerate structural precedents
-      # for sibling claims. Costs ~60-90s runner time on install; free
-      # thereafter. Set enable-cocoindex=false to skip.
-      #
-      # Idempotent — if the workflow already installed cocoindex (older
-      # setup-local flow from v0.4.4), the `command -v` guard skips the
-      # duplicate install.
+      # The `ccc` binary is the portable surface: every agent has a shell
+      # tool, so a binary on PATH works for all of them. The skill wrapper is
+      # agent-native and only installed where the agent actually reads one —
+      # the backend declares that via `skills_home`.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
       run: |
+        set -eu
         if ! command -v ccc >/dev/null 2>&1; then
           pipx install 'cocoindex-code[full]'
         fi
-        mkdir -p ~/.claude/skills
-        if [ ! -e ~/.claude/skills/cocoindex-code ]; then
-          git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
-          ln -sfn /tmp/cocoindex-code ~/.claude/skills/cocoindex-code
+        SKILLS_HOME=$(python "${{ github.action_path }}/src/agent_tooling.py" --skills-home)
+        if [ -n "$SKILLS_HOME" ]; then
+          mkdir -p "$HOME/$SKILLS_HOME"
+          if [ ! -e "$HOME/$SKILLS_HOME/cocoindex-code" ]; then
+            git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
+            ln -sfn /tmp/cocoindex-code "$HOME/$SKILLS_HOME/cocoindex-code"
+          fi
+          echo "installed cocoindex-code skill into ~/$SKILLS_HOME"
+        else
+          echo "agent has no skills mechanism — ccc is reachable on PATH only"
         fi
-        # Sanity check that ccc is on PATH. `ccc --version` would need a
-        # dedicated version flag that the typer app doesn't expose (raises
-        # a red "No such option" error box that scares readers even when
+        # `ccc --version` needs a flag the typer app doesn't expose (it
+        # raises a red "No such option" box that scares readers even when
         # suppressed). `command -v` is quiet and definitive.
-        command -v ccc >/dev/null 2>&1 && echo "ccc installed: $(command -v ccc)" || echo "warning: ccc not on PATH after install"
+        command -v ccc >/dev/null 2>&1 && echo "ccc on PATH" || echo "WARNING: ccc missing"
 
     - name: Write ENVIRONMENTS.md so the selection agent knows ccc is available
-      if: ${{ inputs.enable-cocoindex == 'true' }}
       shell: bash
-      # ENVIRONMENTS.md is read by the selection pass in run.py to surface
-      # workflow-attached tooling to the agent. Written to CWD (the target
-      # repo checkout) so the selection agent picks it up during the same
-      # run. Not committed — this is a runtime file only.
-      #
-      # Only writes when no ENVIRONMENTS.md exists — respects a
-      # user-customized file listing additional workflow-attached tools.
+      # The surface text names the invocation path the ACTIVE agent actually
+      # has. Telling Codex or R-CLI about a "/ccc slash command" sends them
+      # looking for a command they cannot run.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
       run: |
+        set -eu
         if [ ! -f ENVIRONMENTS.md ]; then
-          cat > ENVIRONMENTS.md <<'EOF'
-        - title: cocoindex-code AST search available
-          description: cocoindex-code AST-based semantic code search is pre-installed as a Claude Code skill.
-          resource: https://github.com/cocoindex-io/cocoindex-code
-          tags: [outrider, environment, cocoindex-code, ast-search]
-          surface: |
-            # Environment: cocoindex-code AST search
-            - Available as a Claude Code skill for grounding call-site claims on real AST paths.
-            - Invocable via /ccc slash command or ambient use during selection/implementation.
-        EOF
+          python "${{ github.action_path }}/src/agent_tooling.py" \
+            --environments-md > ENVIRONMENTS.md
+          echo "wrote ENVIRONMENTS.md for agent=${INPUT_AGENT:-claude}"
+        else
+          echo "ENVIRONMENTS.md already present — leaving the repo's own file"
         fi
 
     - name: Configure git identity

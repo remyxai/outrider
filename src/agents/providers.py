@@ -173,19 +173,23 @@ def providers_for(family: ApiFamily) -> list[str]:
     return [p.id for p in PROVIDERS.values() if p.serves(family)]
 
 
-def compatibility_matrix(agents: dict[str, ApiFamily]) -> list[dict]:
+def compatibility_matrix(agents: dict) -> list[dict]:
     """Every valid (agent, provider) pair, derived — not hand-written.
 
-    ``agents`` maps agent name -> the family it speaks. Used by the docs
-    generator and by the tests that keep documentation honest.
+    ``agents`` maps agent name -> its backend. Used by the docs generator and
+    by the tests that keep the published matrix honest.
     """
     rows: list[dict] = []
-    for agent, family in sorted(agents.items()):
+    for agent, backend in sorted(agents.items()):
+        family = backend.api_family
         if family is ApiFamily.NATIVE_ROUTER:
             rows.append({
                 "agent": agent, "provider": "(any — agent-resolved)",
                 "family": family.value, "endpoint": "",
-                "secret": "", "default_model": "", "verified": True,
+                # A consumer still has to tell the user which secret to set,
+                # and for a native router that is the agent's own key.
+                "secret": backend.key_env,
+                "default_model": "", "verified": True,
             })
             continue
         for pid in providers_for(family):

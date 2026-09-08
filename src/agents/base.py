@@ -187,6 +187,23 @@ class AgentBackend:
             f"apply."
         )
 
+    # ── tool surface ──────────────────────────────────────────────────────
+
+    #: Directory this CLI loads packaged "skills" from, relative to $HOME.
+    #: None when the agent has no such mechanism — the tool is then reachable
+    #: only as a plain executable through the agent's shell tool.
+    skills_home: str | None = None
+
+    def tool_invocation_hint(self, executable: str) -> str:
+        """How to tell *this* agent to use an out-of-band tool.
+
+        Every backend has a shell/execute tool, so a binary on PATH is the
+        portable surface. Agent-native wrappers (a Claude Code skill, a slash
+        command) are not, and describing one to an agent that has no such
+        mechanism sends it looking for a command it cannot run.
+        """
+        return f"Run `{executable}` from the shell."
+
     # ── model routing ─────────────────────────────────────────────────────
 
     #: The wire protocol this CLI speaks to its model backend. Set by every

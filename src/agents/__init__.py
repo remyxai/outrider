@@ -46,7 +46,7 @@ for _cls in _REGISTRY.values():
 def agent_matrix() -> list[dict]:
     """Every valid (agent, provider) pair, derived from the registries."""
     return compatibility_matrix(
-        {cls.name: cls.api_family for cls in _REGISTRY.values()}
+        {cls.name: cls() for cls in _REGISTRY.values()}
     )
 
 

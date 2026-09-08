@@ -1,0 +1,208 @@
+{
+  "_generated_by": "scripts/gen_agent_matrix.py \u2014 do not hand-edit",
+  "agents": {
+    "backboard": {
+      "display_name": "Backboard R-CLI",
+      "api_family": "native-router",
+      "install": "BACKBOARD_INSTALL=<dir> curl -fsSL https://app.backboard.io/api/cli | sh",
+      "key_env": "BACKBOARD_API_KEY",
+      "base_url_env": "BACKBOARD_API_URL",
+      "model_env": "BACKBOARD_MODEL",
+      "skills_home": null,
+      "capabilities": [
+        "cost_usd",
+        "oneshot_json",
+        "stream_transcript",
+        "token_usage",
+        "web_research"
+      ]
+    },
+    "claude": {
+      "display_name": "Claude Code",
+      "api_family": "anthropic-messages",
+      "install": "npm install -g @anthropic-ai/claude-code",
+      "key_env": "ANTHROPIC_API_KEY",
+      "base_url_env": "ANTHROPIC_BASE_URL",
+      "model_env": "ANTHROPIC_MODEL",
+      "skills_home": ".claude/skills",
+      "capabilities": [
+        "cost_usd",
+        "guardrail_policy",
+        "oneshot_json",
+        "stream_transcript",
+        "token_usage",
+        "turn_cap",
+        "web_research"
+      ]
+    },
+    "codex": {
+      "display_name": "Codex",
+      "api_family": "openai-responses",
+      "install": "npm install -g @openai/codex",
+      "key_env": "CODEX_API_KEY",
+      "base_url_env": "CODEX_BASE_URL",
+      "model_env": "CODEX_MODEL",
+      "skills_home": null,
+      "capabilities": [
+        "oneshot_json",
+        "output_schema",
+        "stream_transcript",
+        "token_usage",
+        "web_research"
+      ]
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "display_name": "Anthropic",
+      "secret_env": "ANTHROPIC_API_KEY",
+      "families": {
+        "anthropic-messages": ""
+      },
+      "default_model": {},
+      "verified": [
+        "anthropic-messages"
+      ],
+      "caller_supplied_endpoint": false
+    },
+    "openai": {
+      "display_name": "OpenAI",
+      "secret_env": "OPENAI_API_KEY",
+      "families": {
+        "openai-responses": ""
+      },
+      "default_model": {},
+      "verified": [
+        "openai-responses"
+      ],
+      "caller_supplied_endpoint": false
+    },
+    "zai": {
+      "display_name": "z.ai (GLM)",
+      "secret_env": "ZAI_API_KEY",
+      "families": {
+        "anthropic-messages": "https://api.z.ai/api/anthropic",
+        "openai-responses": "https://api.z.ai/api/paas/v4"
+      },
+      "default_model": {
+        "anthropic-messages": "glm-5.3",
+        "openai-responses": "glm-5.3"
+      },
+      "verified": [
+        "anthropic-messages"
+      ],
+      "caller_supplied_endpoint": false
+    },
+    "moonshot": {
+      "display_name": "Moonshot (Kimi)",
+      "secret_env": "MOONSHOT_API_KEY",
+      "families": {
+        "anthropic-messages": "https://api.moonshot.ai/anthropic",
+        "openai-responses": "https://api.moonshot.ai/v1"
+      },
+      "default_model": {
+        "anthropic-messages": "kimi-k3",
+        "openai-responses": "kimi-k3"
+      },
+      "verified": [
+        "anthropic-messages",
+        "openai-responses"
+      ],
+      "caller_supplied_endpoint": false
+    },
+    "custom": {
+      "display_name": "Custom endpoint",
+      "secret_env": "",
+      "families": {
+        "anthropic-messages": "",
+        "openai-responses": ""
+      },
+      "default_model": {},
+      "verified": [],
+      "caller_supplied_endpoint": true
+    }
+  },
+  "pairs": [
+    {
+      "agent": "backboard",
+      "provider": "(any \u2014 agent-resolved)",
+      "family": "native-router",
+      "endpoint": "",
+      "secret": "BACKBOARD_API_KEY",
+      "default_model": "",
+      "verified": true
+    },
+    {
+      "agent": "claude",
+      "provider": "anthropic",
+      "family": "anthropic-messages",
+      "endpoint": "(vendor default)",
+      "secret": "ANTHROPIC_API_KEY",
+      "default_model": "",
+      "verified": true
+    },
+    {
+      "agent": "claude",
+      "provider": "zai",
+      "family": "anthropic-messages",
+      "endpoint": "https://api.z.ai/api/anthropic",
+      "secret": "ZAI_API_KEY",
+      "default_model": "glm-5.3",
+      "verified": true
+    },
+    {
+      "agent": "claude",
+      "provider": "moonshot",
+      "family": "anthropic-messages",
+      "endpoint": "https://api.moonshot.ai/anthropic",
+      "secret": "MOONSHOT_API_KEY",
+      "default_model": "kimi-k3",
+      "verified": true
+    },
+    {
+      "agent": "claude",
+      "provider": "custom",
+      "family": "anthropic-messages",
+      "endpoint": "(vendor default)",
+      "secret": "(agent's own)",
+      "default_model": "",
+      "verified": false
+    },
+    {
+      "agent": "codex",
+      "provider": "openai",
+      "family": "openai-responses",
+      "endpoint": "(vendor default)",
+      "secret": "OPENAI_API_KEY",
+      "default_model": "",
+      "verified": true
+    },
+    {
+      "agent": "codex",
+      "provider": "zai",
+      "family": "openai-responses",
+      "endpoint": "https://api.z.ai/api/paas/v4",
+      "secret": "ZAI_API_KEY",
+      "default_model": "glm-5.3",
+      "verified": false
+    },
+    {
+      "agent": "codex",
+      "provider": "moonshot",
+      "family": "openai-responses",
+      "endpoint": "https://api.moonshot.ai/v1",
+      "secret": "MOONSHOT_API_KEY",
+      "default_model": "kimi-k3",
+      "verified": true
+    },
+    {
+      "agent": "codex",
+      "provider": "custom",
+      "family": "openai-responses",
+      "endpoint": "(vendor default)",
+      "secret": "(agent's own)",
+      "default_model": "",
+      "verified": false
+    }
+  ]
+}

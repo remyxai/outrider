@@ -264,3 +264,40 @@ def test_install_step_is_the_only_remaining_per_agent_branch():
         if "case \"${INPUT_AGENT" in s.get("run", "")
     ]
     assert branchy == ["Install the coding-agent CLI"]
+
+
+# ─── out-of-band tooling is agent-aware ─────────────────────────────────────
+
+def test_only_agents_with_a_skills_mechanism_declare_one():
+    """Installing a skill into ~/.claude/skills for a Codex run wastes a
+    clone and leaves the tool unreachable by the advertised route."""
+    assert resolve("claude").skills_home == ".claude/skills"
+    assert resolve("codex").skills_home is None
+    assert resolve("backboard").skills_home is None
+
+
+def test_invocation_hint_never_promises_a_route_the_agent_lacks():
+    """ENVIRONMENTS.md told every agent ccc was "invocable via /ccc slash
+    command". For Codex and R-CLI that is a command they cannot run, and the
+    failure looks like the model ignoring an instruction."""
+    claude_hint = resolve("claude").tool_invocation_hint("ccc")
+    assert "slash command" in claude_hint
+
+    for name in ("codex", "backboard"):
+        hint = resolve(name).tool_invocation_hint("ccc")
+        assert "slash command" not in hint
+        assert "skill" not in hint.lower()
+        # The portable surface: every agent has a shell tool.
+        assert "shell" in hint.lower()
+
+
+def test_tool_steps_ask_the_backend_rather_than_hardcoding_claude():
+    steps = _action_yaml()["runs"]["steps"]
+    bodies = {s.get("name", ""): s.get("run", "") for s in steps}
+    ccc = next(v for k, v in bodies.items() if "cocoindex" in k)
+    assert "agent_tooling.py" in ccc
+    assert ".claude/skills" not in ccc, "skills path must come from the backend"
+
+    envmd = next(v for k, v in bodies.items() if "ENVIRONMENTS.md" in k)
+    assert "agent_tooling.py" in envmd
+    assert "Claude Code skill" not in envmd
