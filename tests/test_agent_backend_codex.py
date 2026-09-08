@@ -1,21 +1,28 @@
 """OpenAI Codex adapter.
 
-**Fixture provenance.** Mixed, and the difference is called out per test.
+**Fixture provenance: all captured, none inferred.** Every ``*_live.jsonl``
+in ``tests/fixtures/agents/codex/`` is verbatim stdout from codex-cli 0.151.0
+against the real API:
 
-``turn_failed_no_credits.jsonl`` is a *real* codex-cli 0.151.0 transcript:
-the CLI accepts ``CODEX_API_KEY`` and reached the API, which then refused for
-lack of org credits. It confirms the envelope shapes first-hand —
-``thread.started`` carries ``thread_id``, ``turn.started`` is bare,
-``turn.failed`` nests ``error.message``, and an item is keyed ``type`` (not
-``item_type``).
+* ``turn_failed_no_credits`` — the failure envelope (``turn.failed`` nesting
+  ``error.message``, plus the top-level ``{"type":"error"}`` retry events).
+* ``turn_completed_live`` — the success path: ``command_execution`` with
+  ``command`` / ``aggregated_output`` / ``exit_code`` / ``status``, two
+  ``agent_message`` items (a preamble and the answer), and ``turn.completed``
+  usage.
+* ``file_change_live`` — a patch-tool write, which the model only emits when
+  told not to use bash; left to itself it writes files with a shell heredoc,
+  so this shape needed forcing to observe.
 
-The success-path transcripts below are still *synthesized*, because no run
-has yet completed a turn. Their event names, item types and usage field names
-were read out of the shipped binary's strings and their item key corrected
-against the real capture — but the success-item nesting
-(``command_execution``, ``file_change``, ``agent_message`` payloads) remains
-inferred. Diff it against a first billed run before trusting Codex cost
-numbers in production.
+Runs were kept deliberately cheap — ``gpt-5-nano`` at ``model_reasoning_effort
+= "low"`` with web search off, on a two-file repo. The point was to verify
+message passing and event shapes, not model quality; the whole exercise cost
+under a cent. Note ``minimal`` effort is rejected outright because Codex
+enables a ``web_search`` tool that is incompatible with it.
+
+The synthesized ``SESSION`` constant is retained below only as a compact
+fixture for the mapping unit tests; every shape in it is now corroborated by
+a captured transcript.
 """
 import json
 import sys
@@ -315,3 +322,121 @@ def test_unknown_host_is_its_own_series(monkeypatch):
 
 def test_base_url_is_whitelisted(backend):
     assert "CODEX_BASE_URL" in backend.env_whitelist()
+
+
+# ─── captured success path ──────────────────────────────────────────────────
+
+def test_live_success_transcript_parses(backend):
+    result = backend.parse(0, real("turn_completed_live"), "")
+    assert result is not None and result.ok
+
+
+def test_final_message_is_the_last_agent_message_not_the_preamble(backend):
+    """The model narrates before acting ("I'm going to list the src
+    directory..."), so taking the first agent_message would return the plan
+    instead of the answer."""
+    result = backend.parse(0, real("turn_completed_live"), "")
+    assert result.text == "DONE"
+
+
+def test_live_usage_matches_the_captured_numbers(backend):
+    result = backend.parse(0, real("turn_completed_live"), "")
+    usage = result.usage_envelopes[0]["usage"]
+    assert usage["input_tokens"] == 39075
+    assert usage["cache_read_input_tokens"] == 25984
+    # 502 output + 320 reasoning, folded because reasoning bills as output.
+    assert usage["output_tokens"] == 822
+
+
+def test_started_and_completed_items_are_not_double_counted(backend):
+    """command_execution fires item.started then item.completed with the same
+    id; counting both would double every tool call in the coverage stats."""
+    import json as _json
+
+    starts = sum(
+        1 for line in real("turn_completed_live").splitlines()
+        if line.strip() and _json.loads(line).get("type") == "item.started"
+    )
+    assert starts >= 1, "fixture must contain an item.started to be meaningful"
+
+    result = backend.parse(0, real("turn_completed_live"), "", stream=True)
+    uses = [e for e in result.events if e.kind == "tool_use"]
+    assert len(uses) == 1
+
+
+def test_live_shell_command_is_captured(backend):
+    result = backend.parse(0, real("turn_completed_live"), "", stream=True)
+    execs = [e for e in result.events if e.tool == "execute"]
+    assert execs and "ls src" in execs[0].command
+
+
+# ─── captured file_change ───────────────────────────────────────────────────
+
+def test_live_file_change_paths_are_extracted(backend):
+    result = backend.parse(0, real("file_change_live"), "", stream=True)
+    writes = [e for e in result.events if e.tool == "write"]
+    assert writes, "the capture creates a file via the patch tool"
+    assert writes[0].paths and writes[0].paths[0].endswith("src/cube.py")
+
+
+def test_live_file_change_paths_are_absolute(backend):
+    """Codex reports absolute paths, which is why _run_agent relativizes.
+
+    Left as-is the exploration parser buckets the whole run under `tmp`
+    instead of `src`; this pins the input side of that fix.
+    """
+    result = backend.parse(0, real("file_change_live"), "", stream=True)
+    writes = [e for e in result.events if e.tool == "write"]
+    assert writes[0].paths[0].startswith("/")
+
+
+# ─── a run that answers "done" having done nothing ──────────────────────────
+
+def test_failed_commands_are_surfaced_as_diagnostics(backend):
+    """Captured live: every shell command exited 1 and the model still
+    replied DONE, leaving no diff.
+
+    The cause was a weak model mangling its own tool-call escaping, but the
+    shape of the failure is what matters — Codex's turn.completed does not
+    reflect tool failure, so without this the operator sees an unexplained
+    empty changeset.
+    """
+    result = backend.parse(0, real("all_commands_failed_live"), "", stream=True)
+    assert result.text == "DONE"
+    assert result.diagnostics, "a silently-empty run must state its cause"
+    note = result.diagnostics[0]
+    assert "exited non-zero" in note
+    assert "empty" in note
+
+
+def test_failed_commands_do_not_fail_the_run(backend):
+    """A non-zero exit is often legitimate — a grep with no match, a test the
+    agent is diagnosing. Failing the run on it would be wrong."""
+    result = backend.parse(0, real("all_commands_failed_live"), "")
+    assert result.ok
+
+
+def test_diagnostics_stay_out_of_the_answer_text(backend):
+    """Several passes parse `text` as a JSON verdict, so notes must never be
+    mixed into it."""
+    result = backend.parse(0, real("all_commands_failed_live"), "")
+    assert "exited non-zero" not in result.text
+
+
+def test_healthy_run_has_no_diagnostics(backend):
+    assert backend.parse(0, real("turn_completed_live"), "").diagnostics == []
+
+
+def test_inaccessible_model_surfaces_an_actionable_404(backend):
+    """Verified live against two models this org cannot reach: the message
+    names the model and the fix, rather than a bare non-zero exit."""
+    transcript = jsonl(
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"},
+        {"type": "turn.failed", "error": {"message": (
+            "unexpected status 404 Not Found: The model `gpt-5.1-codex-mini` "
+            "does not exist or you do not have access to it.")}},
+    )
+    result = backend.parse(1, transcript, "")
+    assert not result.ok
+    assert "do not have access" in result.text

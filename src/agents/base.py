@@ -140,6 +140,10 @@ class AgentResult:
     #: Normalized transcript; empty when STREAM_TRANSCRIPT is absent or the
     #: caller didn't ask for it.
     events: list[Event] = field(default_factory=list)
+    #: Operator-facing notes about the run that are NOT part of the agent's
+    #: answer — kept out of ``text`` because several passes parse that as a
+    #: JSON verdict. The orchestrator logs these.
+    diagnostics: list[str] = field(default_factory=list)
 
 
 class AgentBackend:

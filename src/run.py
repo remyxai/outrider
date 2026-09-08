@@ -7943,6 +7943,8 @@ def _run_agent(
             ),
             [],
         )
+    for note in result.diagnostics:
+        log.warning("  \u26a0 agent: %s", note)
     for envelope in result.usage_envelopes:
         _record_claude_usage(envelope)
     return result.ok, result.text, _relativize_events(result.events, cwd)

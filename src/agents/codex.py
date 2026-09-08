@@ -181,6 +181,7 @@ class CodexBackend(AgentBackend):
         turns = 0
         turn_index = 0
         saw_usage = False
+        failed_commands: list[str] = []
         norm: list[Event] = []
 
         for ev in raw:
@@ -217,6 +218,19 @@ class CodexBackend(AgentBackend):
                 if item_type == "agent_message" and etype == "item.completed":
                     text = item.get("text") or text
                 elif etype == "item.completed":
+                    if item_type == "command_execution":
+                        # A non-zero exit is often legitimate (a grep with no
+                        # match, a test the agent is diagnosing), so this does
+                        # NOT fail the run. But when every command fails the
+                        # agent can still answer "done" and leave no diff, and
+                        # the operator deserves the reason rather than an
+                        # unexplained empty changeset.
+                        code = item.get("exit_code")
+                        if isinstance(code, int) and code != 0:
+                            failed_commands.append(
+                                f"exit {code}: "
+                                f"{str(item.get('command') or '')[:160]}"
+                            )
                     norm.extend(
                         _normalize_item(item_type, item, turn_index)
                     )
@@ -238,9 +252,18 @@ class CodexBackend(AgentBackend):
                 "is_error": not ok,
             })
 
+        diagnostics: list[str] = []
+        if failed_commands:
+            diagnostics.append(
+                f"{len(failed_commands)} shell command(s) exited non-zero; "
+                f"if the diff is empty this is why: "
+                + " | ".join(failed_commands[:3])
+            )
+
         return AgentResult(
             ok=ok, text=text, usage_envelopes=envelopes,
             events=norm if stream else [],
+            diagnostics=diagnostics,
         )
 
 
