@@ -110,6 +110,17 @@
       ],
       "caller_supplied_endpoint": false
     },
+    "openrouter": {
+      "display_name": "OpenRouter",
+      "secret_env": "OPENROUTER_API_KEY",
+      "families": {
+        "anthropic-messages": "https://openrouter.ai/api",
+        "openai-responses": "https://openrouter.ai/api/v1"
+      },
+      "default_model": {},
+      "verified": [],
+      "caller_supplied_endpoint": false
+    },
     "custom": {
       "display_name": "Custom endpoint",
       "secret_env": "",
@@ -161,6 +172,15 @@
     },
     {
       "agent": "claude",
+      "provider": "openrouter",
+      "family": "anthropic-messages",
+      "endpoint": "https://openrouter.ai/api",
+      "secret": "OPENROUTER_API_KEY",
+      "default_model": "",
+      "verified": false
+    },
+    {
+      "agent": "claude",
       "provider": "custom",
       "family": "anthropic-messages",
       "endpoint": "(vendor default)",
@@ -194,6 +214,15 @@
       "secret": "MOONSHOT_API_KEY",
       "default_model": "kimi-k3",
       "verified": true
+    },
+    {
+      "agent": "codex",
+      "provider": "openrouter",
+      "family": "openai-responses",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "secret": "OPENROUTER_API_KEY",
+      "default_model": "",
+      "verified": false
     },
     {
       "agent": "codex",

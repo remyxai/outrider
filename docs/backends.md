@@ -195,10 +195,12 @@ Leave `agent` empty for Claude Code — every existing workflow keeps its exact 
 | `claude` | `anthropic` | `ANTHROPIC_API_KEY` | (vendor default) | _(agent default)_ | yes |
 | `claude` | `zai` | `ZAI_API_KEY` | https://api.z.ai/api/anthropic | glm-5.3 | yes |
 | `claude` | `moonshot` | `MOONSHOT_API_KEY` | https://api.moonshot.ai/anthropic | kimi-k3 | yes |
+| `claude` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api | _(agent default)_ | **not verified** |
 | `claude` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |
 | `codex` | `openai` | `OPENAI_API_KEY` | (vendor default) | _(agent default)_ | yes |
 | `codex` | `zai` | `ZAI_API_KEY` | https://api.z.ai/api/paas/v4 | glm-5.3 | **not verified** |
 | `codex` | `moonshot` | `MOONSHOT_API_KEY` | https://api.moonshot.ai/v1 | kimi-k3 | yes |
+| `codex` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api/v1 | _(agent default)_ | **not verified** |
 | `codex` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |
 
 "Verified" means a real run reached that vendor's endpoint end-to-end. An unverified pair still runs, but the action logs a warning naming the `provider: custom` + gateway workaround rather than claiming support it hasn't demonstrated.

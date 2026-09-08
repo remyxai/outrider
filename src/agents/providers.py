@@ -135,6 +135,28 @@ PROVIDERS: dict[str, Provider] = {
             ApiFamily.ANTHROPIC_MESSAGES, ApiFamily.OPENAI_RESPONSES,
         }),
     ),
+    "openrouter": Provider(
+        id="openrouter",
+        display_name="OpenRouter",
+        secret_env="OPENROUTER_API_KEY",
+        # Serves BOTH families, which makes it the one provider every agent
+        # can reach: one key, one id, any agent. Probed — /api/v1/responses
+        # and /api/v1/messages both answer 401 (the latter in Anthropic's own
+        # error shape) while a bogus path on the same host 404s.
+        #
+        # Base URLs differ by family because the clients append different
+        # suffixes: Claude Code appends /v1/messages to its base, Codex
+        # appends /responses.
+        endpoints={
+            ApiFamily.ANTHROPIC_MESSAGES: "https://openrouter.ai/api",
+            ApiFamily.OPENAI_RESPONSES: "https://openrouter.ai/api/v1",
+        },
+        # No default: OpenRouter ids are namespaced (`z-ai/glm-4.6`,
+        # `anthropic/claude-...`) and picking one here would rot as models
+        # move. Callers name a model; see the no-default warning in resolve().
+        # Endpoints are probed but no end-to-end run has happened, so neither
+        # family is claimed as verified.
+    ),
     "custom": Provider(
         id="custom",
         display_name="Custom endpoint",
@@ -274,6 +296,13 @@ def resolve(
         base_url = base_url_override
 
     routing = backend.routing(provider, family, model, base_url, env)
+    if not model and not provider.default_model.get(family):
+        routing.warnings.append(
+            f"no model named and {provider.display_name} has no default for "
+            f"{family.value}, so {backend.display_name} will send its own "
+            f"default model id — which this provider may not recognise. Set "
+            f"the `model` input to a model id {provider.display_name} lists."
+        )
     if family not in provider.verified and not provider.caller_supplied_endpoint:
         routing.warnings.append(
             f"agent={backend.name} + provider={provider_id} is unverified: "

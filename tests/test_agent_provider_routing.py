@@ -347,7 +347,84 @@ def test_native_router_accepts_provider_ids_this_registry_never_heard_of():
 
 def test_a_non_router_agent_still_rejects_an_unknown_provider():
     """The passthrough is specific to native routers — Claude Code and Codex
-    need a real endpoint, so an unknown id must still fail."""
+    need a real endpoint, so an id this registry has never heard of must
+    still fail rather than route somewhere arbitrary."""
     with pytest.raises(RoutingError) as exc:
-        route(resolve("claude"), "openrouter", "x", "", env())
+        route(resolve("claude"), "some-vendor-we-do-not-know", "x", "", env())
     assert "unknown provider" in str(exc.value)
+
+
+def test_a_native_router_accepts_the_same_unknown_id():
+    """Same input, opposite outcome — because Backboard resolves it and
+    Outrider does not have to."""
+    routing = route(
+        resolve("backboard"), "some-vendor-we-do-not-know", "m", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "some-vendor-we-do-not-know/m"
+
+
+# ─── OpenRouter: the provider every agent can reach ─────────────────────────
+
+def test_openrouter_serves_both_api_families():
+    """One key, one provider id, any agent — which is why it is worth having.
+
+    Probed: /api/v1/responses and /api/v1/messages both answer 401 (the
+    latter in Anthropic's own error shape) while a bogus path on the same
+    host 404s.
+    """
+    provider = PROVIDERS["openrouter"]
+    assert provider.serves(ApiFamily.ANTHROPIC_MESSAGES)
+    assert provider.serves(ApiFamily.OPENAI_RESPONSES)
+
+
+def test_openrouter_base_urls_differ_by_family():
+    """The clients append different suffixes: Claude Code adds /v1/messages
+    to its base, Codex adds /responses. One shared base URL would 404 one of
+    them."""
+    claude = route(resolve("claude"), "openrouter", "z-ai/glm-4.6", "",
+                   env(OPENROUTER_API_KEY="or"))
+    codex = route(resolve("codex"), "openrouter", "z-ai/glm-4.6", "",
+                  env(OPENROUTER_API_KEY="or"))
+    assert claude.env["ANTHROPIC_BASE_URL"] == "https://openrouter.ai/api"
+    assert codex.env["CODEX_BASE_URL"] == "https://openrouter.ai/api/v1"
+
+
+def test_openrouter_uses_bearer_for_claude():
+    routing = route(resolve("claude"), "openrouter", "z-ai/glm-4.6", "",
+                    env(OPENROUTER_API_KEY="or"))
+    assert routing.env["ANTHROPIC_AUTH_TOKEN"] == "or"
+    assert routing.env["ANTHROPIC_API_KEY"] == ""
+
+
+def test_openrouter_is_reachable_by_every_agent():
+    """The point of the join: one row lights up every agent whose family it
+    serves, and backboard reaches it natively."""
+    reachable = {
+        row["agent"] for row in agent_matrix()
+        if row["provider"] in ("openrouter", "(any — agent-resolved)")
+    }
+    assert reachable == set(available())
+
+
+def test_openrouter_is_not_claimed_as_verified():
+    """Endpoints were probed; no end-to-end run has happened. The pair warns
+    rather than asserting support we haven't demonstrated."""
+    routing = route(resolve("codex"), "openrouter", "z-ai/glm-4.6", "",
+                    env(OPENROUTER_API_KEY="or"))
+    assert any("unverified" in w for w in routing.warnings)
+
+
+def test_a_provider_with_no_default_model_warns_when_none_is_named():
+    """OpenRouter ids are namespaced (`z-ai/glm-4.6`), so there is no sane
+    default to invent. Without a model the agent sends its own default id,
+    which the provider will not recognise — say so."""
+    routing = route(resolve("claude"), "openrouter", "", "",
+                    env(OPENROUTER_API_KEY="or"))
+    assert any("no model named" in w for w in routing.warnings)
+
+
+def test_a_provider_with_a_default_model_does_not_warn():
+    routing = route(resolve("codex"), "moonshot", "", "",
+                    env(MOONSHOT_API_KEY="mk"))
+    assert not any("no model named" in w for w in routing.warnings)
