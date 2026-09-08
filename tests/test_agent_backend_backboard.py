@@ -70,10 +70,28 @@ def test_model_override_is_threaded(monkeypatch):
     assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.5"
 
 
-def test_prompt_rides_in_argv_after_print(backend):
+def test_prompt_is_delivered_on_stdin_not_argv(backend):
+    """Linux caps one argv string at 128 KB; a spec bundle can exceed that.
+
+    `--print <prompt>` is the documented one-shot form but would raise E2BIG
+    before the agent starts. Piped stdin is equally one-shot and unbounded —
+    verified live: the process still exits after one turn and tools still
+    execute.
+    """
     argv, stdin_text = backend.finalize_cmd(["backboard"], "PROMPT")
-    assert argv == ["backboard", "--print", "PROMPT"]
-    assert stdin_text is None
+    assert argv == ["backboard"]
+    assert stdin_text == "PROMPT"
+    assert "--print" not in argv
+
+
+def test_oversized_prompt_would_not_fit_in_argv():
+    """Pins the constraint that forced stdin delivery, so nobody 'simplifies'
+    it back to --print without hitting this."""
+    import subprocess
+
+    oversized = "x" * 131_072
+    with pytest.raises(OSError):
+        subprocess.run(["/bin/true", oversized], capture_output=True, timeout=10)
 
 
 def test_preflight_requires_the_api_key(monkeypatch, backend):
@@ -292,3 +310,36 @@ def test_visible_lines_survive_that_ordering(backend):
     assert coverage["file_reads"] == 2
     # "Read 3 lines" + "Read 4 lines"
     assert coverage["visible_lines"] == 7
+
+
+# ─── a refused run must not read as a weak model ────────────────────────────
+
+def test_permission_denial_fails_the_run_loudly(backend):
+    """Captured live with the default (manual) permission mode.
+
+    R-CLI reports the refusal as tool:error events but still ends the turn
+    `completed` and exits 0 — so an un-bypassed run produces no diff while
+    looking like a success. This adapter always passes bypass, so a permission
+    error is a configuration problem and has to surface as one.
+    """
+    result = backend.parse(0, load("permission_denied"), "")
+    assert result is not None
+    assert not result.ok, "an un-actionable run must not report success"
+    assert "permission" in result.text.lower()
+    assert "bypass" in result.text, "the message must name the fix"
+
+
+def test_permission_denial_names_the_refused_tools(backend):
+    result = backend.parse(0, load("permission_denied"), "")
+    assert "ApplyPatch" in result.text or "Execute" in result.text
+
+
+def test_ordinary_run_is_unaffected(backend):
+    """The detector must not fire on a healthy transcript."""
+    assert backend.parse(0, load("tool_session"), "").ok
+
+
+def test_web_search_is_available(backend):
+    """Verified live: the agent reaches a web_search tool, so the staged
+    research phase can run on this backend."""
+    assert backend.can(Capability.WEB_RESEARCH)

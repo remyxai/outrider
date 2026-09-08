@@ -208,3 +208,26 @@ def test_enforce_still_gates_a_backend_that_does_report(monkeypatch):
 
     assert out["chosen_index"] == -1
     assert out["under_explored"] is True
+
+
+# ─── an agent that cannot even start ────────────────────────────────────────
+
+def test_exec_failure_is_a_normal_agent_failure(monkeypatch, tmp_path):
+    """E2BIG / ENOMEM happen before the process exists, so there is no output.
+
+    Left unhandled this propagated out of _run_agent and killed the whole
+    dispatch; it has to look like any other failed invocation so the existing
+    downgrade path can handle it.
+    """
+    import subprocess
+
+    def boom(*a, **kw):
+        raise OSError(7, "Argument list too long")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    ok, text, events = run._run_agent(["claude"], "p", tmp_path, 60)
+
+    assert ok is False
+    assert events == []
+    assert "could not be started" in text
+    assert "Argument list too long" in text

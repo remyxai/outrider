@@ -7901,6 +7901,13 @@ def _run_agent(
         return False, _BACKEND.timeout_message(timeout_s), []
     except FileNotFoundError:
         return False, _BACKEND.not_found_message(), []
+    except OSError as exc:
+        # E2BIG (prompt too large for argv), ENOMEM, ENOEXEC — the process
+        # never started, so there is no output to parse. Return it as a normal
+        # agent failure; the orchestrator's downgrade path handles it the way
+        # it handles any other failed invocation, instead of the whole
+        # dispatch dying on an unhandled exception.
+        return False, f"{_BACKEND.tool} CLI could not be started: {exc}", []
 
     result = _BACKEND.parse(
         proc.returncode, proc.stdout or "", proc.stderr or "", stream=stream

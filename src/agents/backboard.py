@@ -48,6 +48,7 @@ _TOOL_MAP = {
     "apply_patch": "write",
     "execute": "execute",
     "glob": "glob",
+    "web_search": "web_search",
     "find_skill": "other",
     "find_mcp": "other",
 }
@@ -85,8 +86,9 @@ class BackboardBackend(AgentBackend):
         # No --max-turns / --max-tokens knob exists as of 3.0.5. The
         # orchestrator's wall-clock timeout is the only bound.
         # No JSON-Schema-constrained final response either.
-        # WEB_RESEARCH is unconfirmed: the SDK has web search but the CLI's
-        # tool list isn't fully enumerated, so it is deliberately not claimed.
+        # Verified live: the agent reaches a `web_search` tool, so the staged
+        # research phase can run on this backend.
+        Capability.WEB_RESEARCH,
     })
 
     def preflight(self) -> tuple[bool, list[str]]:
@@ -110,9 +112,20 @@ class BackboardBackend(AgentBackend):
     def finalize_cmd(
         self, cmd_prefix: list[str], prompt: str, *, stream: bool = False
     ) -> tuple[list[str], str | None]:
-        # One shape for both modes — R-CLI always emits the same JSONL stream,
-        # so `stream` only decides whether the caller gets the transcript back.
-        return [*cmd_prefix, "--print", prompt], None
+        """One shape for both modes; the prompt rides on stdin.
+
+        `--print <prompt>` is the documented one-shot form, but Linux caps a
+        single argv string at 128 KB (MAX_ARG_STRLEN) and Outrider's spec
+        bundle can exceed that on a large paper — argv delivery then raises
+        E2BIG before the agent ever starts. Piped stdin is equally one-shot
+        (verified: the process still exits after one turn, tools still
+        execute, `--format json` is satisfied by "piped stdin" per the CLI's
+        own contract) and has no such ceiling.
+
+        `stream` only decides whether the caller gets the transcript back —
+        R-CLI always emits the same JSONL.
+        """
+        return list(cmd_prefix), prompt
 
     def parse(
         self, returncode: int, stdout: str, stderr: str, *, stream: bool = False
@@ -133,6 +146,7 @@ class BackboardBackend(AgentBackend):
         rounds = 0
         model = ""
         saw_usage = False
+        permission_errors: list[str] = []
         norm: list[Event] = []
 
         for ev in events_raw:
@@ -164,6 +178,18 @@ class BackboardBackend(AgentBackend):
                         lines=_result_lines(payload),
                     )
                 )
+            elif etype == "tool:error":
+                # R-CLI does not deny quietly at the event level, but it does
+                # at the *exit* level: a permission refusal emits tool:error,
+                # then turn:end status=completed and exit 0. Left unread, a
+                # misconfigured run looks like a weak model that produced no
+                # diff. It is always a config error here because this adapter
+                # always passes `--permission-mode bypass`.
+                message = str(payload.get("error") or "")
+                if "permission" in message.lower():
+                    permission_errors.append(
+                        f"{payload.get('name') or 'tool'}: {message.strip()}"
+                    )
             elif etype == "run:error":
                 run_error = str(payload.get("error") or "").strip()
                 failed = True
@@ -171,7 +197,16 @@ class BackboardBackend(AgentBackend):
                 if (payload.get("status") or "") != "completed":
                     failed = True
 
-        ok = (not failed) and returncode == 0
+        ok = (not failed) and returncode == 0 and not permission_errors
+
+        if permission_errors and not failed:
+            run_error = (
+                "the agent's tool calls were refused for lack of permission, "
+                "so this run could not change any files. Expected "
+                "`--permission-mode bypass` to be in effect; check the "
+                "`.backboard/settings.json` deny/ask rules in the target repo. "
+                + " | ".join(permission_errors[:3])
+            )
 
         # The cause is on stdout as run:error and stderr is empty — lift it so
         # it lands where the caller's tail-slice will keep it.
