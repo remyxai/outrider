@@ -252,3 +252,66 @@ def test_transient_error_events_do_not_crash_the_parser(backend):
     }
     assert "error" in types
     assert backend.parse(1, real("turn_failed_no_credits"), "") is not None
+
+
+# ─── routing at a non-OpenAI backend ────────────────────────────────────────
+
+def test_no_provider_args_by_default(backend, monkeypatch):
+    """Unset CODEX_BASE_URL must leave the argv exactly as it was."""
+    monkeypatch.delenv("CODEX_BASE_URL", raising=False)
+    assert backend.provider_args() == []
+    assert "-c" not in backend.base_cmd()
+
+
+def test_base_url_routes_codex_at_another_vendor(monkeypatch):
+    """The Codex analogue of ANTHROPIC_BASE_URL.
+
+    Verified live against Moonshot: the run reached api.moonshot.ai (its
+    gateway answered, with a Moonshot request id) rather than OpenAI.
+    """
+    monkeypatch.setenv("CODEX_BASE_URL", "https://api.moonshot.ai/v1")
+    args = CodexBackend().provider_args()
+    joined = " ".join(args)
+    assert 'base_url="https://api.moonshot.ai/v1"' in joined
+    assert 'model_provider="outrider"' in joined
+
+
+def test_wire_api_is_pinned_to_responses(monkeypatch):
+    """codex-cli 0.151.0 removed Chat Completions support outright:
+    `wire_api = "chat"` is no longer supported. A Chat-only provider needs a
+    translating gateway, so emitting "chat" would fail at config load."""
+    monkeypatch.setenv("CODEX_BASE_URL", "https://api.moonshot.ai/v1")
+    joined = " ".join(CodexBackend().provider_args())
+    assert 'wire_api="responses"' in joined
+    assert "chat" not in joined
+
+
+def test_credential_is_always_read_from_one_env_name(monkeypatch):
+    """Each provider's secret is mapped into CODEX_API_KEY by the action, so
+    the adapter never grows a per-vendor branch."""
+    monkeypatch.setenv("CODEX_BASE_URL", "https://api.moonshot.ai/v1")
+    joined = " ".join(CodexBackend().provider_args())
+    assert 'env_key="CODEX_API_KEY"' in joined
+
+
+def test_cost_label_names_the_vendor_that_served_the_run(monkeypatch):
+    """A Codex run against Kimi is not OpenAI spend, and the fleet report
+    slices on this field."""
+    monkeypatch.setenv("CODEX_BASE_URL", "https://api.moonshot.ai/v1")
+    assert CodexBackend().cost_label("kimi-k3") == "Codex \u2192 Moonshot (Kimi) (kimi-k3)"
+
+    monkeypatch.setenv("CODEX_BASE_URL", "https://api.z.ai/api/paas/v4")
+    assert "z.ai (GLM)" in CodexBackend().cost_label()
+
+    monkeypatch.delenv("CODEX_BASE_URL", raising=False)
+    assert CodexBackend().cost_label() == "Codex \u2192 OpenAI"
+
+
+def test_unknown_host_is_its_own_series(monkeypatch):
+    """Never lump an unrecognized vendor in with a known one."""
+    monkeypatch.setenv("CODEX_BASE_URL", "https://gateway.internal/v1")
+    assert "gateway.internal" in CodexBackend().cost_label()
+
+
+def test_base_url_is_whitelisted(backend):
+    assert "CODEX_BASE_URL" in backend.env_whitelist()

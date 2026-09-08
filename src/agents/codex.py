@@ -35,6 +35,14 @@ import os
 
 from agents.base import AgentBackend, AgentResult, Capability, Event
 
+# Recognized hosts, for the model_backend telemetry label. An unknown host
+# passes through as itself — every vendor is its own series, never a lump.
+_VENDOR_NAMES = {
+    "api.moonshot.ai": "Moonshot (Kimi)",
+    "api.z.ai": "z.ai (GLM)",
+    "api.openai.com": "OpenAI",
+}
+
 # Codex item types → the normalized tool vocabulary.
 _ITEM_TOOL_MAP = {
     "command_execution": "execute",
@@ -54,7 +62,21 @@ class CodexBackend(AgentBackend):
 
     #: CODEX_API_KEY is the CI credential; CODEX_HOME relocates the config and
     #: auth directory, which matters on a runner with a scratch HOME.
-    auth_env = ("CODEX_API_KEY", "CODEX_HOME")
+    #: CODEX_BASE_URL routes at a non-OpenAI backend the same way
+    #: ANTHROPIC_BASE_URL routes Claude Code (see base_cmd).
+    auth_env = ("CODEX_API_KEY", "CODEX_HOME", "CODEX_BASE_URL", "CODEX_MODEL")
+
+    def cost_label(self, model: str = "") -> str:
+        """Name the vendor that actually served the tokens.
+
+        A Codex run against Kimi is not an OpenAI run, and the fleet report
+        slices spend on this field.
+        """
+        base_url = (os.environ.get("CODEX_BASE_URL") or "").strip()
+        host = base_url.split("://", 1)[-1].split("/", 1)[0] if base_url else ""
+        vendor = _VENDOR_NAMES.get(host, host) or "OpenAI"
+        label = f"{self.display_name} \u2192 {vendor}"
+        return f"{label} ({model})" if model else label
 
     capabilities = frozenset({
         Capability.ONESHOT_JSON,
@@ -76,6 +98,11 @@ class CodexBackend(AgentBackend):
             ]
         return True, []
 
+    #: Synthetic provider id. One entry whose base_url is swapped per run
+    #: keeps the routing in a single place, the way ANTHROPIC_BASE_URL does
+    #: for Claude Code.
+    PROVIDER_ID = "outrider"
+
     def base_cmd(self) -> list[str]:
         cmd = [
             "codex", "exec", "--json",
@@ -86,10 +113,41 @@ class CodexBackend(AgentBackend):
             # shallow checkout can't dead-end the run.
             "--skip-git-repo-check",
         ]
+        cmd += self.provider_args()
         model = (os.environ.get("CODEX_MODEL") or "").strip()
         if model:
             cmd += ["-m", model]
         return cmd
+
+    def provider_args(self) -> list[str]:
+        """Route Codex at a non-OpenAI backend, per CODEX_BASE_URL.
+
+        This is the Codex analogue of ANTHROPIC_BASE_URL: the engine, the
+        validators and the refinement chain don't care which vendor served
+        the tokens, so the same run can be pointed at Kimi or an on-prem
+        gateway by changing one variable.
+
+        ``wire_api`` is pinned to "responses" because codex-cli removed
+        Chat-Completions support at 0.151.0 ("`wire_api = \"chat\"` is no
+        longer supported"). A provider that only speaks Chat Completions
+        therefore needs a translating gateway in front of it — verified
+        against Moonshot, which does serve /v1/responses.
+
+        The credential always arrives as CODEX_API_KEY regardless of vendor,
+        so the caller maps its provider secret into that one name and this
+        stays a single code path.
+        """
+        base_url = (os.environ.get("CODEX_BASE_URL") or "").strip()
+        if not base_url:
+            return []
+        pid = self.PROVIDER_ID
+        return [
+            "-c", f'model_providers.{pid}.name="{pid}"',
+            "-c", f'model_providers.{pid}.base_url="{base_url}"',
+            "-c", f'model_providers.{pid}.wire_api="responses"',
+            "-c", f'model_providers.{pid}.env_key="CODEX_API_KEY"',
+            "-c", f'model_provider="{pid}"',
+        ]
 
     def finalize_cmd(
         self, cmd_prefix: list[str], prompt: str, *, stream: bool = False

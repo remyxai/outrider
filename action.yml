@@ -403,10 +403,11 @@ inputs:
           caller's env block. Reports authoritative cost. Also has no
           round-limit flag.
 
-      Only `claude` supports the `provider` shortlist (it routes over
-      Anthropic-Messages-compatible endpoints). `codex` and `backboard`
-      carry their own model routing — set `CODEX_MODEL` / `BACKBOARD_MODEL`
-      in the env block instead of `model`.
+      `provider` applies to `claude` and `codex`, but they reach different
+      endpoint families: `claude` routes over Anthropic *Messages*-compatible
+      backends, `codex` over OpenAI *Responses*-compatible ones. Moonshot
+      serves both, so `provider: moonshot` works with either agent. `backboard`
+      carries its own router — set `BACKBOARD_MODEL` in the env block instead.
 
       Capability differences degrade telemetry, never the run: a backend
       that reports no dollars is recorded as `cost_basis: unavailable`
@@ -642,14 +643,87 @@ runs:
         git config --global user.email "289541483+remyx-ai[bot]@users.noreply.github.com"
 
     - name: Validate the agent / provider pair
-      if: ${{ inputs.provider != '' && inputs.agent != '' && inputs.agent != 'claude' }}
+      if: ${{ inputs.provider != '' && inputs.agent == 'backboard' }}
       shell: bash
-      # Not a free cross-product: `provider` only means something for Claude
-      # Code. Failing loudly beats routing at a backend the caller didn't ask
-      # for, which is the same reason `provider=custom` requires a base URL.
+      # `provider` selects a model backend for an agent that routes over a
+      # third-party endpoint. R-CLI carries its own router, so the pair is
+      # meaningless there and failing loudly beats silently ignoring it.
       run: |
-        echo "::error::agent='${{ inputs.agent }}' does not support the 'provider' input (that shortlist routes Claude Code at Anthropic-Messages-compatible endpoints). Set CODEX_MODEL / BACKBOARD_MODEL in your env block instead." >&2
+        echo "::error::agent=backboard does not use the 'provider' input — R-CLI routes models itself. Set BACKBOARD_MODEL in your env block instead." >&2
         exit 1
+
+    - name: Configure Codex backend from provider input
+      if: ${{ inputs.agent == 'codex' }}
+      shell: bash
+      # The Codex analogue of the Claude Code Configure step below. Codex
+      # reads its credential from CODEX_API_KEY and its endpoint from
+      # CODEX_BASE_URL, so each provider's secret is mapped into that one
+      # name and the adapter stays a single code path.
+      #
+      # wire_api is pinned to "responses" in the adapter because codex-cli
+      # removed Chat-Completions support at 0.151.0, so a provider must serve
+      # an OpenAI *Responses* endpoint (or sit behind a translating gateway).
+      env:
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
+      run: |
+        set -eu
+        case "${INPUT_PROVIDER:-}" in
+          ''|openai)
+            if [ -z "${CODEX_API_KEY:-${OPENAI_API_KEY:-}}" ]; then
+              echo "::error::agent=codex requires CODEX_API_KEY (or OPENAI_API_KEY) in the caller's env block" >&2
+              exit 1
+            fi
+            echo "CODEX_API_KEY=${CODEX_API_KEY:-$OPENAI_API_KEY}" >> "$GITHUB_ENV"
+            ;;
+          moonshot)
+            if [ -z "${MOONSHOT_API_KEY:-}" ]; then
+              echo "::error::provider=moonshot requires MOONSHOT_API_KEY in the caller's env block" >&2
+              exit 1
+            fi
+            # Verified: api.moonshot.ai serves /v1/responses (a bogus path on
+            # the same host 404s, so this is a real endpoint, not a catch-all).
+            echo "CODEX_API_KEY=$MOONSHOT_API_KEY" >> "$GITHUB_ENV"
+            echo "CODEX_BASE_URL=https://api.moonshot.ai/v1" >> "$GITHUB_ENV"
+            echo "CODEX_MODEL=${INPUT_MODEL:-kimi-k3}" >> "$GITHUB_ENV"
+            ;;
+          zai)
+            if [ -z "${ZAI_API_KEY:-}" ]; then
+              echo "::error::provider=zai requires ZAI_API_KEY in the caller's env block" >&2
+              exit 1
+            fi
+            # NOT verified end-to-end: z.ai authenticates before routing, so
+            # an unauthenticated probe cannot tell a real /responses endpoint
+            # from a 404. If the run fails with an unexpected 4xx, the
+            # provider likely speaks Chat Completions only and needs a
+            # translating gateway via provider=custom.
+            echo "::warning::agent=codex + provider=zai is unverified — z.ai's OpenAI Responses support has not been confirmed. Use provider=custom with a gateway if this run 4xxs." >&2
+            echo "CODEX_API_KEY=$ZAI_API_KEY" >> "$GITHUB_ENV"
+            echo "CODEX_BASE_URL=https://api.z.ai/api/paas/v4" >> "$GITHUB_ENV"
+            echo "CODEX_MODEL=${INPUT_MODEL:-glm-5.3}" >> "$GITHUB_ENV"
+            ;;
+          custom)
+            if [ -z "${INPUT_MODEL_BASE_URL:-}" ]; then
+              echo "::error::agent=codex + provider=custom requires model-base-url (an OpenAI Responses endpoint)" >&2
+              exit 1
+            fi
+            if [ -z "${CODEX_API_KEY:-}" ]; then
+              echo "::error::agent=codex + provider=custom requires CODEX_API_KEY in the caller's env block" >&2
+              exit 1
+            fi
+            echo "CODEX_BASE_URL=$INPUT_MODEL_BASE_URL" >> "$GITHUB_ENV"
+            [ -n "${INPUT_MODEL:-}" ] && echo "CODEX_MODEL=$INPUT_MODEL" >> "$GITHUB_ENV" || true
+            ;;
+          anthropic)
+            echo "::error::agent=codex cannot use provider=anthropic — Anthropic serves the Messages API, not OpenAI Responses. Use agent=claude for Anthropic-compatible backends." >&2
+            exit 1
+            ;;
+          *)
+            echo "::error::unknown provider '$INPUT_PROVIDER' for agent=codex; must be one of: openai, moonshot, zai, custom" >&2
+            exit 1
+            ;;
+        esac
 
     - name: Configure backend from provider input
       # `provider` routes Claude Code at an Anthropic-Messages-compatible

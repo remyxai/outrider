@@ -232,3 +232,26 @@ def test_install_step_covers_every_registered_backend():
     )
     for backend in (resolve(n) for n in available()):
         assert backend.name in install["run"], f"{backend.name} not installed"
+
+
+def test_codex_provider_pairing_is_configured():
+    """Moonshot serves both Messages and Responses, so provider=moonshot is
+    meaningful for claude AND codex — but they are different endpoint
+    families and must map to different base URLs."""
+    steps = _action_yaml()["runs"]["steps"]
+    codex_cfg = next(
+        s for s in steps
+        if s.get("name") == "Configure Codex backend from provider input"
+    )
+    assert "api.moonshot.ai/v1" in codex_cfg["run"]
+    assert "CODEX_BASE_URL" in codex_cfg["run"]
+    # Anthropic has no Responses API — the pair must be rejected, not routed.
+    assert "cannot use provider=anthropic" in codex_cfg["run"]
+
+
+def test_backboard_rejects_the_provider_input():
+    steps = _action_yaml()["runs"]["steps"]
+    guard = next(
+        s for s in steps if s.get("name") == "Validate the agent / provider pair"
+    )
+    assert "backboard" in guard["if"]

@@ -242,9 +242,10 @@ def test_cost_defaults_describe_the_configured_agent():
     or R-CLI dispatch as Anthropic spend — the same mis-attribution the
     success path had.
     """
-    assert run._initial_cost_attribution(CodexBackend()) == (
-        "Codex", "unavailable",
-    )
+    label, basis = run._initial_cost_attribution(CodexBackend())
+    # The label names the vendor that would have served the run, so a failed
+    # Codex-at-Kimi dispatch is never filed as OpenAI spend.
+    assert label.startswith("Codex") and basis == "unavailable"
     label, basis = run._initial_cost_attribution(BackboardBackend())
     assert "Backboard" in label and basis == "unavailable"
 
