@@ -1,0 +1,37 @@
+{
+  "_note": "Input surface of remyxai/outrider@v1 as of origin/main before the agent port. Regenerate only when intentionally changing the public contract: git show origin/main:action.yml | ...",
+  "required": [
+    "interest-id"
+  ],
+  "inputs": [
+    "candidate-pool",
+    "chain",
+    "claude-timeout",
+    "draft-mode",
+    "enable-cocoindex",
+    "fidelity-policy",
+    "github-token",
+    "guardrails-allowlist",
+    "guardrails-blocklist",
+    "interest-id",
+    "issue-number",
+    "lead-content",
+    "linear-api-key",
+    "lookback",
+    "maintain-state",
+    "min-confidence",
+    "mode",
+    "model",
+    "model-base-url",
+    "pin-arxiv",
+    "pr-number",
+    "provider",
+    "publish",
+    "rate-limit-days",
+    "search-method",
+    "staged-synthesis",
+    "start-from-ref",
+    "test-integration-policy",
+    "weekly-discussion-id"
+  ]
+}

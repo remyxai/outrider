@@ -133,12 +133,23 @@ def test_empty_provider_changes_nothing():
     assert routing.env == {}
 
 
-def test_empty_provider_still_honors_an_explicit_model():
-    """`model` is documented as always applying. The shell only wrote it
-    inside the provider-gated branch, so provider='' + model set silently
-    ignored the model — fixed here, deliberately."""
+def test_empty_provider_ignores_model_for_claude_exactly_as_before():
+    """Backwards compatibility, deliberately preserving a documented wart.
+
+    `model` is documented as always applying, but the shipped step wrote it
+    only inside the provider-gated branch. Honoring it would change what
+    existing installs do — a `model` the default backend does not serve
+    currently works because it is ignored, and would start 404ing. Frozen.
+    """
     routing = route(resolve("claude"), "", "claude-haiku-4-5", "", env())
-    assert routing.env == {"ANTHROPIC_MODEL": "claude-haiku-4-5"}
+    assert routing.env == {}
+
+
+def test_empty_provider_honors_model_for_the_new_agents():
+    """Codex and R-CLI have no shipped behavior to preserve, so they get the
+    documented behavior."""
+    routing = route(resolve("codex"), "", "gpt-5-nano", "", env())
+    assert routing.env == {"CODEX_MODEL": "gpt-5-nano"}
 
 
 # ─── codex: same registry, different API family ─────────────────────────────

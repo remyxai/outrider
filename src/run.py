@@ -18582,15 +18582,21 @@ def main():
     # in the workflow `env:` block (the pre-input workaround) still works;
     # this input is the documented surface.
     if target.model_base_url:
-        os.environ["ANTHROPIC_BASE_URL"] = target.model_base_url
+        # Point the *configured* agent at the endpoint. Writing
+        # ANTHROPIC_BASE_URL unconditionally is right for Claude Code and
+        # inert for anything else, which would leave a `model-base-url` run
+        # on another agent silently talking to the vendor default instead of
+        # the endpoint the caller named.
+        base_url_var = _BACKEND.base_url_env or "ANTHROPIC_BASE_URL"
+        os.environ[base_url_var] = target.model_base_url
         backend_name, backend_rates = _detect_backend(target.model_base_url)
         if backend_rates is not None:
             cost_note = f"cost computed from {backend_name} rate table"
         else:
             cost_note = (f"cost telemetry is Anthropic-rate estimate "
                          f"(no rate table for {backend_name})")
-        log.info(f"  routing Claude Code via {target.model_base_url} "
-                 f"({cost_note})")
+        log.info(f"  routing {_BACKEND.display_name} via "
+                 f"{target.model_base_url} ({cost_note}, {base_url_var})")
     # Validate the auth env shape before any agent call. Catches the
     # common misconfigurations (missing var, literal '-' from
     # gh-secret-set ambiguity, whitespace, mutual-exclusion on non-

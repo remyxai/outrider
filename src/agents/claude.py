@@ -95,6 +95,23 @@ class ClaudeCodeBackend(AgentBackend):
         Capability.GUARDRAIL_POLICY,
     })
 
+    def passthrough_env(self, *, model: str, base_url: str) -> dict[str, str]:
+        """Frozen: with no `provider`, an unset provider changes nothing.
+
+        The `model` input is *documented* as always setting ANTHROPIC_MODEL,
+        but the shipped step wrote it only inside the provider-gated branch —
+        so `provider: ''` + `model: x` has always silently ignored the model.
+        Honoring it here would be closer to the documentation, but it would
+        change what an existing installation does: a `model` naming something
+        the default Anthropic backend does not serve currently works (because
+        it is ignored) and would start 404ing.
+
+        Existing installs win. New agents apply the documented behavior via
+        the base implementation, since they have no shipped behavior to
+        preserve. Tracked as a separate opt-in rather than smuggled in here.
+        """
+        return {}
+
     def tool_invocation_hint(self, executable: str) -> str:
         return (
             f"Available as a Claude Code skill and as `{executable}` on the "
