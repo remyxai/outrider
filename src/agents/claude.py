@@ -18,6 +18,7 @@ from agents.base import (
     Capability,
     Event,
 )
+from agents.providers import ApiFamily, AuthStyle
 
 # Injection-hardening Bash gate for the SPAWNED agent. NOTE: the repo's own
 # .claude/hooks/pre-bash-gate.sh does NOT reach this agent (it governs only
@@ -76,6 +77,13 @@ class ClaudeCodeBackend(AgentBackend):
     # orchestrator holds its own token separately (clone/push unaffected); the
     # agent's `gh` reads use unauthenticated access (fine for public repos).
 
+    api_family = ApiFamily.ANTHROPIC_MESSAGES
+    key_env = "ANTHROPIC_API_KEY"
+    base_url_env = "ANTHROPIC_BASE_URL"
+    model_env = "ANTHROPIC_MODEL"
+    #: The Bearer-style credential var; see `routing` for why there are two.
+    token_env = "ANTHROPIC_AUTH_TOKEN"
+
     capabilities = frozenset({
         Capability.ONESHOT_JSON,
         Capability.STREAM_TRANSCRIPT,
@@ -85,6 +93,66 @@ class ClaudeCodeBackend(AgentBackend):
         Capability.WEB_RESEARCH,
         Capability.GUARDRAIL_POLICY,
     })
+
+    # ── model routing ─────────────────────────────────────────────────────
+
+    def routing(self, provider, family, model: str, base_url: str, env: dict):
+        """Point Claude Code at ``provider``, honoring its auth-var exclusion.
+
+        Claude Code reads two credential vars and *prefers* ANTHROPIC_API_KEY
+        (sent as `x-api-key`) whenever both are set. Non-Anthropic gateways
+        reject that header with HTTP 401, so the two are mutually exclusive
+        and the unselected one must be actively cleared — callers normally
+        pass every vendor's secret at once so `provider` stays switchable at
+        dispatch time.
+
+        An empty string in the returned env means "clear this variable".
+        """
+        from agents.providers import Routing, RoutingError
+
+        if provider.caller_supplied_endpoint:
+            # The caller supplied the endpoint, so they own the auth choice
+            # too — clearing either var here could break a working setup.
+            if not (env.get(self.key_env) or env.get(self.token_env)):
+                raise RoutingError(
+                    f"provider=custom requires {self.key_env} or "
+                    f"{self.token_env} in the caller's env block"
+                )
+            routing = Routing(
+                provider_display=provider.display_name, model=model
+            )
+            if model:
+                routing.env[self.model_env] = model
+            return routing
+
+        key = (env.get(provider.secret_env) or "").strip()
+        if not key:
+            raise RoutingError(
+                f"provider={provider.id} requires {provider.secret_env} in "
+                f"the caller's env block"
+            )
+
+        # Deliberately NOT falling back to provider.default_model here.
+        # The shipped behavior is that an unset `model` lets Claude Code pick
+        # its own default for the configured backend; injecting the registry's
+        # default would silently change which model existing workflows run.
+        # The other agents do apply it, because they have no such default.
+        chosen = model
+        routing = Routing(provider_display=provider.display_name, model=chosen)
+
+        if provider.auth_style(family) is AuthStyle.API_KEY:
+            # Already the var Claude Code prefers; clear the Bearer one.
+            routing.env[self.key_env] = key
+            routing.env[self.token_env] = ""
+        else:
+            routing.env[self.token_env] = key
+            routing.env[self.key_env] = ""
+
+        if base_url:
+            routing.env[self.base_url_env] = base_url
+        if chosen:
+            routing.env[self.model_env] = chosen
+        return routing
 
     # ── invocation ────────────────────────────────────────────────────────
 

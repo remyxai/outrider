@@ -7,6 +7,16 @@ and is pinned by test.
 """
 from __future__ import annotations
 
+from agents.providers import (  # noqa: F401 — re-exported for callers
+    PROVIDERS,
+    ApiFamily,
+    Provider,
+    Routing,
+    RoutingError,
+    compatibility_matrix,
+    register_agent_family,
+    resolve as resolve_routing,
+)
 from agents.base import (  # noqa: F401 — re-exported for callers
     BASE_ENV_WHITELIST,
     AgentBackend,
@@ -26,6 +36,18 @@ _REGISTRY: dict[str, type[AgentBackend]] = {
     CodexBackend.name: CodexBackend,
     BackboardBackend.name: BackboardBackend,
 }
+
+
+# Let routing errors name a working alternative agent for a given provider.
+for _cls in _REGISTRY.values():
+    register_agent_family(_cls.name, _cls.api_family)
+
+
+def agent_matrix() -> list[dict]:
+    """Every valid (agent, provider) pair, derived from the registries."""
+    return compatibility_matrix(
+        {cls.name: cls.api_family for cls in _REGISTRY.values()}
+    )
 
 
 def available() -> tuple[str, ...]:

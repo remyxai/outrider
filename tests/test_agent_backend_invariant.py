@@ -222,80 +222,45 @@ def test_agent_is_threaded_into_the_recommend_step():
         block.get("INPUT_AGENT") for block in env_blocks
     ), "INPUT_AGENT must reach run.py"
 
+def test_routing_lives_in_one_step_that_calls_the_resolver():
+    """Routing used to be per-agent `case` arms in this file.
 
-def test_install_step_covers_every_registered_backend():
-    """A backend the registry knows but the action can't install is a trap:
-    the run would fail at `not found on PATH` deep into a dispatch."""
+    It is now a single step delegating to src/configure_backend.py, so adding
+    a provider or an agent never requires editing the action's YAML. If that
+    regresses into per-agent shell branches, this fails.
+    """
     steps = _action_yaml()["runs"]["steps"]
-    install = next(
-        s for s in steps if s.get("name") == "Install the coding-agent CLI"
-    )
-    for backend in (resolve(n) for n in available()):
-        assert backend.name in install["run"], f"{backend.name} not installed"
+    configure = [
+        s for s in steps if s.get("name") == "Configure the model backend"
+    ]
+    assert len(configure) == 1, "exactly one routing step"
+    assert "configure_backend.py" in configure[0]["run"]
 
-
-def test_codex_provider_pairing_is_configured():
-    """Moonshot serves both Messages and Responses, so provider=moonshot is
-    meaningful for claude AND codex — but they are different endpoint
-    families and must map to different base URLs."""
-    steps = _action_yaml()["runs"]["steps"]
-    codex_cfg = next(
+    # No other step may re-implement provider routing.
+    others = [
         s for s in steps
-        if s.get("name") == "Configure Codex backend from provider input"
-    )
-    assert "api.moonshot.ai/v1" in codex_cfg["run"]
-    assert "CODEX_BASE_URL" in codex_cfg["run"]
-    # Anthropic has no Responses API — the pair must be rejected, not routed.
-    assert "cannot use provider=anthropic" in codex_cfg["run"]
+        if s.get("name") != "Configure the model backend"
+        and "provider" in s.get("run", "").lower()
+    ]
+    assert not others, f"provider logic leaked into {[s['name'] for s in others]}"
 
 
-def test_provider_plus_model_works_the_same_way_for_every_agent():
-    """One mental model across the action: agent, provider, model.
-
-    R-CLI addresses models as `<provider>/<model>`, so the action composes
-    the two rather than making backboard the one agent with different rules.
-    """
+def test_all_four_routing_inputs_reach_the_resolver():
     steps = _action_yaml()["runs"]["steps"]
-    bb = next(
-        s for s in steps if s.get("name") == "Configure Backboard backend"
+    configure = next(
+        s for s in steps if s.get("name") == "Configure the model backend"
     )
-    assert "INPUT_PROVIDER" in bb["run"]
-    assert "$INPUT_PROVIDER/$MODEL" in bb["run"]
-    # An already-qualified model must not be double-prefixed.
-    assert "*/*)" in bb["run"]
-    # No agent rejects `provider` outright any more.
-    assert not any(
-        s.get("name") == "Validate the agent / provider pair" for s in steps
-    )
+    for var in ("INPUT_AGENT", "INPUT_PROVIDER", "INPUT_MODEL",
+                "INPUT_MODEL_BASE_URL"):
+        assert var in configure["env"], f"{var} not threaded"
 
 
-def test_model_input_reaches_every_agent():
-    """One `model` input for all three agents.
-
-    `model` was silently ignored for backboard, which needed a BACKBOARD_MODEL
-    env var instead — the kind of per-agent special case that makes the action
-    feel like a maze. Every agent must honor the same input.
-    """
+def test_install_step_is_the_only_remaining_per_agent_branch():
+    """Installing a CLI genuinely differs per agent (npm vs a native binary),
+    so that one stays a case. Everything else is data."""
     steps = _action_yaml()["runs"]["steps"]
-    configured = {
-        s["name"]: s["run"]
-        for s in steps
-        if s.get("name", "").startswith("Configure ")
-        and "backend" in s.get("name", "")
-    }
-    assert any("CODEX_MODEL" in r for r in configured.values())
-    assert any("BACKBOARD_MODEL" in r for r in configured.values())
-    for name, body in configured.items():
-        assert "INPUT_MODEL" in body, f"{name} ignores the model input"
-
-
-def test_every_agent_validates_its_credential_before_running():
-    """A missing key must fail in the Configure step, not deep in a dispatch."""
-    steps = _action_yaml()["runs"]["steps"]
-    bodies = " ".join(
-        s.get("run", "") for s in steps
-        if s.get("name", "").startswith("Configure ")
-        and "backend" in s.get("name", "")
-    )
-    for secret in ("CODEX_API_KEY", "BACKBOARD_API_KEY", "MOONSHOT_API_KEY"):
-        assert secret in bodies, f"{secret} never validated"
+    branchy = [
+        s.get("name") for s in steps
+        if "case \"${INPUT_AGENT" in s.get("run", "")
+    ]
+    assert branchy == ["Install the coding-agent CLI"]

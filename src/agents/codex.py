@@ -34,6 +34,7 @@ import json
 import os
 
 from agents.base import AgentBackend, AgentResult, Capability, Event
+from agents.providers import ApiFamily
 
 # Recognized hosts, for the model_backend telemetry label. An unknown host
 # passes through as itself — every vendor is its own series, never a lump.
@@ -97,6 +98,11 @@ class CodexBackend(AgentBackend):
                 "agent=codex requires CODEX_API_KEY in the caller's env block"
             ]
         return True, []
+
+    api_family = ApiFamily.OPENAI_RESPONSES
+    key_env = "CODEX_API_KEY"
+    base_url_env = "CODEX_BASE_URL"
+    model_env = "CODEX_MODEL"
 
     #: Synthetic provider id. One entry whose base_url is swapped per run
     #: keeps the routing in a single place, the way ANTHROPIC_BASE_URL does

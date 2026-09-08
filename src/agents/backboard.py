@@ -35,6 +35,7 @@ import os
 import re
 
 from agents.base import AgentBackend, AgentResult, Capability, Event
+from agents.providers import ApiFamily
 
 # R-CLI tool names (lowercased) → the normalized vocabulary.
 # Verified against live runs: read, execute, apply_patch, glob. The write /
@@ -73,6 +74,11 @@ class BackboardBackend(AgentBackend):
     billing_url = "https://app.backboard.io"
     keys_url = "https://app.backboard.io"
 
+    api_family = ApiFamily.NATIVE_ROUTER
+    key_env = "BACKBOARD_API_KEY"
+    base_url_env = "BACKBOARD_API_URL"
+    model_env = "BACKBOARD_MODEL"
+
     #: BACKBOARD_API_KEY is the credential; BACKBOARD_API_URL overrides the
     #: control-plane host. Both are read by the binary directly.
     auth_env = ("BACKBOARD_API_KEY", "BACKBOARD_API_URL")
@@ -98,6 +104,33 @@ class BackboardBackend(AgentBackend):
                 "env block (browser `backboard login` cannot work on a runner)"
             ]
         return True, []
+
+    def routing(self, provider, family, model: str, base_url: str, env: dict):
+        """R-CLI resolves models itself, so `provider` qualifies the model.
+
+        Its addressing is `<provider>/<model>`, so the same two inputs every
+        other agent takes compose into one string here rather than making
+        this agent the odd one out. The pair is passed through verbatim: R-CLI
+        resolves provider ids server-side against a very large catalogue, so a
+        local allowlist would go stale and reject valid combinations.
+        """
+        from agents.providers import Routing, RoutingError
+
+        key = (env.get(self.key_env) or "").strip()
+        if not key:
+            raise RoutingError(
+                f"agent={self.name} requires {self.key_env} in the caller's "
+                f"env block"
+            )
+        if not model:
+            raise RoutingError(
+                f"agent={self.name} with provider={provider.id} also needs a "
+                f"model — R-CLI addresses models as <provider>/<model>"
+            )
+        qualified = model if "/" in model else f"{provider.id}/{model}"
+        routing = Routing(provider_display=provider.display_name, model=qualified)
+        routing.env[self.model_env] = qualified
+        return routing
 
     def base_cmd(self) -> list[str]:
         # `--permission-mode bypass` is mandatory under --print: in

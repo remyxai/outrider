@@ -183,6 +183,57 @@ class AgentBackend:
             f"apply."
         )
 
+    # ── model routing ─────────────────────────────────────────────────────
+
+    #: The wire protocol this CLI speaks to its model backend. Set by every
+    #: adapter; it is the whole basis of provider compatibility.
+    api_family = None  # type: ignore[assignment]
+
+    def routing(self, provider, family, model: str, base_url: str, env: dict):
+        """Environment that points this agent at ``provider``.
+
+        Default implementation covers any agent that takes a base URL, a
+        bearer-style key and a model name in three env vars — which is most
+        of them. Override only for a genuine idiosyncrasy (Claude Code's
+        two mutually-exclusive auth vars; a router that takes no endpoint).
+        """
+        from agents.providers import Routing, RoutingError
+
+        secret_env = provider.secret_env or self.key_env
+        key = (env.get(secret_env) or "").strip()
+        if not key:
+            raise RoutingError(
+                f"provider={provider.id} requires {secret_env} in the "
+                f"caller's env block"
+            )
+        chosen = model or provider.default_model.get(family, "")
+        routing = Routing(provider_display=provider.display_name, model=chosen)
+        routing.env[self.key_env] = key
+        if base_url:
+            routing.env[self.base_url_env] = base_url
+        if chosen:
+            routing.env[self.model_env] = chosen
+        return routing
+
+    def passthrough_env(self, *, model: str, base_url: str) -> dict[str, str]:
+        """Env for an unset `provider` — honor only what the caller gave.
+
+        This is the backward-compatibility path: with no provider selected,
+        nothing about the environment may change beyond an explicit model or
+        base URL, so every pre-existing workflow behaves exactly as before.
+        """
+        out: dict[str, str] = {}
+        if model and self.model_env:
+            out[self.model_env] = model
+        if base_url and self.base_url_env:
+            out[self.base_url_env] = base_url
+        return out
+
+    #: Env var names this agent reads for its credential / endpoint / model.
+    key_env: str = ""
+    base_url_env: str = ""
+    model_env: str = ""
+
     # ── cost attribution ──────────────────────────────────────────────────
 
     #: Human-readable name for this agent in the step summary and telemetry.

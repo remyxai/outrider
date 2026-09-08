@@ -521,6 +521,25 @@ runs:
       with:
         python-version: '3.11'
 
+    - name: Configure the model backend
+      shell: bash
+      # One step for every agent. All routing knowledge lives in
+      # src/agents/providers.py, so adding a provider or an agent never
+      # requires editing this file again — and the docs table is generated
+      # from the same registry, so the two cannot drift.
+      #
+      # Composite-action env inheritance: the caller's `env:` block on the
+      # `- uses: remyxai/outrider@v1` step propagates to every step here, so
+      # whichever vendor secrets the caller passed are readable directly.
+      # Writing to $GITHUB_ENV makes the resolved credential / base URL /
+      # model visible to the recommend step that runs run.py.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
+      run: python ${{ github.action_path }}/src/configure_backend.py
+
     - name: Set up Node (for the agent CLI)
       uses: actions/setup-node@v4
       with:
@@ -643,196 +662,6 @@ runs:
       run: |
         git config --global user.name "remyx-ai[bot]"
         git config --global user.email "289541483+remyx-ai[bot]@users.noreply.github.com"
-
-    - name: Configure Backboard backend
-      if: ${{ inputs.agent == 'backboard' }}
-      shell: bash
-      # R-CLI carries its own router, so there is no provider mapping here —
-      # but `model` must still behave like it does for every other agent.
-      # Its model strings are `provider/model` (e.g. openai/gpt-5.5), which
-      # is how the vendor is chosen.
-      env:
-        INPUT_PROVIDER: ${{ inputs.provider }}
-        INPUT_MODEL: ${{ inputs.model }}
-      run: |
-        set -eu
-        if [ -z "${BACKBOARD_API_KEY:-}" ]; then
-          echo "::error::agent=backboard requires BACKBOARD_API_KEY in the caller's env block" >&2
-          exit 1
-        fi
-        # R-CLI addresses models as `<provider>/<model>`. Composing it from
-        # the same two inputs every other agent uses keeps one mental model
-        # across the action: pick an agent, pick a provider, pick a model.
-        # The pair is passed through verbatim rather than translated — R-CLI
-        # resolves provider ids server-side against a 17k-model catalogue, so
-        # a local allowlist here would go stale and reject valid combinations.
-        MODEL="${INPUT_MODEL:-}"
-        if [ -n "${INPUT_PROVIDER:-}" ] && [ -n "$MODEL" ]; then
-          case "$MODEL" in
-            */*) : ;;                       # already qualified — leave it
-            *)   MODEL="$INPUT_PROVIDER/$MODEL" ;;
-          esac
-        elif [ -n "${INPUT_PROVIDER:-}" ]; then
-          echo "::error::agent=backboard with provider='$INPUT_PROVIDER' also needs a model (R-CLI addresses models as <provider>/<model>)" >&2
-          exit 1
-        fi
-        if [ -n "$MODEL" ]; then
-          echo "BACKBOARD_MODEL=$MODEL" >> "$GITHUB_ENV"
-        fi
-
-    - name: Configure Codex backend from provider input
-      if: ${{ inputs.agent == 'codex' }}
-      shell: bash
-      # The Codex analogue of the Claude Code Configure step below. Codex
-      # reads its credential from CODEX_API_KEY and its endpoint from
-      # CODEX_BASE_URL, so each provider's secret is mapped into that one
-      # name and the adapter stays a single code path.
-      #
-      # wire_api is pinned to "responses" in the adapter because codex-cli
-      # removed Chat-Completions support at 0.151.0, so a provider must serve
-      # an OpenAI *Responses* endpoint (or sit behind a translating gateway).
-      env:
-        INPUT_PROVIDER: ${{ inputs.provider }}
-        INPUT_MODEL: ${{ inputs.model }}
-        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
-      run: |
-        set -eu
-        case "${INPUT_PROVIDER:-}" in
-          ''|openai)
-            if [ -z "${CODEX_API_KEY:-${OPENAI_API_KEY:-}}" ]; then
-              echo "::error::agent=codex requires CODEX_API_KEY (or OPENAI_API_KEY) in the caller's env block" >&2
-              exit 1
-            fi
-            echo "CODEX_API_KEY=${CODEX_API_KEY:-$OPENAI_API_KEY}" >> "$GITHUB_ENV"
-            ;;
-          moonshot)
-            if [ -z "${MOONSHOT_API_KEY:-}" ]; then
-              echo "::error::provider=moonshot requires MOONSHOT_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            # Verified: api.moonshot.ai serves /v1/responses (a bogus path on
-            # the same host 404s, so this is a real endpoint, not a catch-all).
-            echo "CODEX_API_KEY=$MOONSHOT_API_KEY" >> "$GITHUB_ENV"
-            echo "CODEX_BASE_URL=https://api.moonshot.ai/v1" >> "$GITHUB_ENV"
-            echo "CODEX_MODEL=${INPUT_MODEL:-kimi-k3}" >> "$GITHUB_ENV"
-            ;;
-          zai)
-            if [ -z "${ZAI_API_KEY:-}" ]; then
-              echo "::error::provider=zai requires ZAI_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            # NOT verified end-to-end: z.ai authenticates before routing, so
-            # an unauthenticated probe cannot tell a real /responses endpoint
-            # from a 404. If the run fails with an unexpected 4xx, the
-            # provider likely speaks Chat Completions only and needs a
-            # translating gateway via provider=custom.
-            echo "::warning::agent=codex + provider=zai is unverified — z.ai's OpenAI Responses support has not been confirmed. Use provider=custom with a gateway if this run 4xxs." >&2
-            echo "CODEX_API_KEY=$ZAI_API_KEY" >> "$GITHUB_ENV"
-            echo "CODEX_BASE_URL=https://api.z.ai/api/paas/v4" >> "$GITHUB_ENV"
-            echo "CODEX_MODEL=${INPUT_MODEL:-glm-5.3}" >> "$GITHUB_ENV"
-            ;;
-          custom)
-            if [ -z "${INPUT_MODEL_BASE_URL:-}" ]; then
-              echo "::error::agent=codex + provider=custom requires model-base-url (an OpenAI Responses endpoint)" >&2
-              exit 1
-            fi
-            if [ -z "${CODEX_API_KEY:-}" ]; then
-              echo "::error::agent=codex + provider=custom requires CODEX_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            echo "CODEX_BASE_URL=$INPUT_MODEL_BASE_URL" >> "$GITHUB_ENV"
-            [ -n "${INPUT_MODEL:-}" ] && echo "CODEX_MODEL=$INPUT_MODEL" >> "$GITHUB_ENV" || true
-            ;;
-          anthropic)
-            echo "::error::agent=codex cannot use provider=anthropic — Anthropic serves the Messages API, not OpenAI Responses. Use agent=claude for Anthropic-compatible backends." >&2
-            exit 1
-            ;;
-          *)
-            echo "::error::unknown provider '$INPUT_PROVIDER' for agent=codex; must be one of: openai, moonshot, zai, custom" >&2
-            exit 1
-            ;;
-        esac
-
-    - name: Configure backend from provider input
-      # `provider` routes Claude Code at an Anthropic-Messages-compatible
-      # endpoint. Codex and R-CLI carry their own model routing, so the
-      # pair is validated rather than silently ignored.
-      if: ${{ inputs.provider != '' && (inputs.agent == '' || inputs.agent == 'claude') }}
-      shell: bash
-      # Consolidates the per-fork Configure step that previously mapped
-      # `provider` → (auth env var, base URL, secret name). Runs only when
-      # the caller sets `provider`; empty (default) preserves existing
-      # behavior — model-base-url and auth env vars pass through untouched.
-      #
-      # Composite-action env inheritance: the caller's `env:` block on the
-      # `- uses: remyxai/outrider@v1` step propagates to every step here,
-      # so ANTHROPIC_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY (whichever
-      # the caller passed) are readable via os.environ / bash env directly.
-      # Writing to $GITHUB_ENV makes the resulting ANTHROPIC_AUTH_TOKEN /
-      # ANTHROPIC_BASE_URL visible to subsequent composite steps (including
-      # the recommend step that runs run.py).
-      env:
-        INPUT_PROVIDER: ${{ inputs.provider }}
-        INPUT_MODEL: ${{ inputs.model }}
-        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
-      run: |
-        set -eu
-        # Mutual-exclusion enforcement: callers typically pass every backend's
-        # secret via the top-level env block ({ANTHROPIC,ZAI,MOONSHOT}_API_KEY
-        # all set) so `provider` can be dispatch-time-switchable. Per the
-        # docs/backends.md auth-header matrix, having both ANTHROPIC_API_KEY
-        # and ANTHROPIC_AUTH_TOKEN set makes Claude Code prefer x-api-key —
-        # which non-Anthropic backends reject with 401. Each branch below
-        # clears the non-selected auth var to $GITHUB_ENV (empty string,
-        # which Claude Code and the CLI's auth validator both treat as
-        # unset for the mutual-exclusion check).
-        case "$INPUT_PROVIDER" in
-          anthropic)
-            if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-              echo "::error::provider=anthropic requires ANTHROPIC_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            # ANTHROPIC_API_KEY is already in the parent env — no override needed
-            echo "ANTHROPIC_AUTH_TOKEN=" >> "$GITHUB_ENV"
-            ;;
-          zai)
-            if [ -z "${ZAI_API_KEY:-}" ]; then
-              echo "::error::provider=zai requires ZAI_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_API_KEY=" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic" >> "$GITHUB_ENV"
-            ;;
-          moonshot)
-            if [ -z "${MOONSHOT_API_KEY:-}" ]; then
-              echo "::error::provider=moonshot requires MOONSHOT_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            echo "ANTHROPIC_AUTH_TOKEN=$MOONSHOT_API_KEY" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_API_KEY=" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic" >> "$GITHUB_ENV"
-            ;;
-          custom)
-            if [ -z "$INPUT_MODEL_BASE_URL" ]; then
-              echo "::error::provider=custom requires model-base-url to be set" >&2
-              exit 1
-            fi
-            if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
-              echo "::error::provider=custom requires ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in the caller's env block" >&2
-              exit 1
-            fi
-            # model-base-url passes through via INPUT_MODEL_BASE_URL to run.py.
-            # No clearing here — caller supplied exactly what they want.
-            ;;
-          *)
-            echo "::error::unknown provider '$INPUT_PROVIDER'; must be one of: anthropic, zai, moonshot, custom" >&2
-            exit 1
-            ;;
-        esac
-        if [ -n "$INPUT_MODEL" ]; then
-          echo "ANTHROPIC_MODEL=$INPUT_MODEL" >> "$GITHUB_ENV"
-        fi
 
     - name: Recommend + implement + open PR
       id: recommend
