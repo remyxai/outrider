@@ -274,3 +274,102 @@ def test_no_operator_log_hardcodes_claude():
         if re.search(r'log\.(info|warning|error)\(f?"[^"]*Claude', line)
     ]
     assert not offenders, f"operator logs must name the active agent: {offenders}"
+
+
+# ─── failure remedies must point at the right vendor ────────────────────────
+
+AUTH_TAIL = "HTTP 401 authentication_error invalid api key"
+
+
+def test_failure_remedy_names_the_agents_own_console(monkeypatch):
+    """A Backboard failure used to tell the operator to top up at Anthropic.
+
+    The recognizable causes are common across vendors, but the remedy — which
+    console, which secret — is not.
+    """
+    monkeypatch.setattr(run, "_BACKEND", BackboardBackend())
+    monkeypatch.delenv("INPUT_PROVIDER", raising=False)
+    blob = " ".join(run._agent_failure_blocks("backboard", AUTH_TAIL, 3))
+    assert "BACKBOARD_API_KEY" in blob
+    assert "app.backboard.io" in blob
+    assert "anthropic" not in blob.lower()
+
+
+def test_codex_failure_remedy_points_at_openai(monkeypatch):
+    monkeypatch.setattr(run, "_BACKEND", CodexBackend())
+    monkeypatch.delenv("INPUT_PROVIDER", raising=False)
+    blob = " ".join(run._agent_failure_blocks("codex", AUTH_TAIL, 1))
+    assert "CODEX_API_KEY" in blob
+    assert "platform.openai.com" in blob
+
+
+def test_remedy_names_the_providers_secret_not_the_agents(monkeypatch):
+    """A z.ai-routed Claude Code run authenticates with ZAI_API_KEY, so
+    telling the operator to reset ANTHROPIC_API_KEY sends them to the wrong
+    secret."""
+    from agents.claude import ClaudeCodeBackend
+
+    monkeypatch.setattr(run, "_BACKEND", ClaudeCodeBackend())
+    monkeypatch.setenv("INPUT_PROVIDER", "zai")
+    blob = " ".join(run._agent_failure_blocks("claude", AUTH_TAIL, 2))
+    assert "ZAI_API_KEY" in blob
+    assert "gh secret set ZAI_API_KEY" in blob
+
+
+def test_claude_default_remedy_is_unchanged(monkeypatch):
+    from agents.claude import ClaudeCodeBackend
+
+    monkeypatch.setattr(run, "_BACKEND", ClaudeCodeBackend())
+    monkeypatch.delenv("INPUT_PROVIDER", raising=False)
+    blob = " ".join(run._agent_failure_blocks("claude", AUTH_TAIL, 2))
+    assert "ANTHROPIC_API_KEY" in blob
+    assert "console.anthropic.com" in blob
+
+
+def test_credit_exhaustion_recognizes_both_vendors_wording(monkeypatch):
+    """Anthropic says "credit balance is too low"; OpenAI says "no credits
+    remaining" — both are the same actionable state."""
+    monkeypatch.setattr(run, "_BACKEND", CodexBackend())
+    monkeypatch.delenv("INPUT_PROVIDER", raising=False)
+    blob = " ".join(
+        run._agent_failure_blocks("codex", "You have no credits remaining.", 1)
+    )
+    assert "credit balance exhausted" in blob
+    assert "platform.openai.com" in blob
+
+
+def test_no_user_facing_string_hardcodes_the_agent_name():
+    """Guard the whole class, including multi-line calls and step-summary
+    lines, not just the one call that was found on a real run.
+
+    Contract names are exempt: telemetry fields (`claude_calls`,
+    `claude_log_tail`), the `claude-timeout` input, status values the engine
+    stores (`claude_failed`, `claude_code_envelope`), the back-compat
+    `_CLAUDE_ENV_WHITELIST` alias, and the Claude-Code-specific auth
+    validator, which is only ever called for that agent.
+    """
+    import re
+    from pathlib import Path
+
+    CONTRACTS = (
+        "_CLAUDE_ENV", "claude_calls", "claude_log_tail", "claude-timeout",
+        "claude_timeout", "claude_failed", "claude_code_envelope",
+        # The auth-header matrix inside _validate_claude_auth_env, which is
+        # only ever called for Claude Code. The sentence spans two source
+        # lines, so both fragments are exempt.
+        "Claude Code prefers",
+        "non-default backend is configured",
+        "pre_pr_fidelity_failed_claude",
+    )
+    src = (Path(__file__).resolve().parent.parent / "src" / "run.py").read_text()
+    offenders = []
+    for lineno, line in enumerate(src.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        for literal in re.findall(r'"([^"]*Claude[^"]*)"', line):
+            if any(c in line for c in CONTRACTS):
+                continue
+            offenders.append(f"{lineno}: {literal[:60]}")
+    assert not offenders, (
+        "user-facing text must name the active agent: " + "; ".join(offenders)
+    )

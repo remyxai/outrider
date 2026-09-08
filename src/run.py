@@ -8224,7 +8224,8 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
         # untruncated — so the complete error (e.g. usage limit / credit
         # balance) is always recoverable from the run logs.
         log.error(
-            "Claude Code implementation call failed — full output:\n%s", text
+            "%s implementation call failed — full output:\n%s",
+            _BACKEND.display_name, text
         )
     return ok, text[-4000:]   # last 4KB retained for the telemetry log tail
 
@@ -9730,7 +9731,7 @@ def _render_risky_surface_note(files: list[str]) -> str:
 
 
 def _file_is_new(workdir: Path, path: str) -> bool:
-    """True if `path` did not exist at HEAD (i.e. Claude created it)."""
+    """True if `path` did not exist at HEAD (i.e. the agent created it)."""
     result = subprocess.run(
         ["git", "ls-tree", "HEAD", "--", path],
         cwd=workdir, capture_output=True, text=True, check=False,
@@ -14982,7 +14983,7 @@ def _run_pre_pr_fidelity_check(
         scoped_out=scoped_out,
     )
     log.info(
-        f"  → pre-PR fidelity Claude one-shot "
+        f"  → pre-PR fidelity {_BACKEND.display_name} one-shot "
         f"({verdict['mode_cited']}, subs={len(substitutions)}, "
         f"scoped_out={len(scoped_out)}, timeout={target.claude_timeout_s}s)"
     )
@@ -14991,7 +14992,7 @@ def _run_pre_pr_fidelity_check(
     )
     if not ok:
         verdict["status"] = "pre_pr_fidelity_failed_claude"
-        verdict["error"] = f"Claude non-zero: {raw[-500:]}"
+        verdict["error"] = f"{_BACKEND.display_name} non-zero: {raw[-500:]}"
         log.warning(f"  ⚠ pre-PR fidelity {_BACKEND.display_name} failed")
         return verdict
 
@@ -15172,7 +15173,7 @@ def _run_mode3_insight_preservation_check(
     if not reframed_insight:
         log.info(
             "  → pre-PR fidelity (mode-3): no reframed_insight in self-review; "
-            "skipping (Claude may have omitted the field)"
+            f"skipping ({_BACKEND.display_name} may have omitted the field)"
         )
         verdict["status"] = "pre_pr_fidelity_mode3_skipped_no_insight"
         return verdict
@@ -15192,7 +15193,8 @@ def _run_mode3_insight_preservation_check(
         arxiv_id=rec.arxiv_id,
     )
     log.info(
-        f"  → pre-PR fidelity (mode-3) insight-preservation Claude one-shot "
+        f"  → pre-PR fidelity (mode-3) insight-preservation "
+            f"{_BACKEND.display_name} one-shot "
         f"(timeout={target.claude_timeout_s}s)"
     )
     audit_workdir = Path(tempfile.mkdtemp(prefix="outrider-mode3-fidelity-"))
@@ -15201,7 +15203,7 @@ def _run_mode3_insight_preservation_check(
     )
     if not ok:
         verdict["status"] = "pre_pr_fidelity_failed_claude"
-        verdict["error"] = f"Claude non-zero: {raw[-500:]}"
+        verdict["error"] = f"{_BACKEND.display_name} non-zero: {raw[-500:]}"
         log.warning(f"  ⚠ pre-PR fidelity (mode-3) {_BACKEND.display_name} failed")
         return verdict
 
@@ -15830,13 +15832,15 @@ def run_fidelity_audit(target: Target) -> dict:
     ok, raw = _run_claude_oneshot(workdir, prompt, target.claude_timeout_s, max_turns=20)
     if not ok:
         result["status"] = "fidelity_failed_claude"
-        result["error"] = f"Claude returned non-zero: {raw[-500:]}"
+        result["error"] = f"{_BACKEND.display_name} returned non-zero: {raw[-500:]}"
         return result
 
     matrix = _extract_json_object(raw)
     if not matrix or "items" not in matrix:
         result["status"] = "fidelity_failed_claude"
-        result["error"] = f"Claude returned unparseable JSON: {raw[-500:]}"
+        result["error"] = (
+            f"{_BACKEND.display_name} returned unparseable JSON: {raw[-500:]}"
+        )
         return result
 
     coverage_section = _render_coverage_matrix(matrix, audit_anchor=audit_anchor)
@@ -16064,7 +16068,7 @@ def _fetch_recent_merged_prs(repo: str, limit: int) -> list[dict]:
 def _build_convention_extraction_prompt(
     upstream_repo: str, recent_prs: list[dict]
 ) -> str:
-    """Compose the prompt for the convention-extraction Claude one-shot."""
+    """Compose the prompt for the convention-extraction agent one-shot."""
     pr_blocks = []
     for pr in recent_prs:
         files_summary = "\n".join(
@@ -16394,7 +16398,7 @@ def _apply_pr_body_convention_update(
     )
     ok, raw = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=4)
     if not ok:
-        return False, "", f"body-rewrite Claude call failed: {raw[-300:]}"
+        return False, "", f"body-rewrite {_BACKEND.display_name} call failed: {raw[-300:]}"
     rewrite = _extract_json_object(raw)
     if not rewrite or "updated_body" not in rewrite:
         return False, "", f"body-rewrite returned unparseable JSON: {raw[-300:]}"
@@ -17238,7 +17242,7 @@ def _apply_issue_body_convention_update(
     )
     ok, raw = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=4)
     if not ok:
-        return False, "", "", f"issue-body-rewrite Claude call failed: {raw[-300:]}"
+        return False, "", "", f"issue-body-rewrite {_BACKEND.display_name} call failed: {raw[-300:]}"
     rewrite = _parse_issue_rewrite_response(raw)
     if not rewrite:
         return False, "", "", (
@@ -17936,29 +17940,49 @@ def run_test_gate(target: Target) -> dict:
 
 
 def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[str]:
-    """Render a list of step_summary markdown lines for a ``claude_failed``
-    status, dispatching on the agent's log tail.
+    """Render step_summary markdown for an agent-failure status.
 
-    Currently agent-specific to Claude Code (Anthropic). When alternative
-    agent CLIs land (Aider, Goose, Copilot, Codex), this helper grows a
-    per-agent patterns + URLs lookup keyed on ``agent`` — the call site
-    in ``_write_step_summary`` doesn't change.
+    Dispatches on the agent's log tail. The recognizable causes — exhausted
+    credit, a rejected key, a rate limit — are common across vendors, but the
+    *remedy* is not: the console to top up at, the secret to rotate, and the
+    provider's name all differ per agent. Those come from the active backend
+    rather than being hardcoded, so a Backboard failure no longer tells the
+    operator to visit Anthropic's billing page.
     """
     tail = (log_tail or "").lower()
+    # Two different names matter here. The *credit* and the rate limit belong
+    # to whoever served the tokens (Anthropic, z.ai, Moonshot…), which is what
+    # model_backend records; the failure *tail* is the agent's own output.
+    vendor = _RUN_COST.get("model_backend") or _BACKEND.display_name
+    # The secret to rotate is the *provider's*, not the agent's: a z.ai-routed
+    # Claude Code run authenticates with ZAI_API_KEY, so telling the operator
+    # to reset ANTHROPIC_API_KEY sends them to the wrong secret.
+    secret = _BACKEND.key_env or "ANTHROPIC_API_KEY"
+    provider_id = (os.environ.get("INPUT_PROVIDER") or "").strip().lower()
+    if provider_id:
+        from agents.providers import PROVIDERS as _PROVIDERS
+        provider = _PROVIDERS.get(provider_id)
+        if provider is not None and provider.secret_env:
+            secret = provider.secret_env
+    billing = _BACKEND.billing_url
+    keys = _BACKEND.keys_url
     lines: list[str] = []
-    if "credit balance is too low" in tail:
-        lines.append("\n> ### 🪙 Action required: Anthropic credit balance exhausted\n>")
+    if "credit balance is too low" in tail or "no credits remaining" in tail:
         lines.append(
-            f"> All {claude_calls} Claude calls this run failed with "
-            "\"Credit balance is too low\"."
+            f"\n> ### 🪙 Action required: {vendor} credit balance exhausted\n>"
         )
         lines.append(
-            "> The `ANTHROPIC_API_KEY` secret authenticated — the account "
-            "just has no remaining credits."
+            f"> All {claude_calls} {_BACKEND.display_name} calls this run "
+            "failed for lack of credit."
+        )
+        lines.append(
+            f"> The `{secret}` secret authenticated — the account just has no "
+            "remaining credits."
         )
         lines.append(">")
-        lines.append(f"> **Top up at:** {_ANTHROPIC_BILLING_URL}")
-        lines.append(">")
+        if billing:
+            lines.append(f"> **Top up at:** {billing}")
+            lines.append(">")
         lines.append(
             "> The next scheduled run will retry automatically once "
             "credits are available.\n"
@@ -17968,24 +17992,26 @@ def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[
         or "invalid api key" in tail
         or "invalid x-api-key" in tail
     ):
-        lines.append("\n> ### 🔑 Action required: ANTHROPIC_API_KEY secret invalid\n>")
+        lines.append(f"\n> ### 🔑 Action required: {secret} secret invalid\n>")
         lines.append(
-            "> The key configured as the `ANTHROPIC_API_KEY` repo secret "
-            "didn't authenticate."
+            f"> The key configured as the `{secret}` repo secret didn't "
+            "authenticate."
         )
-        lines.append(
-            f"> Check the key at {_ANTHROPIC_KEYS_URL} and update the "
-            "secret via"
-        )
-        lines.append("> `gh secret set ANTHROPIC_API_KEY --repo <this-repo>`.\n")
+        if keys:
+            lines.append(f"> Check the key at {keys} and update the secret via")
+        else:
+            lines.append("> Check the key with your provider and update it via")
+        lines.append(f"> `gh secret set {secret} --repo <this-repo>`.\n")
     elif "429" in tail or "rate_limit" in tail or "too many requests" in tail:
         lines.append("\n> ### ⏱️ Rate limited — no action needed\n>")
         lines.append(
-            "> The Anthropic API rate-limited this run. The next "
-            "scheduled run will retry.\n"
+            f"> {vendor} rate-limited this run. The next scheduled run will "
+            "retry.\n"
         )
     elif tail:
-        lines.append("\n<details><summary>Claude agent failure tail</summary>\n")
+        lines.append(
+        f"\n<details><summary>{_BACKEND.display_name} failure tail</summary>\n"
+    )
         lines.append(f"\n```\n{log_tail[:1500]}\n```\n")
         lines.append("\n</details>\n")
     return lines
@@ -18233,7 +18259,7 @@ def _write_step_summary(result: dict) -> None:
     token_line = f"{in_tok:,} in / {out_tok:,} out"
     if cache_in_tok:
         token_line += f" ({cache_in_tok:,} cache-read)"
-    agent = result.get("agent", "Claude Code")
+    agent = result.get("agent") or _BACKEND.display_name
     backend = result.get("model_backend", "Anthropic")
     cost_basis = result.get("cost_basis", "claude_code_envelope")
     # Annotate the cost line when the figure is the CLI's
@@ -18253,7 +18279,7 @@ def _write_step_summary(result: dict) -> None:
     lines.append(f"- **Cost**: `${cost:.4f}`{cost_note}")
     lines.append(f"- **Tokens**: {token_line}")
     if claude_calls:
-        lines.append(f"- **Claude calls**: {claude_calls}")
+        lines.append(f"- **{agent} calls**: {claude_calls}")
     lines.append("")
 
     if rejected:
