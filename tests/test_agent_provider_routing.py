@@ -208,12 +208,34 @@ def test_backboard_composes_provider_and_model():
     assert routing.env["BACKBOARD_MODEL"] == "openai/gpt-5.5"
 
 
-def test_backboard_leaves_an_already_qualified_model_alone():
+def test_backboard_leaves_a_model_already_prefixed_with_this_provider():
     routing = route(
-        resolve("backboard"), "openai", "anthropic/claude-opus-4-8", "",
+        resolve("backboard"), "openai", "openai/gpt-5.5", "",
         env(BACKBOARD_API_KEY="bk"),
     )
-    assert routing.env["BACKBOARD_MODEL"] == "anthropic/claude-opus-4-8"
+    assert routing.env["BACKBOARD_MODEL"] == "openai/gpt-5.5"
+
+
+def test_backboard_prefixes_a_multi_segment_model_id():
+    """Backboard ids are often three levels deep — `openrouter/~z-ai/glm-latest`.
+
+    A bare `contains "/"` test read `~z-ai/glm-latest` as already qualified
+    and dropped the provider segment, and the router rejected the id. Found
+    on a real run against the live catalogue.
+    """
+    routing = route(
+        resolve("backboard"), "openrouter", "~z-ai/glm-latest", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "openrouter/~z-ai/glm-latest"
+
+
+def test_backboard_does_not_double_prefix():
+    routing = route(
+        resolve("backboard"), "openrouter", "openrouter/~z-ai/glm-latest", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "openrouter/~z-ai/glm-latest"
 
 
 def test_backboard_sets_no_endpoint():
@@ -306,3 +328,26 @@ def test_auth_style_defaults_to_bearer():
     assert PROVIDERS["anthropic"].auth_style(
         ApiFamily.ANTHROPIC_MESSAGES
     ) is AuthStyle.API_KEY
+
+
+def test_native_router_accepts_provider_ids_this_registry_never_heard_of():
+    """Backboard's catalogue includes openrouter, cerebras, featherless…
+
+    Outrider never picks an endpoint for a native router, so validating its
+    provider ids against this registry would reject valid combinations and go
+    stale. Unknown ids pass through; the vendor rejects what it doesn't know.
+    """
+    for pid in ("openrouter", "cerebras", "featherless"):
+        routing = route(
+            resolve("backboard"), pid, "some-model", "",
+            env(BACKBOARD_API_KEY="bk"),
+        )
+        assert routing.env["BACKBOARD_MODEL"] == f"{pid}/some-model"
+
+
+def test_a_non_router_agent_still_rejects_an_unknown_provider():
+    """The passthrough is specific to native routers — Claude Code and Codex
+    need a real endpoint, so an unknown id must still fail."""
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("claude"), "openrouter", "x", "", env())
+    assert "unknown provider" in str(exc.value)

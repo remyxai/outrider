@@ -228,15 +228,27 @@ def resolve(
     if not provider_id:
         return _passthrough(backend, model, base_url_override, env)
 
+    if family is ApiFamily.NATIVE_ROUTER:
+        # A native router resolves provider ids against its own catalogue —
+        # Backboard's includes openrouter, cerebras, featherless and more that
+        # this registry has no reason to know, because Outrider never picks an
+        # endpoint for them. Validating against PROVIDERS here would reject
+        # valid combinations and go stale, so unknown ids pass through and the
+        # vendor rejects what it does not recognize.
+        provider = PROVIDERS.get(provider_id) or Provider(
+            id=provider_id,
+            display_name=provider_id,
+            secret_env="",
+            endpoints={ApiFamily.NATIVE_ROUTER: ""},
+        )
+        return backend.routing(provider, family, model, "", env)
+
     provider = PROVIDERS.get(provider_id)
     if provider is None:
         raise RoutingError(
             f"unknown provider '{provider_id}'; must be one of: "
             + ", ".join(sorted(PROVIDERS))
         )
-
-    if family is ApiFamily.NATIVE_ROUTER:
-        return backend.routing(provider, family, model, "", env)
 
     if not provider.serves(family):
         alternatives = [

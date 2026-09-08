@@ -127,7 +127,13 @@ class BackboardBackend(AgentBackend):
                 f"agent={self.name} with provider={provider.id} also needs a "
                 f"model — R-CLI addresses models as <provider>/<model>"
             )
-        qualified = model if "/" in model else f"{provider.id}/{model}"
+        # "Already qualified" means the model already starts with THIS
+        # provider, not merely that it contains a slash. Backboard model ids
+        # are frequently three levels deep — `openrouter/~z-ai/glm-latest` —
+        # so a bare `contains "/"` test silently drops the provider segment
+        # and the router rejects the id. Found on a real run.
+        prefix = f"{provider.id}/"
+        qualified = model if model.startswith(prefix) else prefix + model
         routing = Routing(provider_display=provider.display_name, model=qualified)
         routing.env[self.model_env] = qualified
         return routing
