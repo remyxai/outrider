@@ -232,3 +232,45 @@ def test_rcli_permission_denial_fails_the_implementation_call(
     ok, log_tail = run.invoke_claude_code(tmp_path, timeout_s=60)
     assert not ok
     assert "permission" in log_tail.lower()
+
+
+# ─── operator-facing logs must name the agent that actually ran ─────────────
+
+def test_implementation_log_names_the_configured_agent(tmp_path, monkeypatch, caplog):
+    """A real Backboard run logged "invoking Claude Code".
+
+    Harmless to the run, but an operator reading the job log would conclude
+    the wrong agent executed — and cost, latency and failure modes all differ
+    per agent, so that is a genuinely misleading breadcrumb.
+    """
+    import logging
+
+    monkeypatch.setattr(run, "_BACKEND", BackboardBackend())
+    monkeypatch.setenv("BACKBOARD_API_KEY", "bk-test")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: _Proc(transcript("backboard", "simple_turn")),
+    )
+    bundle = tmp_path / run.BUNDLE_DIR_NAME
+    bundle.mkdir(parents=True)
+    (bundle / "INVOCATION.md").write_text("do the thing")
+
+    with caplog.at_level(logging.INFO):
+        run.invoke_claude_code(tmp_path, timeout_s=60)
+
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "Backboard R-CLI" in logged
+    assert "invoking Claude Code" not in logged
+
+
+def test_no_operator_log_hardcodes_claude():
+    """Guard the whole class, not just the one line that was found."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "src" / "run.py").read_text()
+    offenders = [
+        line.strip() for line in src.splitlines()
+        if re.search(r'log\.(info|warning|error)\(f?"[^"]*Claude', line)
+    ]
+    assert not offenders, f"operator logs must name the active agent: {offenders}"

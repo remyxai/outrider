@@ -8210,7 +8210,8 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     invocation = _strip_leading_frontmatter(
         (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
     )
-    log.info(f"  → invoking Claude Code (timeout={timeout_s}s) in {workdir}")
+    log.info(f"  → invoking {_BACKEND.display_name} "
+             f"(timeout={timeout_s}s) in {workdir}")
     cmd = _agent_base_cmd()
     max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
     if max_turns:
@@ -12139,7 +12140,7 @@ def process_target(target: Target) -> dict:
         # 6.5. Claude may have elected Issue-mode instead of writing code.
         issue_file = workdir / ISSUE_FALLBACK_FILENAME
         if issue_file.exists():
-            log.info(f"  → Claude elected Issue-mode "
+            log.info(f"  → {_BACKEND.display_name} elected Issue-mode "
                      f"({ISSUE_FALLBACK_FILENAME} present); opening Issue")
             issue_title_inner, issue_body_inner = parse_issue_fallback_file(issue_file)
             issue_title = f"{PR_TITLE_PREFIX} {issue_title_inner}"
@@ -14991,7 +14992,7 @@ def _run_pre_pr_fidelity_check(
     if not ok:
         verdict["status"] = "pre_pr_fidelity_failed_claude"
         verdict["error"] = f"Claude non-zero: {raw[-500:]}"
-        log.warning(f"  ⚠ pre-PR fidelity Claude failed")
+        log.warning(f"  ⚠ pre-PR fidelity {_BACKEND.display_name} failed")
         return verdict
 
     matrix = _extract_json_object(raw)
@@ -15201,7 +15202,7 @@ def _run_mode3_insight_preservation_check(
     if not ok:
         verdict["status"] = "pre_pr_fidelity_failed_claude"
         verdict["error"] = f"Claude non-zero: {raw[-500:]}"
-        log.warning("  ⚠ pre-PR fidelity (mode-3) Claude failed")
+        log.warning(f"  ⚠ pre-PR fidelity (mode-3) {_BACKEND.display_name} failed")
         return verdict
 
     matrix = _extract_json_object(raw)
@@ -15824,7 +15825,8 @@ def run_fidelity_audit(target: Target) -> dict:
         audit_anchor = "paper"
         log.info(f"  → paper-anchored audit (arxiv:{arxiv_id}, no reference impl)")
 
-    log.info(f"  → Claude one-shot audit (timeout={target.claude_timeout_s}s)")
+    log.info(f"  → {_BACKEND.display_name} one-shot audit "
+             f"(timeout={target.claude_timeout_s}s)")
     ok, raw = _run_claude_oneshot(workdir, prompt, target.claude_timeout_s, max_turns=20)
     if not ok:
         result["status"] = "fidelity_failed_claude"
@@ -16713,7 +16715,8 @@ def run_convention_pass(target: Target) -> dict:
         (bundle_dir / "INVOCATION.md").write_text(invocation)
 
         # Run the agentic patch loop
-        log.info(f"  → invoking Claude Code patch session (timeout={target.claude_timeout_s}s)")
+        log.info(f"  → invoking {_BACKEND.display_name} patch session "
+                 f"(timeout={target.claude_timeout_s}s)")
         ok, patch_output = invoke_claude_code(clone_workdir, timeout_s=target.claude_timeout_s)
         if not ok:
             result["status"] = "convention_failed_patch"
