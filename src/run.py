@@ -7691,11 +7691,18 @@ def _record_claude_usage(env: dict) -> None:
             _RUN_COST.get("envelopes_without_usage", 0) + 1
         )
 
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    # Read the endpoint from whichever var the ACTIVE agent routes with.
+    # Hardcoding ANTHROPIC_BASE_URL meant a Codex run at Moonshot reported
+    # cost_basis="unavailable" and $0.00 despite the rate table having rows
+    # for that host — the base URL was simply in CODEX_BASE_URL.
+    base_url = os.environ.get(_BACKEND.base_url_env or "ANTHROPIC_BASE_URL", "")
     # Prefer the envelope's model (what was actually served) over the env
     # var (what we requested) — same in practice, but envelope wins when
     # both are present.
-    model = env.get("model") or os.environ.get("ANTHROPIC_MODEL", "")
+    model = (
+        env.get("model")
+        or os.environ.get(_BACKEND.model_env or "ANTHROPIC_MODEL", "")
+    )
 
     if _BACKEND.name != "claude":
         # Non-Claude agents don't speak ANTHROPIC_BASE_URL, so the base-url
@@ -7708,6 +7715,9 @@ def _record_claude_usage(env: dict) -> None:
             _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
             _RUN_COST["cost_basis"] = "agent_envelope"
             return
+        # No dollars from the CLI — fall back to the per-host rate table,
+        # which is keyed by endpoint host and so serves any agent routing at
+        # a host we have rows for.
         _, rates = _detect_backend(base_url, model)
         if rates is not None:
             rate_in, rate_out, rate_cache = rates

@@ -270,3 +270,51 @@ def test_guardrail_note_is_logged_once_per_run(monkeypatch, caplog):
             run._agent_base_cmd()
     notes = [r for r in caplog.records if "guardrail policy" in r.getMessage()]
     assert len(notes) == 1
+
+
+# ─── the rate table must reach every agent ──────────────────────────────────
+
+def test_rate_table_applies_to_a_non_claude_agent(monkeypatch):
+    """Codex at Moonshot reported $0.00 / "unavailable" despite the rate
+    table having rows for that host.
+
+    Cost resolution read ANTHROPIC_BASE_URL, which a Codex run never sets —
+    its endpoint lives in CODEX_BASE_URL. The table is keyed by host, so it
+    serves any agent routing at a host we have rows for.
+    """
+    monkeypatch.setattr(run, "_BACKEND", CodexBackend())
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("CODEX_BASE_URL", "https://api.moonshot.ai/v1")
+    monkeypatch.setenv("CODEX_MODEL", "kimi-k3")
+    run._RUN_COST.update(cost_usd=0.0, cost_basis=None)
+
+    run._record_claude_usage(envelope(
+        usage={"input_tokens": 1_000_000, "output_tokens": 100_000,
+               "cache_read_input_tokens": 0},
+        total_cost_usd=None, model="kimi-k3",
+    ))
+
+    assert run._RUN_COST["cost_basis"] == "backend_rate_table"
+    # kimi-k3: $3.00/M in, $15.00/M out
+    assert run._RUN_COST["cost_usd"] == pytest.approx(4.5)
+
+
+def test_unknown_host_still_reports_unavailable(monkeypatch):
+    """A host with no rate row must say so rather than invent a number."""
+    monkeypatch.setattr(run, "_BACKEND", CodexBackend())
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("CODEX_BASE_URL", "https://gateway.internal/v1")
+    run._RUN_COST.update(cost_usd=0.0, cost_basis=None)
+
+    run._record_claude_usage(envelope(total_cost_usd=None))
+
+    assert run._RUN_COST["cost_basis"] == "unavailable"
+    assert run._RUN_COST["cost_usd"] == 0.0
+
+
+def test_claude_still_reads_its_own_base_url(monkeypatch):
+    monkeypatch.setattr(run, "_BACKEND", ClaudeCodeBackend())
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.moonshot.ai/anthropic")
+    run._RUN_COST.update(cost_usd=0.0, cost_basis=None)
+    run._record_claude_usage(envelope(model="kimi-k3"))
+    assert run._RUN_COST["cost_basis"] == "backend_rate_table"
