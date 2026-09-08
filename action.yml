@@ -563,13 +563,25 @@ runs:
             codex --version
             ;;
           backboard)
-            # Native binary (~99 MB), not an npm package. BACKBOARD_INSTALL
-            # keeps it out of $HOME so the installer never edits shell rc
-            # files on the runner.
-            BACKBOARD_INSTALL="$RUNNER_TEMP/backboard" \
-              curl -fsSL https://app.backboard.io/api/cli | sh
-            echo "$RUNNER_TEMP/backboard/bin" >> "$GITHUB_PATH"
-            "$RUNNER_TEMP/backboard/bin/backboard" --version
+            # Native binary (~99 MB), not an npm package.
+            #
+            # BACKBOARD_INSTALL must be *exported*, not prefixed onto the
+            # pipeline: `VAR=x curl ... | sh` sets VAR for curl, not for the
+            # sh that actually runs the installer, so the install silently
+            # lands in $HOME/.backboard and any hardcoded path 127s.
+            export BACKBOARD_INSTALL="$RUNNER_TEMP/backboard"
+            curl -fsSL https://app.backboard.io/api/cli | sh
+            # Resolve wherever it actually landed: the installer also links
+            # the binary onto PATH itself, so accept either location rather
+            # than depending on one layout staying put.
+            BB="$BACKBOARD_INSTALL/bin/backboard"
+            [ -x "$BB" ] || BB="$(command -v backboard || true)"
+            if [ -z "$BB" ] || [ ! -x "$BB" ]; then
+              echo "::error::backboard CLI not found after install" >&2
+              exit 1
+            fi
+            dirname "$BB" >> "$GITHUB_PATH"
+            "$BB" --version
             ;;
           *)
             echo "::error::unknown agent '$INPUT_AGENT'; must be one of: claude, codex, backboard" >&2

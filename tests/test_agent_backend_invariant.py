@@ -301,3 +301,32 @@ def test_tool_steps_ask_the_backend_rather_than_hardcoding_claude():
     envmd = next(v for k, v in bodies.items() if "ENVIRONMENTS.md" in k)
     assert "agent_tooling.py" in envmd
     assert "Claude Code skill" not in envmd
+
+
+def test_backboard_install_exports_its_location_rather_than_prefixing_it():
+    """`VAR=x curl ... | sh` sets VAR for curl, not for the sh running the
+    installer.
+
+    Found on a real runner: the install silently landed in $HOME/.backboard
+    while the verification used $RUNNER_TEMP, so the step exited 127. No local
+    test could have caught it — this pins the shape that fixed it.
+    """
+    steps = _action_yaml()["runs"]["steps"]
+    install = next(
+        s for s in steps if s.get("name") == "Install the coding-agent CLI"
+    )
+    body = install["run"]
+    assert "export BACKBOARD_INSTALL=" in body
+    assert 'BACKBOARD_INSTALL="$RUNNER_TEMP/backboard" \\' not in body
+
+
+def test_backboard_install_tolerates_either_install_location():
+    """The installer also links the binary onto PATH itself, so the step must
+    not depend on one layout staying put."""
+    steps = _action_yaml()["runs"]["steps"]
+    install = next(
+        s for s in steps if s.get("name") == "Install the coding-agent CLI"
+    )
+    body = install["run"]
+    assert "command -v backboard" in body
+    assert "not found after install" in body, "must fail loudly, not 127"
