@@ -407,7 +407,9 @@ inputs:
       endpoint families: `claude` routes over Anthropic *Messages*-compatible
       backends, `codex` over OpenAI *Responses*-compatible ones. Moonshot
       serves both, so `provider: moonshot` works with either agent. `backboard`
-      carries its own router — set `BACKBOARD_MODEL` in the env block instead.
+      carries its own router, and composes the two into R-CLI's own
+      `<provider>/<model>` form — so `provider: openai` + `model: gpt-5.5`
+      does the right thing there too.
 
       Capability differences degrade telemetry, never the run: a backend
       that reports no dollars is recorded as `cost_basis: unavailable`
@@ -642,15 +644,41 @@ runs:
         git config --global user.name "remyx-ai[bot]"
         git config --global user.email "289541483+remyx-ai[bot]@users.noreply.github.com"
 
-    - name: Validate the agent / provider pair
-      if: ${{ inputs.provider != '' && inputs.agent == 'backboard' }}
+    - name: Configure Backboard backend
+      if: ${{ inputs.agent == 'backboard' }}
       shell: bash
-      # `provider` selects a model backend for an agent that routes over a
-      # third-party endpoint. R-CLI carries its own router, so the pair is
-      # meaningless there and failing loudly beats silently ignoring it.
+      # R-CLI carries its own router, so there is no provider mapping here —
+      # but `model` must still behave like it does for every other agent.
+      # Its model strings are `provider/model` (e.g. openai/gpt-5.5), which
+      # is how the vendor is chosen.
+      env:
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
       run: |
-        echo "::error::agent=backboard does not use the 'provider' input — R-CLI routes models itself. Set BACKBOARD_MODEL in your env block instead." >&2
-        exit 1
+        set -eu
+        if [ -z "${BACKBOARD_API_KEY:-}" ]; then
+          echo "::error::agent=backboard requires BACKBOARD_API_KEY in the caller's env block" >&2
+          exit 1
+        fi
+        # R-CLI addresses models as `<provider>/<model>`. Composing it from
+        # the same two inputs every other agent uses keeps one mental model
+        # across the action: pick an agent, pick a provider, pick a model.
+        # The pair is passed through verbatim rather than translated — R-CLI
+        # resolves provider ids server-side against a 17k-model catalogue, so
+        # a local allowlist here would go stale and reject valid combinations.
+        MODEL="${INPUT_MODEL:-}"
+        if [ -n "${INPUT_PROVIDER:-}" ] && [ -n "$MODEL" ]; then
+          case "$MODEL" in
+            */*) : ;;                       # already qualified — leave it
+            *)   MODEL="$INPUT_PROVIDER/$MODEL" ;;
+          esac
+        elif [ -n "${INPUT_PROVIDER:-}" ]; then
+          echo "::error::agent=backboard with provider='$INPUT_PROVIDER' also needs a model (R-CLI addresses models as <provider>/<model>)" >&2
+          exit 1
+        fi
+        if [ -n "$MODEL" ]; then
+          echo "BACKBOARD_MODEL=$MODEL" >> "$GITHUB_ENV"
+        fi
 
     - name: Configure Codex backend from provider input
       if: ${{ inputs.agent == 'codex' }}

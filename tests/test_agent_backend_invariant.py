@@ -249,9 +249,53 @@ def test_codex_provider_pairing_is_configured():
     assert "cannot use provider=anthropic" in codex_cfg["run"]
 
 
-def test_backboard_rejects_the_provider_input():
+def test_provider_plus_model_works_the_same_way_for_every_agent():
+    """One mental model across the action: agent, provider, model.
+
+    R-CLI addresses models as `<provider>/<model>`, so the action composes
+    the two rather than making backboard the one agent with different rules.
+    """
     steps = _action_yaml()["runs"]["steps"]
-    guard = next(
-        s for s in steps if s.get("name") == "Validate the agent / provider pair"
+    bb = next(
+        s for s in steps if s.get("name") == "Configure Backboard backend"
     )
-    assert "backboard" in guard["if"]
+    assert "INPUT_PROVIDER" in bb["run"]
+    assert "$INPUT_PROVIDER/$MODEL" in bb["run"]
+    # An already-qualified model must not be double-prefixed.
+    assert "*/*)" in bb["run"]
+    # No agent rejects `provider` outright any more.
+    assert not any(
+        s.get("name") == "Validate the agent / provider pair" for s in steps
+    )
+
+
+def test_model_input_reaches_every_agent():
+    """One `model` input for all three agents.
+
+    `model` was silently ignored for backboard, which needed a BACKBOARD_MODEL
+    env var instead — the kind of per-agent special case that makes the action
+    feel like a maze. Every agent must honor the same input.
+    """
+    steps = _action_yaml()["runs"]["steps"]
+    configured = {
+        s["name"]: s["run"]
+        for s in steps
+        if s.get("name", "").startswith("Configure ")
+        and "backend" in s.get("name", "")
+    }
+    assert any("CODEX_MODEL" in r for r in configured.values())
+    assert any("BACKBOARD_MODEL" in r for r in configured.values())
+    for name, body in configured.items():
+        assert "INPUT_MODEL" in body, f"{name} ignores the model input"
+
+
+def test_every_agent_validates_its_credential_before_running():
+    """A missing key must fail in the Configure step, not deep in a dispatch."""
+    steps = _action_yaml()["runs"]["steps"]
+    bodies = " ".join(
+        s.get("run", "") for s in steps
+        if s.get("name", "").startswith("Configure ")
+        and "backend" in s.get("name", "")
+    )
+    for secret in ("CODEX_API_KEY", "BACKBOARD_API_KEY", "MOONSHOT_API_KEY"):
+        assert secret in bodies, f"{secret} never validated"
