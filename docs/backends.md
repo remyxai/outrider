@@ -1,13 +1,13 @@
 ---
 type: Customization Guide
-title: Model backends
-description: Route Outrider's agent at non-default model backends (z.ai GLM, Moonshot Kimi, Bedrock, Vertex, on-prem) — auth, workflow template, cost telemetry, debug.
+title: Agent & model backends
+description: Route Outrider at a different coding agent (Claude Code, OpenAI Codex, Backboard R-CLI) and a different model backend (z.ai GLM, Moonshot Kimi, OpenAI, OpenRouter, Bedrock, Vertex, on-prem) — which pairs work, auth, workflow template, cost telemetry, debug.
 resource: https://github.com/remyxai/outrider/blob/main/docs/backends.md
-tags: [outrider, customization, model-backends, glm, kimi, moonshot, bedrock, vertex]
+tags: [outrider, customization, agent-backends, model-backends, claude-code, codex, backboard, glm, kimi, moonshot, openrouter, bedrock, vertex]
 timestamp: 2026-07-16T00:00:00Z
 ---
 
-# Model backends
+# Agent & model backends
 
 Outrider's coding-agent step shells out to a coding-agent CLI — `claude` by default, or `codex` / `backboard` via the [`agent`](#coding-agents-the-agent-input) input. Anything that agent can authenticate against, Outrider can route through.
 

@@ -390,22 +390,28 @@ inputs:
     default: ''
   model-base-url:
     description: |
-      Optional override for the Claude Code subprocess's ANTHROPIC_BASE_URL.
-      Use this to route the coding agent to any Anthropic-Messages-compatible
-      backend — e.g. z.ai's GLM Coding Plan, AWS Bedrock, GCP Vertex, an
-      on-prem proxy. The ANTHROPIC_API_KEY repo secret should hold the
-      backend's API key when this is set, not your Anthropic key. Empty
-      (default) = api.anthropic.com. Note: when set, the `total_cost_usd`
-      that the Claude Code CLI reports is computed with Anthropic-rate
-      pricing applied to the backend's tokens — it's an estimate, not a
-      bill. Token counts remain accurate.
+      Optional endpoint override for the selected agent — the action sets
+      that agent's own base-URL env var (`ANTHROPIC_BASE_URL`,
+      `CODEX_BASE_URL`, ...). Use it to reach any backend that speaks the
+      API family the agent speaks: an on-prem gateway, AWS Bedrock, GCP
+      Vertex, or a vendor not in the registry. The endpoint must serve
+      the agent's family — `docs/backends.md` names which family each
+      agent speaks. Empty (default) = the agent's vendor default.
 
-      For the known backends `zai` / `moonshot`, prefer the `provider`
-      input below — it configures both this URL and the correct auth env
-      var (Bearer vs x-api-key) from a single field, and picks up the
-      right per-vendor secret without a fork-side case-switch. Use
-      `model-base-url` directly only for custom / on-prem endpoints not
-      covered by the `provider` shortlist.
+      Prefer the `provider` input for any backend the registry already
+      knows. It sets this URL, the credential *and* the correct auth
+      header style (Bearer vs x-api-key) from a single field, and picks
+      up the right per-vendor secret without a fork-side case-switch.
+      Reach for `model-base-url` only for endpoints `provider` does not
+      cover, in which case pair it with `provider: custom`.
+
+      Note on cost when you point an agent off its vendor: a dollar
+      figure the agent's own CLI reports is computed with that vendor's
+      pricing applied to another backend's tokens, so Outrider ignores it
+      and resolves cost from the per-host rate table instead
+      (`cost_basis: backend_rate_table`). With no rate row for the host
+      it reports `cost_basis: unavailable` rather than a fabricated
+      `$0.00`. Token counts stay exact either way.
     required: false
     default: ''
   agent:
@@ -441,23 +447,29 @@ inputs:
     default: ''
   provider:
     description: |
-      Which Anthropic-Messages-compatible backend to route the coding
-      agent at. Consolidates the auth-env + base-URL wiring that forks
-      previously duplicated in a workflow-level Configure step.
+      Which model backend to route the coding agent at. A separate axis
+      from `agent`, which selects the agent CLI itself. Consolidates the
+      auth-env + base-URL wiring that forks previously duplicated in a
+      workflow-level Configure step.
+
+      An agent speaks one API family and a provider serves one or more,
+      so only pairs that share a family are valid. The action resolves
+      that itself and rejects an impossible pair up front, naming the
+      agent that *does* serve your provider. The full pair table is in
+      docs/backends.md — generated from the same registry the action
+      reads, so it cannot drift from the code.
 
       Recognized values:
         - `` (empty, default): existing behavior — pass through
           `model-base-url` as-is, no auth manipulation. Backward-compatible.
-        - `anthropic`: default Anthropic API. Requires `ANTHROPIC_API_KEY`
-          in the caller's env block.
-        - `zai`: z.ai GLM Coding Plan. Requires `ZAI_API_KEY` in the
-          caller's env block. Sets `ANTHROPIC_AUTH_TOKEN` (Bearer) and
-          `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`.
-        - `moonshot`: Moonshot Kimi. Requires `MOONSHOT_API_KEY` in the
-          caller's env block. Sets `ANTHROPIC_AUTH_TOKEN` (Bearer) and
-          `ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic`.
+        - a named provider — `anthropic`, `openai`, `zai`, `moonshot`,
+          `openrouter` at time of writing. The action sets the selected
+          agent's credential, endpoint and model env vars for you, with
+          the right auth header style for that vendor. Each provider
+          reads its own conventionally-named secret: `ZAI_API_KEY` for
+          `zai`, `MOONSHOT_API_KEY` for `moonshot`, and so on.
         - `custom`: use `model-base-url` + caller-supplied auth env var
-          for anything not in the shortlist above.
+          for anything not in the registry.
 
       Secrets aren't magically visible inside the composite action — the
       caller MUST pass the required secret via the `env:` block on the
@@ -468,17 +480,27 @@ inputs:
     default: ''
   model:
     description: |
-      Optional model name — sets `ANTHROPIC_MODEL` for the Claude Code
-      subprocess. When set, cost telemetry looks up the specific per-model
-      rate in the backend rate table (see `_BACKEND_RATES` in src/run.py)
+      Optional model id for whichever agent is selected — the action sets
+      that agent's own model env var (`ANTHROPIC_MODEL`, `CODEX_MODEL`,
+      ...). When set, cost telemetry looks up the specific per-model rate
+      in the backend rate table (see `_BACKEND_RATES` in src/run.py)
       rather than falling back to the host's flagship-tier default.
 
-      Examples: `claude-opus-4-8`, `claude-haiku-4-5`, `glm-5.2`,
-      `glm-4.6`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`.
+      Use the id your provider lists, not another vendor's — a model id
+      from the wrong vocabulary is the most common misconfiguration here.
+      Examples: `claude-opus-4-8` or `claude-haiku-4-5` on `anthropic`,
+      `glm-5.3` on `zai`, `kimi-k3` or `kimi-k2.7-code` on `moonshot`,
+      `gpt-5.4-mini` on `openai`, and namespaced ids on a gateway
+      (`z-ai/glm-5.3` on `openrouter`). R-CLI addresses models as
+      `<provider>/<model>`; the action composes that form for you, so
+      pass the bare id there too.
 
-      Empty (default) → the caller's own `ANTHROPIC_MODEL` env var wins if
-      set; otherwise the backend picks its own default and cost telemetry
-      uses the host's flagship-tier rates.
+      `mode: smoke` checks a model id against the vendor for real in
+      seconds — cheaper than discovering it mid-dispatch.
+
+      Empty (default) → the caller's own model env var wins if set;
+      otherwise the agent picks its own default and cost telemetry uses
+      the host's flagship-tier rates.
     required: false
     default: ''
   enable-cocoindex:

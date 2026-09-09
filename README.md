@@ -46,15 +46,25 @@ Bring your own context — even when it's underspecified. The scaffolding fills 
 - **A selection narrative** in the step summary — why this candidate, or why nothing this run
 
 
-## Model backends
+## Agent and model backends
+
+Two independent axes. `agent` picks the coding-agent CLI that does the work; `provider` picks the model behind it.
+
+| `agent` | CLI |
+|---|---|
+| `claude` *(default)* | Claude Code |
+| `codex` | OpenAI Codex |
+| `backboard` | Backboard R-CLI |
 
 | Backend | Cost / full run | Best for |
 |---|---|---|
 | Anthropic Opus | ~$2–3 | Finalize a draft PR |
-| z.ai GLM-5.2 | ~$0.05–0.10 | Draft PR |
+| z.ai GLM-5.3 | ~$0.05–0.10 | Draft PR |
 | Moonshot Kimi-K3 | ~$1 | Finalize a draft PR  |
 
-Route per-dispatch via a `provider` input — see [`docs/backends.md`](docs/backends.md) for the auth-header matrix and the switching workflow template. Rule of thumb: GLM for the exploration ladder, Opus for the candidate you commit to ship.
+Route per-dispatch via the `agent` and `provider` inputs — see [`docs/backends.md`](docs/backends.md) for the generated pair table, the auth-header matrix and the switching workflow template. Rule of thumb: GLM for the exploration ladder, Opus for the candidate you commit to ship.
+
+Leave `agent` unset and nothing changes: every existing workflow keeps the Claude Code path it has today. Not every agent/provider pair is valid — an agent speaks one API family and a provider serves one or more — so the action rejects an impossible pair before spending anything and names the agent that *does* serve your provider. `mode: smoke` verifies a new `agent`/`provider`/`model` combination against the vendor in seconds without cloning or opening anything.
 
 
 ## Quickstart
@@ -128,7 +138,7 @@ Each PR below shows the **match** (paper → repo) and the **shape** (how the wi
 - **[Architecture](docs/architecture.md)** — selection taxonomy, pipeline, refinement chain
 - **[Guardrails](docs/guardrails.md)** — what the agent can and can't modify
 - **[Security](docs/security.md)** — the agent-harness defense-in-depth model (prompt-injection & credential-leak controls)
-- **[Model backends](docs/backends.md)** — full backend/auth matrix + per-dispatch switching template
+- **[Agent & model backends](docs/backends.md)** — which agent/provider pairs work, the auth matrix, per-dispatch switching template
 - **[Environments](docs/environments.md)** — describe workflow-attached tooling via `ENVIRONMENTS.md`
 - **[Weekly summary mode](docs/weekly-summary.md)** — opt-in rolling digest comments
 

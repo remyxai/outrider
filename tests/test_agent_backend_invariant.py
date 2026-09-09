@@ -372,3 +372,58 @@ def test_argv_delivered_prompts_close_the_childs_stdin():
     assert 'else {"input": stdin_text}' in body
     # The old unconditional form must not linger.
     assert "input=stdin_text," not in body
+
+
+def test_the_agent_axis_is_in_the_inputs_reference():
+    """docs/configuration.md is the documented "full inputs" list.
+
+    An input that only appears in backends.md is discoverable only by
+    someone who already knows the feature exists, which is the wrong way
+    round. `claude-timeout` also drifted here — the reference showed the
+    pre-v1.7.24 default of 900 long after the action moved to 1500 — so
+    this checks the stated default against action.yml rather than trusting
+    the prose.
+    """
+    import re
+
+    import yaml
+
+    root = Path(__file__).resolve().parent.parent
+    action = yaml.safe_load((root / "action.yml").read_text())
+    doc = (root / "docs" / "configuration.md").read_text()
+    rows = dict(
+        re.findall(r"^\| `([a-z0-9-]+)` \| ([^|]*) \|", doc, re.M)
+    )
+
+    for name in ("agent", "agent-timeout", "claude-timeout", "mode"):
+        assert name in action["inputs"], f"{name} vanished from action.yml"
+        assert name in rows, f"{name} is missing from docs/configuration.md"
+
+    declared = str(action["inputs"]["claude-timeout"].get("default"))
+    assert declared in rows["claude-timeout"], (
+        f"docs/configuration.md states a claude-timeout default that "
+        f"action.yml does not: action.yml says {declared!r}"
+    )
+
+
+def test_the_shared_routing_inputs_are_not_described_as_claude_only():
+    """`provider`, `model` and `model-base-url` are shared across agents.
+
+    They predate the agent axis and described themselves in Claude Code's
+    terms — "sets ANTHROPIC_MODEL for the Claude Code subprocess" — which
+    reads as if they do not apply to `codex` or `backboard`. They do; each
+    sets the selected agent's own env var.
+    """
+    import yaml
+
+    action = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "action.yml").read_text()
+    )
+    for name in ("provider", "model", "model-base-url"):
+        text = action["inputs"][name]["description"]
+        assert "Claude Code subprocess" not in text, (
+            f"`{name}` still describes itself as Claude-only"
+        )
+        assert "Anthropic-Messages-compatible backend" not in text, (
+            f"`{name}` still implies only Anthropic's API family is routable"
+        )
