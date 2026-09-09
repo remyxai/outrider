@@ -446,3 +446,28 @@ def test_a_provider_with_a_default_model_does_not_warn():
     routing = route(resolve("codex"), "moonshot", "", "",
                     env(MOONSHOT_API_KEY="mk"))
     assert not any("no model named" in w for w in routing.warnings)
+
+
+def test_a_vendor_default_provider_clears_any_inherited_base_url():
+    """Without this, a stale base URL wins and the run talks to the wrong
+    vendor using this vendor's key.
+
+    Observed while smoke-testing the matrix: `codex` + `openai` reported
+    `model_backend = "Codex → Moonshot (Kimi)"` and 401'd, because a
+    CODEX_BASE_URL from an earlier step survived. Same reasoning as Claude
+    Code's mutually-exclusive auth vars — an unset value is not enough, it
+    has to be cleared.
+    """
+    routing = route(
+        resolve("codex"), "openai", "gpt-5-nano", "",
+        env(OPENAI_API_KEY="ok", CODEX_BASE_URL="https://stale.example/v1"),
+    )
+    assert routing.env["CODEX_BASE_URL"] == "", "must be actively cleared"
+    assert routing.env["CODEX_API_KEY"] == "ok"
+
+
+def test_an_explicit_endpoint_is_still_honored():
+    routing = route(
+        resolve("codex"), "moonshot", "kimi-k3", "", env(MOONSHOT_API_KEY="mk")
+    )
+    assert routing.env["CODEX_BASE_URL"] == "https://api.moonshot.ai/v1"

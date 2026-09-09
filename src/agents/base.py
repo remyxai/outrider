@@ -223,6 +223,15 @@ class AgentBackend:
         routing.env[self.key_env] = key
         if base_url:
             routing.env[self.base_url_env] = base_url
+        elif self.base_url_env:
+            # This provider uses its vendor default, so the agent must NOT
+            # inherit an endpoint from anywhere else. Writing an empty value
+            # clears it: without this, a base URL left in the caller's env
+            # (or by an earlier step) silently wins and the run talks to the
+            # wrong vendor with this vendor's key — observed as a 401 whose
+            # telemetry named the wrong backend entirely. Same reasoning as
+            # Claude Code's mutually-exclusive auth vars.
+            routing.env[self.base_url_env] = ""
         if chosen:
             routing.env[self.model_env] = chosen
         return routing
