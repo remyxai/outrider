@@ -7961,11 +7961,23 @@ def _run_agent(
     real cause survives the caller's tail-slice.
     """
     cmd, stdin_text = _BACKEND.finalize_cmd(cmd_prefix, prompt, stream=stream)
+    # Backends that put the prompt in argv return stdin_text=None, and
+    # `input=None` leaves the child *inheriting* our stdin. On a runner that
+    # is an open pipe which never delivers, so Claude Code waits for it and
+    # logs "no stdin data received in 3s, proceeding without it" — measured
+    # at ~2.5s of dead time on every call, times the dozens of calls a
+    # dispatch makes. Worse, that warning lands on stderr, so it gets
+    # embedded in the reported error text and makes unrelated failures look
+    # like stdin problems. Closing stdin outright removes both.
+    delivery = (
+        {"stdin": subprocess.DEVNULL} if stdin_text is None
+        else {"input": stdin_text}
+    )
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, env=_claude_subprocess_env(),
-            input=stdin_text, capture_output=True, text=True,
-            timeout=timeout_s,
+            capture_output=True, text=True, timeout=timeout_s,
+            **delivery,
         )
     except subprocess.TimeoutExpired:
         return False, _BACKEND.timeout_message(timeout_s), []

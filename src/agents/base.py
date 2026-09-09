@@ -278,12 +278,32 @@ class AgentBackend:
         return tuple(self.auth_env) + BASE_ENV_WHITELIST
 
     def subprocess_env(self) -> dict[str, str]:
-        """Minimal env dict built from :meth:`env_whitelist`."""
+        """Minimal env dict built from :meth:`env_whitelist`.
+
+        A var on this backend's own routing axis (:attr:`auth_env` — the
+        credential, base URL and model) is dropped when empty rather than
+        forwarded, because empty string is how routing expresses "cleared":
+        a mutually-exclusive auth var, or an endpoint the agent must not
+        inherit. An empty var is still a *present* var to the CLI reading
+        it, and Claude Code answers a cleared `ANTHROPIC_API_KEY` with
+        "ANTHROPIC_API_KEY or another auth source is set and takes
+        precedence over your claude.ai login" — untrue, and alarming in a
+        log. This env is built from a whitelist rather than inherited, so an
+        omitted key is simply absent in the child, which is what clearing
+        meant.
+
+        Every other whitelisted var keeps the present-but-empty distinction,
+        which is meaningful for things like `LANG`.
+        """
+        cleared_when_empty = set(self.auth_env)
         env: dict[str, str] = {}
         for key in self.env_whitelist():
             val = os.environ.get(key)
-            if val is not None:
-                env[key] = val
+            if val is None:
+                continue
+            if not val and key in cleared_when_empty:
+                continue
+            env[key] = val
         return env
 
     def preflight(self) -> tuple[bool, list[str]]:

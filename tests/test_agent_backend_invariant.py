@@ -350,3 +350,25 @@ def test_a_failed_auth_check_reports_at_error_level_and_says_it_stopped():
     # And the exit is announced, naming the agent that will not be called.
     assert "stopping before any %s call" in block
     assert block.index("stopping before any %s call") < block.index("sys.exit(2)")
+
+
+def test_argv_delivered_prompts_close_the_childs_stdin():
+    """`input=None` is not the same as "no stdin".
+
+    A backend that puts the prompt in argv returns `stdin_text=None`, and
+    `subprocess.run(input=None)` leaves the child inheriting our stdin. On a
+    runner that is an open pipe which never delivers, so Claude Code waits
+    on it and logs "no stdin data received in 3s, proceeding without it" —
+    measured at ~2.5s per call against ~3.1s with stdin closed, on every one
+    of the dozens of calls a dispatch makes. The warning also lands on
+    stderr, where it gets folded into the reported error text and makes
+    unrelated failures look like stdin problems.
+    """
+    src = (Path(__file__).resolve().parent.parent / "src" / "run.py").read_text()
+    body = src[src.index("def _run_agent("):]
+    body = body[: body.index("except subprocess.TimeoutExpired")]
+    assert '{"stdin": subprocess.DEVNULL} if stdin_text is None' in body
+    # And the stdin payload still reaches a backend that uses one.
+    assert 'else {"input": stdin_text}' in body
+    # The old unconditional form must not linger.
+    assert "input=stdin_text," not in body

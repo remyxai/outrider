@@ -287,3 +287,48 @@ def test_env_strip_complements_outbound_scrubber():
                 f"Whitelist entry {name!r} looks token-shaped but isn't on "
                 f"the intentional list {intentional_token_entries} — review"
             )
+
+
+# ─── "cleared" must mean absent, not empty ──────────────────────────────
+
+
+def test_a_cleared_credential_is_absent_not_empty(monkeypatch):
+    """Empty string is how routing says "cleared" — the child must see none.
+
+    `resolve_routing` writes `ANTHROPIC_API_KEY=""` to clear the auth var
+    that is mutually exclusive with `ANTHROPIC_AUTH_TOKEN`. Forwarding it as
+    an empty string still leaves it *present*, and Claude Code then logs
+    "ANTHROPIC_API_KEY or another auth source is set and takes precedence
+    over your claude.ai login" — untrue, and it lands on stderr where it
+    gets folded into reported error text.
+    """
+    for name in run._CLAUDE_ENV_WHITELIST:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+
+    env = run._claude_subprocess_env()
+
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "token"
+
+
+def test_a_cleared_base_url_is_absent_not_empty(monkeypatch):
+    """Same for the endpoint: a provider on its vendor default clears the
+    base URL so the agent cannot inherit one from anywhere else."""
+    for name in run._CLAUDE_ENV_WHITELIST:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "")
+
+    assert "ANTHROPIC_BASE_URL" not in run._claude_subprocess_env()
+
+
+def test_clearing_is_scoped_to_the_routing_axis(monkeypatch):
+    """Only the backend's own auth/routing vars get this treatment.
+
+    A general passthrough var keeps the present-but-empty distinction —
+    `LANG=""` is not the same as no `LANG` for locale resolution, and
+    nothing about routing says otherwise.
+    """
+    monkeypatch.setenv("LANG", "")
+    assert run._claude_subprocess_env().get("LANG") == ""
