@@ -7796,10 +7796,14 @@ def _record_claude_usage(env: dict) -> None:
 # explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
 # wildcards — future Anthropic env vars may carry telemetry tokens the
 # agent shouldn't see verbatim.
-# Back-compat alias: this tuple was module-level in run.py before the agent
-# port and tests assert on it directly. The whitelist and its security
-# rationale now live on the backend that owns those auth vars.
-_CLAUDE_ENV_WHITELIST: tuple[str, ...] = _BACKEND.env_whitelist()
+# The env vars the active agent's subprocess may inherit. The whitelist and
+# its security rationale live on the backend that owns those auth vars.
+_AGENT_ENV_WHITELIST: tuple[str, ...] = _BACKEND.env_whitelist()
+
+# Back-compat alias: this name was module-level in run.py before the agent
+# port and tests assert on it directly. Purely internal, so it costs nothing
+# to keep pointing at the same tuple.
+_CLAUDE_ENV_WHITELIST: tuple[str, ...] = _AGENT_ENV_WHITELIST
 
 
 def _claude_subprocess_env() -> dict[str, str]:
@@ -13002,7 +13006,14 @@ def build_target_from_env() -> Target:
     # staged-synthesis routinely reach 15-20 min, and users triggering
     # runs without prior tuning were hitting the 15-min ceiling. Opus
     # refinement runs sit comfortably under 25 min at the new default.
-    timeout_raw = _optional_env("INPUT_CLAUDE_TIMEOUT", "1500")
+    # `agent-timeout` is the generalized input; `claude-timeout` is the
+    # original and keeps working indefinitely. Prefer the new name when both
+    # are set, so a caller migrating one workflow at a time is never
+    # surprised by the old value winning.
+    timeout_raw = (
+        _optional_env("INPUT_AGENT_TIMEOUT", "").strip()
+        or _optional_env("INPUT_CLAUDE_TIMEOUT", "1500")
+    )
     try:
         claude_timeout_s = int(timeout_raw)
     except ValueError:
@@ -18416,6 +18427,17 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "output_tokens": result.get("output_tokens"),
         "cache_read_input_tokens": result.get("cache_read_input_tokens"),
         "claude_calls": result.get("claude_calls"),
+        # Agent-neutral alias, dual-written so the engine can migrate its
+        # column without a flag day: the ingest reads named keys only, so
+        # this is inert until the server adds it, and `claude_calls` stays
+        # until its dashboards have moved.
+        #
+        # Deliberately NOT aliasing `claude_log_tail`: it is not posted to
+        # the engine today and there is no column for it. Adding one here
+        # would start shipping agent log output over the wire as a side
+        # effect of a rename — a new data flow that needs its own scrubbing
+        # review, not a compatibility shim.
+        "agent_calls": result.get("claude_calls"),
         "num_turns": result.get("num_turns"),
         # Coding-agent identity + backend / cost-basis annotations. These
         # let SQL slice telemetry by which backend served a run (Anthropic

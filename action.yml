@@ -233,6 +233,19 @@ inputs:
       a larger pool just widens the window the selection pass sees).
     required: false
     default: '25'
+  agent-timeout:
+    description: |
+      Wall-clock seconds for each coding-agent phase (selection, deep-search,
+      preflight, audit, implementation, self-review).
+
+      Generalized name for `claude-timeout`, which still works and always
+      will — pass either. If both are set this one wins. Neither agent added
+      in the agent port has a round-limit flag, so on `codex` and `backboard`
+      this is the *only* spend bound: keep it tight on cron-driven installs,
+      and comfortably below the job's own `timeout-minutes` so one slow phase
+      cannot consume the whole run.
+    required: false
+    default: ''
   claude-timeout:
     description: |
       Wall-clock seconds for the Claude Code agent calls (preflight
@@ -692,6 +705,8 @@ runs:
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_FIDELITY_POLICY: ${{ inputs.fidelity-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
+        # Generalized alias; run.py prefers this when both are set.
+        INPUT_AGENT_TIMEOUT: ${{ inputs.agent-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         INPUT_SEARCH_METHOD: ${{ inputs.search-method }}
         INPUT_PUBLISH: ${{ inputs.publish }}

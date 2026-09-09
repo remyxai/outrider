@@ -92,7 +92,9 @@ def test_no_input_became_required():
 
 def test_the_port_only_added_inputs():
     added = sorted(set(ACTION["inputs"]) - set(BASELINE["inputs"]))
-    assert added == ["agent"], f"unexpected input changes: {added}"
+    assert added == ["agent", "agent-timeout"], (
+        f"unexpected input changes: {added}"
+    )
 
 
 def test_the_new_agent_input_defaults_to_empty():
@@ -240,3 +242,77 @@ def test_unknown_agent_fails_loudly_rather_than_defaulting():
     vendor — but note this can only happen on a workflow that opted in."""
     with pytest.raises(ValueError):
         resolve("claude-code")
+
+
+# ─── generalizing the claude-prefixed names without a flag day ──────────────
+
+def test_claude_timeout_still_works_alone():
+    """The original input must keep working indefinitely."""
+    import os
+
+    for var in ("INPUT_AGENT_TIMEOUT", "INPUT_CLAUDE_TIMEOUT"):
+        os.environ.pop(var, None)
+    os.environ["INPUT_CLAUDE_TIMEOUT"] = "2400"
+    try:
+        assert run._optional_env("INPUT_AGENT_TIMEOUT", "").strip() == ""
+        assert run._optional_env("INPUT_CLAUDE_TIMEOUT", "1500") == "2400"
+    finally:
+        os.environ.pop("INPUT_CLAUDE_TIMEOUT", None)
+
+
+def test_agent_timeout_wins_when_both_are_set():
+    """A caller migrating one workflow at a time must not be surprised by the
+    old value winning."""
+    steps = ACTION["runs"]["steps"]
+    recommend = next(
+        s for s in steps if "INPUT_AGENT_TIMEOUT" in (s.get("env") or {})
+    )
+    assert "INPUT_CLAUDE_TIMEOUT" in recommend["env"], "both must be threaded"
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "run.py"
+    ).read_text()
+    assert 'INPUT_AGENT_TIMEOUT", ""' in src, "new name must be read first"
+
+
+def test_both_timeout_inputs_are_declared():
+    assert "claude-timeout" in ACTION["inputs"]
+    assert "agent-timeout" in ACTION["inputs"]
+    assert ACTION["inputs"]["agent-timeout"]["default"] == ""
+
+
+def test_telemetry_dual_writes_agent_neutral_aliases():
+    """The engine can migrate its columns without a flag day: the action posts
+    both names, the ingest reads named keys only so the new ones are inert
+    until the server adds them, and the legacy keys stay until its dashboards
+    have moved."""
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "run.py"
+    ).read_text()
+    assert '"claude_calls": result.get("claude_calls")' in src
+    assert '"agent_calls": result.get("claude_calls")' in src
+
+
+def test_log_tail_is_not_newly_shipped_to_the_engine():
+    """`claude_log_tail` is local-only — no column, never posted.
+
+    Aliasing it would have started sending agent log output over the wire as
+    a side effect of a rename. That is a new data flow needing its own
+    scrubbing review, not a compatibility shim.
+    """
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "run.py"
+    ).read_text()
+    payload_start = src.index("def _post_run_telemetry")
+    payload = src[payload_start:payload_start + 6000]
+    # Comments may discuss it; only actual payload keys matter.
+    code = "\n".join(
+        line for line in payload.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "log_tail" not in code, "log tails must not be posted"
+
+
+def test_the_internal_whitelist_alias_still_resolves():
+    """Renamed to _AGENT_ENV_WHITELIST; the old name is an alias because this
+    repo's own tests assert on it."""
+    assert run._CLAUDE_ENV_WHITELIST is run._AGENT_ENV_WHITELIST
