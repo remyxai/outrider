@@ -49,6 +49,11 @@ def build() -> dict:
                     f.value: m for f, m in p.default_model.items()
                 },
                 "verified": sorted(f.value for f in p.verified),
+                # An operational precondition a *verified* pair still
+                # carries. Published so the CLI and the engine can warn
+                # with the same words instead of each keeping a copy of
+                # this text — the whole point of the artifact.
+                "verification_caveat": p.verification_caveat,
                 "caller_supplied_endpoint": p.caller_supplied_endpoint,
             }
             for pid, p in PROVIDERS.items()

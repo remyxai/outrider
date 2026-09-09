@@ -63,6 +63,7 @@
       "verified": [
         "anthropic-messages"
       ],
+      "verification_caveat": "",
       "caller_supplied_endpoint": false
     },
     "openai": {
@@ -75,6 +76,7 @@
       "verified": [
         "openai-responses"
       ],
+      "verification_caveat": "",
       "caller_supplied_endpoint": false
     },
     "zai": {
@@ -89,6 +91,7 @@
       "verified": [
         "anthropic-messages"
       ],
+      "verification_caveat": "",
       "caller_supplied_endpoint": false
     },
     "moonshot": {
@@ -106,6 +109,7 @@
         "anthropic-messages",
         "openai-responses"
       ],
+      "verification_caveat": "",
       "caller_supplied_endpoint": false
     },
     "openrouter": {
@@ -120,6 +124,7 @@
         "anthropic-messages",
         "openai-responses"
       ],
+      "verification_caveat": "reserves the requested max_tokens against your balance before calling the model, and both CLIs request a lot by default (Codex's is 131,072), so a thin balance can answer HTTP 402 before the model is reached \u2014 verified with real completions on a zero-balance account using smaller-output models",
       "caller_supplied_endpoint": false
     },
     "custom": {
@@ -131,6 +136,7 @@
       },
       "default_model": {},
       "verified": [],
+      "verification_caveat": "",
       "caller_supplied_endpoint": true
     }
   },

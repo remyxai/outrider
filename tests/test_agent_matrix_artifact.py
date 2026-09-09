@@ -72,3 +72,20 @@ def test_backends_doc_documents_the_new_cost_basis_values():
     doc = (ROOT / "docs" / "backends.md").read_text()
     for value in ("agent_envelope", "unavailable"):
         assert f"`{value}`" in doc, f"{value} undocumented"
+
+
+def test_the_artifact_publishes_verification_caveats():
+    """The caveat text belongs in the contract, not in each consumer.
+
+    Three repos read this matrix — the action, the `remyxai` CLI and the
+    engine. If the caveat lived only in the action's registry, the CLI would
+    have to keep its own copy of the wording to warn with, which is exactly
+    the drift the artifact exists to prevent.
+    """
+    matrix = json.loads(ARTIFACT.read_text())
+    for pid, provider in matrix["providers"].items():
+        assert "verification_caveat" in provider, (
+            f"provider {pid} is missing verification_caveat"
+        )
+    # And the one we know about actually made it through.
+    assert matrix["providers"]["openrouter"]["verification_caveat"]
