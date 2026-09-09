@@ -92,6 +92,19 @@ class CodexBackend(AgentBackend):
         # so the honest declaration is that the launch-time gate is absent.
     })
 
+    def can(self, cap: Capability) -> bool:
+        """Capabilities that depend on how this run is routed.
+
+        WEB_RESEARCH comes from OpenAI's server-side `web_search` tool, which
+        only exists on OpenAI's own endpoint — so it is genuinely absent when
+        Codex is pointed at a third-party Responses implementation. Reporting
+        it statically would make the orchestrator stage a research phase the
+        agent cannot perform.
+        """
+        if cap is Capability.WEB_RESEARCH:
+            return not (os.environ.get("CODEX_BASE_URL") or "").strip()
+        return super().can(cap)
+
     def preflight(self) -> tuple[bool, list[str]]:
         if not (os.environ.get("CODEX_API_KEY") or "").strip():
             return False, [
@@ -120,6 +133,19 @@ class CodexBackend(AgentBackend):
             "--skip-git-repo-check",
         ]
         cmd += self.provider_args()
+        if (os.environ.get("CODEX_BASE_URL") or "").strip():
+            # OpenAI's `web_search` is a *server-side* tool, not part of the
+            # Responses protocol third parties implement. OpenRouter rejects
+            # the whole request when Codex offers it ("Server tool request
+            # failed", HTTP 400) before the model is reached; Moonshot
+            # happens to tolerate it. Disabling it whenever Codex is routed
+            # off OpenAI makes the behavior the same everywhere instead of
+            # depending on how forgiving each gateway is.
+            #
+            # `can(WEB_RESEARCH)` reflects this, so the orchestrator skips
+            # the staged research phase rather than asking for web context
+            # the agent cannot fetch.
+            cmd += ["-c", "tools.web_search=false"]
         model = (os.environ.get("CODEX_MODEL") or "").strip()
         if model:
             cmd += ["-m", model]

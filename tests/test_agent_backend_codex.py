@@ -440,3 +440,42 @@ def test_inaccessible_model_surfaces_an_actionable_404(backend):
     result = backend.parse(1, transcript, "")
     assert not result.ok
     assert "do not have access" in result.text
+
+
+# ─── server-side tools don't exist off OpenAI ───────────────────────────────
+
+def test_web_search_is_disabled_when_routed_off_openai(monkeypatch):
+    """OpenRouter rejects the whole request when Codex offers `web_search`
+    ("Server tool request failed", HTTP 400) before the model is reached.
+
+    It is an OpenAI *server-side* tool, not part of the Responses protocol
+    third parties implement. Moonshot happens to tolerate it being offered;
+    disabling it off-OpenAI makes behavior uniform instead of dependent on
+    how forgiving each gateway is.
+    """
+    monkeypatch.setenv("CODEX_BASE_URL", "https://openrouter.ai/api/v1")
+    cmd = CodexBackend().base_cmd()
+    assert "tools.web_search=false" in " ".join(cmd)
+
+
+def test_web_search_is_left_alone_on_openai(monkeypatch):
+    monkeypatch.delenv("CODEX_BASE_URL", raising=False)
+    assert "web_search" not in " ".join(CodexBackend().base_cmd())
+
+
+def test_web_research_capability_follows_the_routing(monkeypatch):
+    """Reporting it statically would make the orchestrator stage a research
+    phase the agent cannot perform."""
+    monkeypatch.delenv("CODEX_BASE_URL", raising=False)
+    assert CodexBackend().can(Capability.WEB_RESEARCH)
+
+    monkeypatch.setenv("CODEX_BASE_URL", "https://openrouter.ai/api/v1")
+    assert not CodexBackend().can(Capability.WEB_RESEARCH)
+
+
+def test_other_capabilities_are_unaffected_by_routing(monkeypatch):
+    monkeypatch.setenv("CODEX_BASE_URL", "https://openrouter.ai/api/v1")
+    backend = CodexBackend()
+    assert backend.can(Capability.STREAM_TRANSCRIPT)
+    assert backend.can(Capability.OUTPUT_SCHEMA)
+    assert not backend.can(Capability.TURN_CAP)
