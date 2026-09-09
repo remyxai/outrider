@@ -71,15 +71,34 @@ def test_whitelist_excludes_remyx_api_key():
     assert "REMYX_API_KEY" not in run._CLAUDE_ENV_WHITELIST
 
 
-def test_whitelist_includes_workflow_github_token():
-    """The workflow's built-in GITHUB_TOKEN is allowed through so the
-    selection-pass agent's `gh` CLI invocations can authenticate.
-    Without it, the agent falls back to
-    unauthenticated GitHub API at 60 req/hr per shared runner IP and
-    can't view private-repo content. Trade-off justified by the
-    egress defenses (v1.6.4 scrubber + v1.6.8 diagnostic + v1.6.10
-    prompt redaction)."""
-    assert "GITHUB_TOKEN" in run._CLAUDE_ENV_WHITELIST
+def test_whitelist_excludes_workflow_github_token():
+    """The workflow's built-in GITHUB_TOKEN must NOT reach the agent.
+
+    It is write-scoped — the workflow's `permissions:` block grants
+    `pull-requests: write` and `issues: write` — and the agent reads
+    untrusted text all run long: issue and PR bodies, the READMEs of
+    arbitrary repos, paper content. That is a prompt-injection path whose
+    payoff is a token that can write to the repo.
+
+    The egress defenses (outbound-payload scrubber, per-pattern diagnostics,
+    prompt redaction) catch known patterns in payloads Outrider itself sends.
+    They cannot cover every channel available to an agent holding the value:
+    committing it to a file, embedding it in a URL it fetches, or encoding it
+    in a branch name. Nor can the injection-hardening Bash gate, which
+    removes tool *reach* but cannot stop the agent from reproducing a string
+    it was given.
+
+    This assertion was previously inverted, and the code has always stripped
+    the token — so the suite was red rather than the behavior being wrong.
+
+    The cost is real and is accepted deliberately: the selection agent's `gh`
+    calls run unauthenticated (60 req/hr on a shared runner IP, no
+    private-repo reads), which measurably degrades verification quality on
+    some runs. The principled fix is an engine-minted, read-only, repo-scoped
+    token — not handing over the workflow's write-scoped one. Until that
+    exists, unauthenticated reads are the correct trade.
+    """
+    assert "GITHUB_TOKEN" not in run._CLAUDE_ENV_WHITELIST
 
 
 def test_whitelist_excludes_bot_installation_token():
@@ -87,8 +106,8 @@ def test_whitelist_excludes_bot_installation_token():
     (the orchestrator uses it for PR/Issue creation through gh_api).
     The agent must NOT see this token — it's strictly more
     privileged than the workflow built-in (cross-repo, write scopes
-    the bot was granted). Keeping it stripped preserves the
-    least-privilege principle even after restoring GITHUB_TOKEN."""
+    the bot was granted). Neither token is exposed — see
+    test_whitelist_excludes_workflow_github_token."""
     assert "INPUT_GITHUB_TOKEN" not in run._CLAUDE_ENV_WHITELIST
 
 
@@ -109,12 +128,10 @@ def test_whitelist_excludes_github_metadata_vars():
     agent's env either; legitimate cases (repo identity) are passed
     through prompt context.
 
-    Two exceptions are allowed: ``GITHUB_ACTIONS`` (informational CI
-    sentinel) and ``GITHUB_TOKEN`` (workflow built-in token for the
-    agent's ``gh`` CLI verification tooling — see the
-    ``test_whitelist_includes_workflow_github_token`` test for the
-    rationale)."""
-    allowed_github_prefix = {"GITHUB_ACTIONS", "GITHUB_TOKEN"}
+    Exactly one exception is allowed: ``GITHUB_ACTIONS``, an informational
+    CI sentinel carrying no credential. Notably NOT ``GITHUB_TOKEN`` — see
+    ``test_whitelist_excludes_workflow_github_token``."""
+    allowed_github_prefix = {"GITHUB_ACTIONS"}
     for name in run._CLAUDE_ENV_WHITELIST:
         if name.startswith("GITHUB_"):
             assert name in allowed_github_prefix, (
@@ -147,9 +164,9 @@ def test_subprocess_env_returns_only_whitelisted(monkeypatch):
     assert env["ANTHROPIC_API_KEY"] == "sk-test-key"
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["HOME"] == "/home/runner"
-    # Workflow GITHUB_TOKEN is whitelisted for the agent's `gh` CLI auth.
-    # The bot's installation token (via INPUT_GITHUB_TOKEN) stays stripped.
-    assert env["GITHUB_TOKEN"] == "ghs_workflow_token"
+    # NEITHER GitHub token reaches the agent: not the workflow's built-in
+    # (write-scoped) nor the bot's installation token (more privileged still).
+    assert "GITHUB_TOKEN" not in env
 
     # Forbidden vars absent.
     assert "REMYX_API_KEY" not in env
@@ -235,7 +252,7 @@ def test_run_claude_stream_passes_stripped_env(monkeypatch, tmp_path):
     assert captured["env"] is not None, "env= must be passed; got None"
     assert "ANTHROPIC_API_KEY" in captured["env"]
     # Workflow GITHUB_TOKEN passes through for the agent's `gh` auth.
-    assert captured["env"]["GITHUB_TOKEN"] == "ghs_workflow_token"
+    assert "GITHUB_TOKEN" not in captured["env"]
     # Bot installation token (via INPUT_GITHUB_TOKEN) and other INPUT_*
     # action inputs stay stripped — they're strictly higher-privilege
     # than the agent needs.

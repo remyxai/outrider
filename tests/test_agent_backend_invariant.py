@@ -123,10 +123,11 @@ def test_whitelist_composes_from_auth_plus_base():
 def test_github_token_stays_out_of_the_agent_env():
     """A write-scoped token in the agent's context is an exfiltration risk.
 
-    run.py's whitelist deliberately omits GITHUB_TOKEN; the port must not
-    quietly reintroduce it. (Note: tests/test_claude_subprocess_env.py asserts
-    the opposite — that divergence predates this branch and is a live
-    maintainer decision, not something this refactor resolves.)
+    The token is write-scoped and the agent reads untrusted text all run
+    long, so the port must not quietly reintroduce it. run.py has always
+    stripped it; test_claude_subprocess_env.py used to assert the opposite,
+    which is why main was red — those assertions are now corrected to match
+    the code rather than the code to match them.
     """
     assert "GITHUB_TOKEN" not in ClaudeCodeBackend().env_whitelist()
 
