@@ -122,10 +122,19 @@ def build() -> str:
             endpoint = "_you supply `model-base-url`_"
         else:
             endpoint = r["endpoint"] or "—"
+        caveat = getattr(provider, "verification_caveat", "") if provider else ""
+        if not r["verified"]:
+            verdict = "**not verified**"
+        elif caveat:
+            # A verified pair can still carry a precondition. Marking it
+            # keeps a bare "yes" from reading as more than was shown.
+            verdict = "yes\u00b2"
+        else:
+            verdict = "yes"
         w(
             f"| `{r['agent']}` | `{pid}` | `{cell(r['secret'])}` | "
             f"{cell(endpoint)} | {r['default_model'] or '_(agent default)_'} | "
-            f"{'yes' if r['verified'] else '**not verified**'} |"
+            f"{verdict} |"
         )
     w("")
     w('"Verified" means a real run reached that vendor\'s endpoint '
@@ -133,6 +142,19 @@ def build() -> str:
       "warning naming the `provider: custom` + gateway workaround rather "
       "than claiming support it hasn't demonstrated.")
     w("")
+    caveats = sorted(
+        {
+            (p.display_name, p.verification_caveat)
+            for pid_, p in PROVIDERS.items()
+            if getattr(p, "verification_caveat", "")
+            and any(r["provider"] == pid_ and r["verified"]
+                    for r in matrix["pairs"])
+        }
+    )
+    for name, text in caveats:
+        w(f"\u00b2 {name} — {text}.")
+    if caveats:
+        w("")
     w("Two rejections are deliberate rather than missing: `agent: codex` "
       "with `provider: anthropic` fails because Anthropic serves the Messages "
       "API, not OpenAI Responses — and the reverse for `agent: claude` with "

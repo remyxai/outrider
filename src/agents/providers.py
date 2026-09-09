@@ -73,6 +73,11 @@ class Provider:
     #: Families we have actually confirmed end-to-end. An unverified pair
     #: still runs, but warns — see :func:`resolve`.
     verified: frozenset[ApiFamily] = frozenset()
+    #: An operational precondition a verified pair still carries, surfaced
+    #: in the generated table. Kept as data rather than prose so a user
+    #: reading "Verified: yes" also sees what their account has to be for
+    #: that to hold.
+    verification_caveat: str = ""
     #: True when the caller supplies the endpoint themselves.
     caller_supplied_endpoint: bool = False
 
@@ -175,6 +180,11 @@ PROVIDERS: dict[str, Provider] = {
         verified=frozenset({
             ApiFamily.ANTHROPIC_MESSAGES, ApiFamily.OPENAI_RESPONSES,
         }),
+        verification_caveat=(
+            "needs a funded account: both CLIs request a large max_tokens "
+            "(Codex asks for 131,072), which a zero-balance account rejects "
+            "with HTTP 402 before the model is called"
+        ),
     ),
     "custom": Provider(
         id="custom",
@@ -329,6 +339,14 @@ def resolve(
             f"confirmed end-to-end. If the run fails with an unexpected 4xx, "
             f"the endpoint likely speaks a different protocol — use "
             f"provider=custom with a translating gateway."
+        )
+    elif provider.verification_caveat:
+        # A verified provider can still have a precondition the caller's
+        # account has to meet. Saying so here — at the moment they are
+        # configuring — beats letting them discover it as a bare HTTP 402
+        # from the CLI partway into a dispatch.
+        routing.warnings.append(
+            f"provider={provider_id} works but {provider.verification_caveat}."
         )
     return routing
 

@@ -471,3 +471,53 @@ def test_an_explicit_endpoint_is_still_honored():
         resolve("codex"), "moonshot", "kimi-k3", "", env(MOONSHOT_API_KEY="mk")
     )
     assert routing.env["CODEX_BASE_URL"] == "https://api.moonshot.ai/v1"
+
+
+# ─── a verified provider can still carry a precondition ─────────────────
+
+
+def test_a_verification_caveat_is_warned_at_configure_time():
+    """OpenRouter routes correctly but needs a funded account.
+
+    Both CLIs request a large max_tokens — Codex asks for 131,072 — which a
+    zero-balance account rejects with HTTP 402 before the model is called.
+    That is a billing state, not a compatibility problem, so the pair stays
+    verified; saying so while the caller is configuring beats letting them
+    meet it as a bare 402 partway into a dispatch.
+    """
+    routing = route(
+        resolve("codex"), "openrouter", "z-ai/glm-5.3", "",
+        {"OPENROUTER_API_KEY": "k"},
+    )
+    assert any("funded account" in w for w in routing.warnings)
+    assert any("402" in w for w in routing.warnings)
+
+
+def test_a_provider_with_no_caveat_warns_about_nothing():
+    routing = route(
+        resolve("codex"), "moonshot", "kimi-k3", "",
+        {"MOONSHOT_API_KEY": "k"},
+    )
+    assert routing.warnings == []
+
+
+def test_the_caveat_does_not_replace_the_unverified_warning():
+    """The two are different claims and must not collapse into each other:
+    unverified means we could not confirm the protocol at all, a caveat
+    means we did and it carries a precondition."""
+    routing = route(
+        resolve("codex"), "custom", "m", "https://gw.example/v1",
+        {"CODEX_API_KEY": "k"},
+    )
+    assert not any("funded account" in w for w in routing.warnings)
+
+
+def test_every_caveat_belongs_to_a_verified_provider():
+    """A caveat on an unverified provider would never be reached — the
+    unverified warning wins that branch — so it would be dead data."""
+    for pid, provider in PROVIDERS.items():
+        if provider.verification_caveat:
+            assert provider.verified, (
+                f"{pid} carries a verification_caveat but is unverified, so "
+                f"the caveat can never be surfaced"
+            )

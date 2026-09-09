@@ -195,14 +195,16 @@ Leave `agent` empty for Claude Code — every existing workflow keeps its exact 
 | `claude` | `anthropic` | `ANTHROPIC_API_KEY` | (vendor default) | _(agent default)_ | yes |
 | `claude` | `zai` | `ZAI_API_KEY` | https://api.z.ai/api/anthropic | glm-5.3 | yes |
 | `claude` | `moonshot` | `MOONSHOT_API_KEY` | https://api.moonshot.ai/anthropic | kimi-k3 | yes |
-| `claude` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api | _(agent default)_ | yes |
+| `claude` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api | _(agent default)_ | yes² |
 | `claude` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |
 | `codex` | `openai` | `OPENAI_API_KEY` | (vendor default) | _(agent default)_ | yes |
 | `codex` | `moonshot` | `MOONSHOT_API_KEY` | https://api.moonshot.ai/v1 | kimi-k3 | yes |
-| `codex` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api/v1 | _(agent default)_ | yes |
+| `codex` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api/v1 | _(agent default)_ | yes² |
 | `codex` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |
 
 "Verified" means a real run reached that vendor's endpoint end-to-end. An unverified pair still runs, but the action logs a warning naming the `provider: custom` + gateway workaround rather than claiming support it hasn't demonstrated.
+
+² OpenRouter — needs a funded account: both CLIs request a large max_tokens (Codex asks for 131,072), which a zero-balance account rejects with HTTP 402 before the model is called.
 
 Two rejections are deliberate rather than missing: `agent: codex` with `provider: anthropic` fails because Anthropic serves the Messages API, not OpenAI Responses — and the reverse for `agent: claude` with `provider: openai`. Both errors name the agent that *does* serve the provider.
 
