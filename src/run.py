@@ -76,6 +76,10 @@ from exploration_structure import (
     structure_enabled,
 )
 from instruction_files import render_instruction_files
+from spec_compiler import (
+    compile_specification,
+    render_specification_metadata,
+)
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -7302,6 +7306,17 @@ def write_spec_bundle(
             arxiv_id=rec.arxiv_id,
             paper_abstract=rec.paper_abstract,
         ))
+
+        # Compile structured specification metadata (PaperCompiler adaptation).
+        # This enriches the bundle with non-degradation requirements, cross-file
+        # dependencies, and file-level constraints to guide higher-fidelity
+        # code generation.
+        compilation = compile_specification(
+            paper_title=rec.paper_title or "",
+            paper_abstract=rec.paper_abstract or "",
+            suggested_experiment=effective_experiment,
+        )
+        (bundle / "SPEC_COMPILATION.json").write_text(compilation.to_json())
 
     # CONTEXT.md — team's shipping history bullets,
     # fetched from the research-interests endpoint. Skipped entirely
