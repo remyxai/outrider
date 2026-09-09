@@ -198,7 +198,6 @@ Leave `agent` empty for Claude Code — every existing workflow keeps its exact 
 | `claude` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api | _(agent default)_ | yes |
 | `claude` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |
 | `codex` | `openai` | `OPENAI_API_KEY` | (vendor default) | _(agent default)_ | yes |
-| `codex` | `zai` | `ZAI_API_KEY` | https://api.z.ai/api/paas/v4 | glm-5.3 | **not verified** |
 | `codex` | `moonshot` | `MOONSHOT_API_KEY` | https://api.moonshot.ai/v1 | kimi-k3 | yes |
 | `codex` | `openrouter` | `OPENROUTER_API_KEY` | https://openrouter.ai/api/v1 | _(agent default)_ | yes |
 | `codex` | `custom` | `(agent's own)` | _you supply `model-base-url`_ | _(agent default)_ | **not verified** |

@@ -103,17 +103,24 @@ PROVIDERS: dict[str, Provider] = {
         id="zai",
         display_name="z.ai (GLM)",
         secret_env="ZAI_API_KEY",
+        # ANTHROPIC_MESSAGES only. z.ai does NOT serve the OpenAI Responses
+        # API that Codex requires — verified with a real key:
+        #   POST /api/paas/v4/responses        -> 404 {"path":"/v4/responses"}
+        #   POST /api/paas/v4/chat/completions -> 200-class (endpoint exists)
+        # It is Chat-Completions-only, and codex-cli 0.151.0 removed Chat
+        # support, so Codex cannot reach z.ai directly at all. This row
+        # previously advertised the paas/v4 base for OPENAI_RESPONSES, which
+        # would have 404'd mid-run; omitting the family makes the pair fail
+        # fast with a message naming the agent that does work.
+        #
+        # A dev who wants GLM under Codex needs a translating gateway
+        # (provider=custom + model-base-url) or a router that exposes
+        # Responses.
         endpoints={
             ApiFamily.ANTHROPIC_MESSAGES: "https://api.z.ai/api/anthropic",
-            # z.ai authenticates before routing, so an unauthenticated probe
-            # cannot tell a real /responses endpoint from a 404. Left in the
-            # registry (it is the documented OpenAI-compatible base) but not
-            # marked verified, which makes the run warn instead of claiming.
-            ApiFamily.OPENAI_RESPONSES: "https://api.z.ai/api/paas/v4",
         },
         default_model={
             ApiFamily.ANTHROPIC_MESSAGES: "glm-5.3",
-            ApiFamily.OPENAI_RESPONSES: "glm-5.3",
         },
         verified=frozenset({ApiFamily.ANTHROPIC_MESSAGES}),
     ),

@@ -81,12 +81,10 @@
       "display_name": "z.ai (GLM)",
       "secret_env": "ZAI_API_KEY",
       "families": {
-        "anthropic-messages": "https://api.z.ai/api/anthropic",
-        "openai-responses": "https://api.z.ai/api/paas/v4"
+        "anthropic-messages": "https://api.z.ai/api/anthropic"
       },
       "default_model": {
-        "anthropic-messages": "glm-5.3",
-        "openai-responses": "glm-5.3"
+        "anthropic-messages": "glm-5.3"
       },
       "verified": [
         "anthropic-messages"
@@ -199,15 +197,6 @@
       "secret": "OPENAI_API_KEY",
       "default_model": "",
       "verified": true
-    },
-    {
-      "agent": "codex",
-      "provider": "zai",
-      "family": "openai-responses",
-      "endpoint": "https://api.z.ai/api/paas/v4",
-      "secret": "ZAI_API_KEY",
-      "default_model": "glm-5.3",
-      "verified": false
     },
     {
       "agent": "codex",

@@ -183,12 +183,28 @@ def test_codex_rejects_a_provider_that_does_not_serve_its_family():
     assert "agent=claude" in message
 
 
-def test_unverified_pair_warns_but_still_runs():
-    """z.ai authenticates before routing, so its Responses support could not
-    be confirmed. Warn rather than claim — or block."""
-    routing = route(resolve("codex"), "zai", "", "", env(ZAI_API_KEY="zk"))
-    assert routing.env["CODEX_BASE_URL"] == "https://api.z.ai/api/paas/v4"
-    assert any("unverified" in w for w in routing.warnings)
+def test_codex_cannot_reach_zai_and_says_so():
+    """z.ai does not serve the OpenAI Responses API — verified with a real
+    key: /api/paas/v4/responses returns 404 while /chat/completions exists.
+
+    It is Chat-Completions-only and codex-cli 0.151.0 removed Chat support,
+    so this pair is impossible rather than merely unproven. Failing fast with
+    a message naming the working agent beats a mid-run 404.
+    """
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("codex"), "zai", "glm-5.3", "", env(ZAI_API_KEY="zk"))
+    message = str(exc.value)
+    assert "does not serve" in message
+    assert "agent=claude" in message
+
+
+def test_claude_still_reaches_zai_directly():
+    """Direct provider access must not depend on any router: a dev with only
+    a ZAI_API_KEY gets a working config."""
+    routing = route(resolve("claude"), "zai", "", "", env(ZAI_API_KEY="zk"))
+    assert routing.env["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
+    assert routing.env["ANTHROPIC_AUTH_TOKEN"] == "zk"
+    assert routing.warnings == [], "a verified direct pair must not warn"
 
 
 def test_verified_pair_does_not_warn():
