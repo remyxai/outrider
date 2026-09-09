@@ -331,7 +331,3 @@ _AGENT_FAMILIES: dict[str, ApiFamily] = {}
 
 def register_agent_family(name: str, family: ApiFamily) -> None:
     _AGENT_FAMILIES[name] = family
-
-
-def agent_families() -> dict[str, ApiFamily]:
-    return dict(_AGENT_FAMILIES)

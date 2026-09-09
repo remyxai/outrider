@@ -23,7 +23,6 @@ from agents.base import (  # noqa: F401 — re-exported for callers
     AgentResult,
     Capability,
     Event,
-    PromptDelivery,
 )
 from agents.backboard import BackboardBackend
 from agents.claude import ClaudeCodeBackend

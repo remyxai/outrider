@@ -29,8 +29,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
-from typing import Iterable
 
 
 class Capability(str, Enum):
@@ -56,13 +54,6 @@ class Capability(str, Enum):
     #: injected instruction the agent complies with is not defanged at the
     #: tool boundary — see ``guardrail_note``.
     GUARDRAIL_POLICY = "guardrail_policy"
-
-
-class PromptDelivery(str, Enum):
-    """How the prompt reaches the process."""
-
-    ARGV = "argv"
-    STDIN = "stdin"
 
 
 # Environment every agent CLI legitimately needs. Per-backend auth vars are
@@ -341,11 +332,3 @@ class AgentBackend:
         (exit code + stderr, formatted so the cause survives tail-slicing).
         """
         raise NotImplementedError
-
-
-def _dedup(items: Iterable[str]) -> tuple[str, ...]:
-    """Order-preserving dedup, for composing env whitelists."""
-    seen: dict[str, None] = {}
-    for item in items:
-        seen.setdefault(item, None)
-    return tuple(seen)

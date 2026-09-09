@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agents import RoutingError, available, resolve, resolve_routing  # noqa: E402
+from agents import RoutingError, resolve, resolve_routing  # noqa: E402
 
 
 def main() -> int:
