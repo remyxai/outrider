@@ -33,16 +33,20 @@ The `claude-timeout` input threads through every phase (selection, deep-search, 
 
 ## Auth-header matrix (and why setting both env vars breaks)
 
-Different backends expect different auth headers. Claude Code uses two distinct env vars depending on the auth path:
+Different backends expect different auth headers, and Claude Code picks the header from *which env var* you set. Verified by pointing the CLI at a local server and reading what arrived:
 
 | Env var | Header Claude Code sends | Right for |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | `x-api-key: <value>` | Default Anthropic |
-| `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer <value>` | Non-Anthropic backends that expect Bearer auth: z.ai's GLM, Moonshot's Kimi (both gateways return HTTP 401 to `x-api-key`) |
+| `ANTHROPIC_API_KEY` | `x-api-key: <value>` | Anthropic's own API |
+| `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer <value>` | Gateways that expect Bearer auth: z.ai's GLM, Moonshot's Kimi, OpenRouter (all reject `x-api-key` with HTTP 401) |
 
-> **Mutual exclusion.** Setting **both** env vars in the runner environment makes Claude Code prefer `ANTHROPIC_API_KEY` (the `x-api-key` path) — which non-Anthropic backends like z.ai reject. The two env vars are not additive; they're mutually exclusive, and the workflow must choose one per dispatch.
+**On the `ANTHROPIC_` prefix.** It looks wrong on a run that never touches Anthropic, but it is *Claude Code's own* env namespace rather than a claim about who serves the request — the CLI accepts no other spelling, and namespaces other vendors the same way (`ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_FOUNDRY_API_KEY`). Choose Claude Code as the agent and these are the variable names, whichever gateway bills the tokens. Codex and R-CLI have their own namespaces and take their routing on the command line.
 
-The job-level conditional `${{ inputs.provider == 'zai' && '' || secrets.ANTHROPIC_API_KEY }}` does NOT evaluate to `''` when the condition is true — GitHub Actions's `&& ''` short-circuits as falsy and `||` falls through to the third operand. The reliable way to set "one or the other, never both" is a step that writes to `$GITHUB_ENV` (which DOES support empty values cleanly). See the template below.
+> **Set exactly one.** With **both** set, Claude Code does not choose between them — it sends **both headers on every request**, so an unrelated Anthropic key travels to whatever gateway the run is pointed at. The gateway reads the Bearer token and ignores the extra header, so the run *succeeds* and nothing looks wrong.
+>
+> The action prevents it where it cannot be undone: the agent's process environment is built explicitly at launch, and carries only the credential the selected provider needs. Nothing in a caller's workflow can add the other one back.
+>
+> Earlier revisions of this page recommended writing an empty value to `$GITHUB_ENV` to clear the unselected var. **That does not work.** A step-level `env:` in the caller's workflow takes precedence over `$GITHUB_ENV`, and every install declares each vendor's secret there so `provider` stays switchable — so the clear was silently overridden on every install that used it. Captured from a real run: `ANTHROPIC_API_KEY=(cleared)` was written, and the next step still saw it set.
 
 
 ## Workflow template — per-dispatch provider + model switching

@@ -562,3 +562,42 @@ def test_every_caveat_belongs_to_a_verified_provider():
                 f"{pid} carries a verification_caveat but is unverified, so "
                 f"the caveat can never be surfaced"
             )
+
+
+def test_a_gateway_run_carries_no_anthropic_key_at_all():
+    """The credential-hygiene reason this matters, not just tidiness.
+
+    Claude Code does not choose between its two credential vars when both
+    are set — verified against a local server, it sends **both headers**:
+
+        Authorization: Bearer <token>
+        x-api-key: <key>
+
+    So on a run routed at z.ai, an unrelated Anthropic key was travelling to
+    z.ai on every request. The gateway reads the Bearer token and ignores
+    the extra header, so the run succeeds and nothing looks wrong — which is
+    why it went unnoticed. The clear that was supposed to prevent it was
+    itself overridden by the caller's `env:` block.
+
+    Asserted against the launch environment, which is what the agent gets.
+    """
+    backend = resolve("claude")
+    for provider in ("zai", "moonshot", "openrouter"):
+        secret = PROVIDERS[provider].secret_env
+        routing = route(backend, provider, "m", "", env(**{secret: "vendor"}))
+        launched_env = dict(routing.env)
+        launched_env["ANTHROPIC_API_KEY"] = "sk-ant-REAL"   # caller's key
+        import os
+        saved = {k: os.environ.get(k) for k in launched_env}
+        try:
+            os.environ.update(launched_env)
+            launched = backend.subprocess_env()
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        assert "ANTHROPIC_API_KEY" not in launched, (
+            f"an Anthropic key would be sent to {provider} as x-api-key"
+        )

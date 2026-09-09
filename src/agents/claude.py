@@ -61,12 +61,29 @@ class ClaudeCodeBackend(AgentBackend):
     billing_url = "https://console.anthropic.com/settings/billing"
     keys_url = "https://console.anthropic.com/settings/keys"
 
-    # ANTHROPIC_AUTH_TOKEN — used by Claude Code as a Bearer credential for
-    # non-default backends (z.ai's GLM Coding Plan requires this:
-    # https://docs.z.ai/devpack/tool/claude). When set, Claude Code sends
-    # "Authorization: Bearer <token>" instead of "x-api-key: <key>". z.ai's
-    # gateway rejects x-api-key with HTTP 401, so without this entry any
-    # glm-routed run fails at auth.
+    # On the `ANTHROPIC_` prefix, which looks wrong on a run that never
+    # touches Anthropic: it is *Claude Code's own* env namespace, not a claim
+    # about who serves the request. The CLI accepts no other spelling — it
+    # namespaces every backend this way, including other vendors'
+    # (ANTHROPIC_BEDROCK_BASE_URL, ANTHROPIC_FOUNDRY_API_KEY). Pick Claude
+    # Code as the agent and these are the variable names, whichever gateway
+    # the tokens are actually billed by.
+    #
+    # The two credential vars are not "Anthropic vs everyone else" — they
+    # select the HTTP auth header, verified by pointing the CLI at a local
+    # server and reading what arrived:
+    #
+    #   ANTHROPIC_AUTH_TOKEN  ->  Authorization: Bearer <key>
+    #   ANTHROPIC_API_KEY     ->  x-api-key: <key>
+    #
+    # So the Bearer var is needed *because* the request is not going to
+    # Anthropic. z.ai, Moonshot and OpenRouter all want
+    # `Authorization: Bearer` and reject x-api-key with HTTP 401 — see
+    # https://docs.z.ai/devpack/tool/claude — while Anthropic's own API wants
+    # x-api-key. `AuthStyle` on each provider row is which of the two to use.
+    #
+    # Codex and R-CLI have their own namespaces (CODEX_*, BACKBOARD_*) and
+    # take their routing on the command line, so this only applies here.
     auth_env = (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
