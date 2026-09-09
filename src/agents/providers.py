@@ -151,11 +151,23 @@ PROVIDERS: dict[str, Provider] = {
             ApiFamily.ANTHROPIC_MESSAGES: "https://openrouter.ai/api",
             ApiFamily.OPENAI_RESPONSES: "https://openrouter.ai/api/v1",
         },
-        # No default: OpenRouter ids are namespaced (`z-ai/glm-4.6`,
+        # No default: OpenRouter ids are namespaced (`z-ai/glm-5.3`,
         # `anthropic/claude-...`) and picking one here would rot as models
         # move. Callers name a model; see the no-default warning in resolve().
-        # Endpoints are probed but no end-to-end run has happened, so neither
-        # family is claimed as verified.
+        #
+        # Both families verified with real completions against z-ai/glm-5.3:
+        # /v1/messages returned an Anthropic-shaped message with content
+        # blocks and usage; /v1/responses returned status="completed" with a
+        # usage block. So the protocol claim is backed, not inferred.
+        #
+        # Caveat for operators rather than for this registry: both agent CLIs
+        # request a very large max_tokens (Codex asks for 131,072), which a
+        # free-tier OpenRouter account rejects with HTTP 402 before the model
+        # is ever called. A paid account is required for a real run — that is
+        # a billing state, not a compatibility problem.
+        verified=frozenset({
+            ApiFamily.ANTHROPIC_MESSAGES, ApiFamily.OPENAI_RESPONSES,
+        }),
     ),
     "custom": Provider(
         id="custom",

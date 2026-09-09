@@ -407,12 +407,14 @@ def test_openrouter_is_reachable_by_every_agent():
     assert reachable == set(available())
 
 
-def test_openrouter_is_not_claimed_as_verified():
-    """Endpoints were probed; no end-to-end run has happened. The pair warns
-    rather than asserting support we haven't demonstrated."""
-    routing = route(resolve("codex"), "openrouter", "z-ai/glm-4.6", "",
-                    env(OPENROUTER_API_KEY="or"))
-    assert any("unverified" in w for w in routing.warnings)
+def test_openrouter_is_verified_on_both_families():
+    """Backed by real completions against z-ai/glm-5.3: /v1/messages returned
+    an Anthropic-shaped message, /v1/responses returned status="completed".
+    So neither pair warns about protocol compatibility any more."""
+    for agent in ("claude", "codex"):
+        routing = route(resolve(agent), "openrouter", "z-ai/glm-5.3", "",
+                        env(OPENROUTER_API_KEY="or"))
+        assert not any("unverified" in w for w in routing.warnings), agent
 
 
 def test_a_provider_with_no_default_model_warns_when_none_is_named():

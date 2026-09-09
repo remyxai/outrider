@@ -118,7 +118,10 @@
         "openai-responses": "https://openrouter.ai/api/v1"
       },
       "default_model": {},
-      "verified": [],
+      "verified": [
+        "anthropic-messages",
+        "openai-responses"
+      ],
       "caller_supplied_endpoint": false
     },
     "custom": {
@@ -177,7 +180,7 @@
       "endpoint": "https://openrouter.ai/api",
       "secret": "OPENROUTER_API_KEY",
       "default_model": "",
-      "verified": false
+      "verified": true
     },
     {
       "agent": "claude",
@@ -222,7 +225,7 @@
       "endpoint": "https://openrouter.ai/api/v1",
       "secret": "OPENROUTER_API_KEY",
       "default_model": "",
-      "verified": false
+      "verified": true
     },
     {
       "agent": "codex",

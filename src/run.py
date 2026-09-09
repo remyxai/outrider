@@ -7681,6 +7681,7 @@ def _detect_backend(
     display_overrides = {
         "api.z.ai": "z.ai (GLM)",
         "api.moonshot.ai": "Moonshot (Kimi)",
+        "openrouter.ai": "OpenRouter",
     }
     for key, model_rates in _BACKEND_RATES.items():
         if key in host:
