@@ -7603,13 +7603,25 @@ def _validate_claude_auth_env() -> tuple[bool, list[str]]:
     if non_default:
         primary_name = "ANTHROPIC_AUTH_TOKEN"
         primary_val = auth_token
+        # Both credential vars being set is normal, not a problem: a
+        # workflow declares every vendor's secret so `provider` stays
+        # switchable per dispatch, so a run routed at a gateway always has an
+        # Anthropic key in scope too. This used to warn, and the warning was
+        # wrong twice over — Claude Code does not "prefer ANTHROPIC_API_KEY"
+        # (given both, it sends *both* headers), and the advice to "set only
+        # ANTHROPIC_AUTH_TOKEN" was something the caller could not act on.
+        #
+        # The condition is handled where it counts: the agent is launched
+        # with only the credential routing selected, so nothing here needs
+        # the operator's attention. Saying which one that is beats warning
+        # about a state the action has already resolved.
         if api_key and auth_token:
-            warnings.append(
-                "Both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set "
-                "while a non-default backend is configured. Claude Code "
-                "will prefer ANTHROPIC_API_KEY (x-api-key), which "
-                "non-Anthropic backends typically reject with HTTP 401. "
-                "Set only ANTHROPIC_AUTH_TOKEN for non-default backends."
+            log.info(
+                "  auth check: both credential vars are in scope (a workflow "
+                "declares every vendor's secret); the agent will be launched "
+                "with %s only",
+                os.environ.get("OUTRIDER_CLAUDE_AUTH_VAR")
+                or "ANTHROPIC_AUTH_TOKEN",
             )
     else:
         primary_name = "ANTHROPIC_API_KEY"

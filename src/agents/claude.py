@@ -100,6 +100,14 @@ class ClaudeCodeBackend(AgentBackend):
     key_env = "ANTHROPIC_API_KEY"
     base_url_env = "ANTHROPIC_BASE_URL"
     model_env = "ANTHROPIC_MODEL"
+    #: Where routing records which credential var it selected, so the launch
+    #: environment can drop the other one. Written to `$GITHUB_ENV` like the
+    #: rest of the routing, and safe there because a caller's workflow has no
+    #: reason to declare it — unlike the credential vars themselves, which
+    #: every install declares and which therefore shadow anything routing
+    #: says about them.
+    AUTH_VAR_MARKER = "OUTRIDER_CLAUDE_AUTH_VAR"
+
     #: The Bearer-style credential var; see `routing` for why there are two.
     token_env = "ANTHROPIC_AUTH_TOKEN"
 
@@ -197,12 +205,23 @@ class ClaudeCodeBackend(AgentBackend):
         chosen = model
         routing = Routing(provider_display=provider.display_name, model=chosen)
 
-        # Set the one this provider's auth style calls for, and leave the
-        # other alone. subprocess_env() decides which reaches the agent.
+        # Set the one this provider's auth style calls for, and record which
+        # that was. subprocess_env() reads the marker to drop the *other*
+        # credential at launch.
+        #
+        # The choice has to be recorded rather than re-derived, because
+        # "which var is present" is not the same question. A caller can have
+        # a stale ANTHROPIC_AUTH_TOKEN secret and select provider=anthropic;
+        # inferring from presence would then send Bearer to Anthropic and
+        # earn a 401 on a configuration that works today. And `custom`
+        # records nothing at all (see above), so a caller-supplied endpoint
+        # keeps whichever credential the caller chose.
         if provider.auth_style(family) is AuthStyle.API_KEY:
             routing.env[self.key_env] = key
+            routing.env[self.AUTH_VAR_MARKER] = self.key_env
         else:
             routing.env[self.token_env] = key
+            routing.env[self.AUTH_VAR_MARKER] = self.token_env
 
         if base_url:
             routing.env[self.base_url_env] = base_url
@@ -263,11 +282,16 @@ class ClaudeCodeBackend(AgentBackend):
         and the call was billed by the gateway, not rejected. Naming that
         explicitly means the run no longer depends on it staying true.
         """
+        selected = (os.environ.get(self.AUTH_VAR_MARKER) or "").strip()
         env = super().subprocess_env()
-        if env.get(self.token_env):
-            # Bearer auth was selected; the other var is an unrelated
-            # vendor's key that happens to be in scope.
-            env.pop(self.key_env, None)
+        if selected in (self.key_env, self.token_env):
+            unselected = (
+                self.token_env if selected == self.key_env else self.key_env
+            )
+            env.pop(unselected, None)
+        # Never hand the marker itself to the agent: it is this action's
+        # bookkeeping, not something Claude Code reads.
+        env.pop(self.AUTH_VAR_MARKER, None)
         return env
 
     def base_cmd(self) -> list[str]:

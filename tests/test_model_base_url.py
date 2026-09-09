@@ -88,9 +88,12 @@ def test_claude_subprocess_env_forwards_only_the_selected_credential(monkeypatch
     """
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-zai-token")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-default")
+    # Routing records which var it picked; the launch env drops the other.
+    monkeypatch.setenv("OUTRIDER_CLAUDE_AUTH_VAR", "ANTHROPIC_AUTH_TOKEN")
     env = run._claude_subprocess_env()
     assert env.get("ANTHROPIC_AUTH_TOKEN") == "test-zai-token"
     assert "ANTHROPIC_API_KEY" not in env
+    assert "OUTRIDER_CLAUDE_AUTH_VAR" not in env
 
 
 def test_claude_subprocess_env_uses_the_api_key_when_no_token_is_set(monkeypatch):

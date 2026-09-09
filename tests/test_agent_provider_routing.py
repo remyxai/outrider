@@ -47,7 +47,8 @@ CLAUDE_PARITY = [
     (
         "anthropic",
         env(ANTHROPIC_API_KEY="ak-1"),
-        {"ANTHROPIC_API_KEY": "ak-1"},
+        {"ANTHROPIC_API_KEY": "ak-1",
+         "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_API_KEY"},
     ),
     (
         "zai",
@@ -55,6 +56,7 @@ CLAUDE_PARITY = [
         {
             "ANTHROPIC_AUTH_TOKEN": "zk-1",
             "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+            "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_AUTH_TOKEN",
         },
     ),
     (
@@ -63,6 +65,7 @@ CLAUDE_PARITY = [
         {
             "ANTHROPIC_AUTH_TOKEN": "mk-1",
             "ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic",
+            "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_AUTH_TOKEN",
         },
     ),
 ]
@@ -601,3 +604,61 @@ def test_a_gateway_run_carries_no_anthropic_key_at_all():
         assert "ANTHROPIC_API_KEY" not in launched, (
             f"an Anthropic key would be sent to {provider} as x-api-key"
         )
+
+
+def test_the_auth_var_choice_is_recorded_not_inferred():
+    """Presence is not the same question as selection.
+
+    Inferring "Bearer if a token is present" looked equivalent and is not: a
+    caller can hold a stale ANTHROPIC_AUTH_TOKEN secret and select
+    provider=anthropic, and inference would then send Bearer to Anthropic and
+    earn a 401 on a configuration that works today. Caught before shipping.
+    """
+    import os
+
+    backend = resolve("claude")
+    routing = route(backend, "anthropic", "", "", env(ANTHROPIC_API_KEY="ak"))
+    assert routing.env[backend.AUTH_VAR_MARKER] == "ANTHROPIC_API_KEY"
+
+    saved = {k: os.environ.get(k) for k in
+             ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+              backend.AUTH_VAR_MARKER)}
+    try:
+        os.environ["ANTHROPIC_API_KEY"] = "ak"
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = "stale-gateway-token"
+        os.environ.update(routing.env)
+        launched = backend.subprocess_env()
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert launched["ANTHROPIC_API_KEY"] == "ak"
+    assert "ANTHROPIC_AUTH_TOKEN" not in launched
+
+
+def test_a_caller_supplied_endpoint_records_no_choice():
+    """`provider: custom` means the caller owns the auth decision, so nothing
+    is dropped — they may legitimately have supplied either var."""
+    backend = resolve("claude")
+    routing = route(backend, "custom", "", "https://gw.example/v1",
+                    env(ANTHROPIC_API_KEY="caller-key"))
+    assert backend.AUTH_VAR_MARKER not in routing.env
+
+
+def test_the_marker_never_reaches_the_agent():
+    """It is this action's bookkeeping, not something Claude Code reads."""
+    import os
+
+    backend = resolve("claude")
+    saved = os.environ.get(backend.AUTH_VAR_MARKER)
+    try:
+        os.environ[backend.AUTH_VAR_MARKER] = "ANTHROPIC_API_KEY"
+        assert backend.AUTH_VAR_MARKER not in backend.subprocess_env()
+    finally:
+        if saved is None:
+            os.environ.pop(backend.AUTH_VAR_MARKER, None)
+        else:
+            os.environ[backend.AUTH_VAR_MARKER] = saved

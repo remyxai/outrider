@@ -135,13 +135,16 @@ LEGACY_ENV_EXPECTATIONS = [
     # process actually gets. See
     # test_the_unselected_credential_never_reaches_the_agent below.
     ("anthropic", {"ANTHROPIC_API_KEY": "ak"},
-     {"ANTHROPIC_API_KEY": "ak"}),
+     {"ANTHROPIC_API_KEY": "ak",
+      "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_API_KEY"}),
     ("zai", {"ZAI_API_KEY": "zk"},
      {"ANTHROPIC_AUTH_TOKEN": "zk",
-      "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}),
+      "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+      "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_AUTH_TOKEN"}),
     ("moonshot", {"MOONSHOT_API_KEY": "mk"},
      {"ANTHROPIC_AUTH_TOKEN": "mk",
-      "ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic"}),
+      "ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic",
+      "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_AUTH_TOKEN"}),
 ]
 
 
