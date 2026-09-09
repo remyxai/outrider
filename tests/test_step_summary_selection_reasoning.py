@@ -203,7 +203,9 @@ def test_step_summary_succeeds_when_claude_log_tail_missing(tmp_path, monkeypatc
         "claude_calls": 0,
     }, tmp_path, monkeypatch)
     # Headline still renders even without the tail-derived action block.
-    assert "claude_failed" in out
+    # Displayed form is agent-neutral; the stored/posted value is still
+    # `claude_failed` (see test_agent_cross_phase.py).
+    assert "agent_failed" in out
     # No specific-action section fires when there's no tail content.
     assert "Anthropic credit balance" not in out
     assert "ANTHROPIC_API_KEY secret invalid" not in out

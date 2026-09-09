@@ -373,3 +373,38 @@ def test_no_user_facing_string_hardcodes_the_agent_name():
     assert not offenders, (
         "user-facing text must name the active agent: " + "; ".join(offenders)
     )
+
+
+# ─── stored status vs displayed status ──────────────────────────────────────
+
+def test_displayed_status_is_agent_neutral():
+    """A Backboard failure rendered its step-summary header as
+    `claude_failed`, which is the same misleading breadcrumb the log sweep
+    removed everywhere else."""
+    assert run._display_status("claude_failed") == "agent_failed"
+    assert run._display_status("fidelity_failed_claude") == "fidelity_failed_agent"
+
+
+def test_unmapped_statuses_pass_through_unchanged():
+    for status in ("pr_opened", "issue_opened_preflight", "skipped_by_cadence"):
+        assert run._display_status(status) == status
+
+
+def test_the_stored_status_value_is_not_changed():
+    """The engine persists these and existing queries group on them, so the
+    posted value must stay until a server-side normalize-on-read lands."""
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "run.py"
+    ).read_text()
+    assert 'result["status"] = "claude_failed"' in src, (
+        "the stored value must remain claude_failed until the server maps it"
+    )
+
+
+def test_the_header_renders_the_display_form(tmp_path, monkeypatch):
+    lines = run._agent_failure_blocks("backboard", "some tail", 1)
+    assert lines  # sanity
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "run.py"
+    ).read_text()
+    assert "_display_status(status)" in src

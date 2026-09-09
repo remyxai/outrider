@@ -18028,6 +18028,27 @@ def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[
     return lines
 
 
+# Status values are stored data: the engine persists them and existing
+# queries group on them, so `claude_failed` cannot be renamed from this side
+# without orphaning rows. What it *can* do is stop displaying a Claude-
+# specific name for a run that used another agent — a Backboard failure
+# rendering as "claude_failed" is exactly the kind of misleading breadcrumb
+# the log sweep removed everywhere else.
+#
+# Display-only mapping. The posted value is untouched; generalizing the
+# stored value needs a server-side normalize-on-read first.
+_DISPLAY_STATUS = {
+    "claude_failed": "agent_failed",
+    "fidelity_failed_claude": "fidelity_failed_agent",
+    "pre_pr_fidelity_failed_claude": "pre_pr_fidelity_failed_agent",
+}
+
+
+def _display_status(status: str) -> str:
+    """Human-facing form of a stored status value."""
+    return _DISPLAY_STATUS.get(status, status)
+
+
 def _write_step_summary(result: dict) -> None:
     """Render the run outcome as Markdown into $GITHUB_STEP_SUMMARY.
 
@@ -18103,7 +18124,7 @@ def _write_step_summary(result: dict) -> None:
     }.get(status, "ℹ️")
 
     lines: list[str] = []
-    lines.append(f"## {emoji} Remyx Recommendation — `{status}`\n")
+    lines.append(f"## {emoji} Remyx Recommendation — `{_display_status(status)}`\n")
 
     if paper and arxiv:
         tier_str = f" ({tier})" if tier else ""
