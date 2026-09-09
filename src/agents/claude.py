@@ -9,6 +9,7 @@ previously.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from agents.base import (
@@ -122,16 +123,30 @@ class ClaudeCodeBackend(AgentBackend):
     # ── model routing ─────────────────────────────────────────────────────
 
     def routing(self, provider, family, model: str, base_url: str, env: dict):
-        """Point Claude Code at ``provider``, honoring its auth-var exclusion.
+        """Point Claude Code at ``provider``, selecting one credential var.
 
-        Claude Code reads two credential vars and *prefers* ANTHROPIC_API_KEY
-        (sent as `x-api-key`) whenever both are set. Non-Anthropic gateways
-        reject that header with HTTP 401, so the two are mutually exclusive
-        and the unselected one must be actively cleared — callers normally
-        pass every vendor's secret at once so `provider` stays switchable at
-        dispatch time.
+        Claude Code reads two credential vars, and callers normally pass every
+        vendor's secret at once so `provider` stays switchable at dispatch
+        time — so a run routed at z.ai has an Anthropic key sitting in the
+        environment as well.
 
-        An empty string in the returned env means "clear this variable".
+        This used to write an empty string for the unselected var, meaning
+        "clear it". **That never worked.** These values reach the run through
+        ``$GITHUB_ENV``, and a step-level ``env:`` entry in the caller's
+        workflow takes precedence over it. Captured from a real run:
+
+            ANTHROPIC_API_KEY=(cleared)      <- written here
+            ...
+            ANTHROPIC_API_KEY: ***           <- what the next step actually saw
+
+        The run worked anyway, which is the part worth knowing: with both
+        vars set and a non-Anthropic base URL, Claude Code used the Bearer
+        token. So the exclusion this docstring used to claim was load-bearing
+        was neither achieved nor needed.
+
+        Nothing is cleared now. The selection is made where it cannot be
+        overridden — :meth:`subprocess_env`, which builds the agent's
+        environment explicitly at launch.
         """
         from agents.providers import Routing, RoutingError
 
@@ -165,13 +180,12 @@ class ClaudeCodeBackend(AgentBackend):
         chosen = model
         routing = Routing(provider_display=provider.display_name, model=chosen)
 
+        # Set the one this provider's auth style calls for, and leave the
+        # other alone. subprocess_env() decides which reaches the agent.
         if provider.auth_style(family) is AuthStyle.API_KEY:
-            # Already the var Claude Code prefers; clear the Bearer one.
             routing.env[self.key_env] = key
-            routing.env[self.token_env] = ""
         else:
             routing.env[self.token_env] = key
-            routing.env[self.key_env] = ""
 
         if base_url:
             routing.env[self.base_url_env] = base_url
@@ -212,12 +226,50 @@ class ClaudeCodeBackend(AgentBackend):
         }
         return ["--settings", json.dumps(settings)]
 
+    def subprocess_env(self) -> dict[str, str]:
+        """The agent's environment, with exactly one credential in it.
+
+        Claude Code reads ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN, and a
+        caller's workflow normally declares every vendor's secret so
+        `provider` stays switchable per dispatch. So on a run routed at a
+        gateway, an unrelated Anthropic key is sitting right there.
+
+        Choosing here is what makes the choice stick. Routing writes its
+        decision to ``$GITHUB_ENV``, which a step-level ``env:`` in the
+        caller's workflow silently overrides — verified from a real run,
+        where a value this code had just cleared came back set one step
+        later. This dict, by contrast, is the environment the agent process
+        is launched with: nothing downstream can override it.
+
+        The rule is the one Claude Code follows anyway. Observed live: with
+        both vars set and a non-Anthropic base URL it used the Bearer token
+        and the call was billed by the gateway, not rejected. Naming that
+        explicitly means the run no longer depends on it staying true.
+        """
+        env = super().subprocess_env()
+        if env.get(self.token_env):
+            # Bearer auth was selected; the other var is an unrelated
+            # vendor's key that happens to be in scope.
+            env.pop(self.key_env, None)
+        return env
+
     def base_cmd(self) -> list[str]:
-        return [
+        cmd = [
             "claude",
             "--dangerously-skip-permissions",
             *self.hardening_settings_arg(),
         ]
+        # Name the model on the command line, the way Codex takes `-m` and
+        # R-CLI takes `--model`. ANTHROPIC_MODEL still carries it here — it
+        # is what routing writes and what a passthrough caller sets — but an
+        # env var is the weaker channel: it can be shadowed by a step-level
+        # `env:`, and a stale one silently selects a different model than the
+        # dispatch asked for. Passing it explicitly means the argv says which
+        # model the run used, and the log shows it.
+        model = (os.environ.get(self.model_env) or "").strip()
+        if model:
+            cmd += ["--model", model]
+        return cmd
 
     def turn_cap_args(self, max_turns: int | None) -> list[str]:
         # NOTE: `--max-turns` is accepted by the CLI but is absent from

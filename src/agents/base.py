@@ -224,13 +224,21 @@ class AgentBackend:
         if base_url:
             routing.env[self.base_url_env] = base_url
         elif self.base_url_env:
-            # This provider uses its vendor default, so the agent must NOT
-            # inherit an endpoint from anywhere else. Writing an empty value
-            # clears it: without this, a base URL left in the caller's env
-            # (or by an earlier step) silently wins and the run talks to the
-            # wrong vendor with this vendor's key — observed as a 401 whose
-            # telemetry named the wrong backend entirely. Same reasoning as
-            # Claude Code's mutually-exclusive auth vars.
+            # This provider uses its vendor default, so the agent must not
+            # inherit an endpoint from anywhere else: a base URL left over
+            # from an earlier step would silently win and the run would talk
+            # to the wrong vendor with this vendor's key — observed once as a
+            # 401 whose telemetry named the wrong backend entirely.
+            #
+            # An empty value means "not routed", and subprocess_env() drops
+            # it rather than passing an empty endpoint down. Note this is
+            # only belt-and-braces: it travels through `$GITHUB_ENV`, which a
+            # step-level `env:` in the caller's workflow overrides, so it
+            # cannot be relied on the way the launch-time credential
+            # selection in ClaudeBackend.subprocess_env can. Callers do not
+            # declare base URLs in `env:` today, which is the only reason
+            # this holds. A credential, which they *do* declare, needs the
+            # stronger mechanism.
             routing.env[self.base_url_env] = ""
         if chosen:
             routing.env[self.model_env] = chosen

@@ -29,21 +29,31 @@ def env(**kw):
 # ─── parity with the shell that shipped ─────────────────────────────────────
 #
 # Transcribed from action.yml's "Configure backend from provider input" step.
-# `""` means the variable is actively cleared, which is how Claude Code's
-# two mutually-exclusive auth vars were handled.
+#
+# That shell also wrote `""` for the *unselected* auth var, meaning "clear
+# it" — Claude Code reads two credential vars and callers pass every
+# vendor's secret at once. Those entries are gone and nothing observable
+# changed, because the clear never worked: these values reach the run
+# through `$GITHUB_ENV`, which a step-level `env:` in the caller's workflow
+# overrides, and every install declares those secrets there. Captured from
+# a real run — `ANTHROPIC_API_KEY=(cleared)` written, `ANTHROPIC_API_KEY:
+# ***` seen one step later.
+#
+# The exclusion now happens in ClaudeBackend.subprocess_env, on the
+# environment the agent is actually launched with. See
+# test_only_the_selected_credential_reaches_the_agent.
 
 CLAUDE_PARITY = [
     (
         "anthropic",
         env(ANTHROPIC_API_KEY="ak-1"),
-        {"ANTHROPIC_API_KEY": "ak-1", "ANTHROPIC_AUTH_TOKEN": ""},
+        {"ANTHROPIC_API_KEY": "ak-1"},
     ),
     (
         "zai",
         env(ZAI_API_KEY="zk-1"),
         {
             "ANTHROPIC_AUTH_TOKEN": "zk-1",
-            "ANTHROPIC_API_KEY": "",
             "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
         },
     ),
@@ -52,7 +62,6 @@ CLAUDE_PARITY = [
         env(MOONSHOT_API_KEY="mk-1"),
         {
             "ANTHROPIC_AUTH_TOKEN": "mk-1",
-            "ANTHROPIC_API_KEY": "",
             "ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic",
         },
     ),
@@ -108,14 +117,19 @@ def test_claude_custom_requires_a_base_url():
 # ─── the mutual exclusion that motivated all of it ──────────────────────────
 
 @pytest.mark.parametrize("provider", ["zai", "moonshot"])
-def test_bearer_providers_clear_the_x_api_key_var(provider):
-    """Claude Code *prefers* ANTHROPIC_API_KEY when both are set, and these
-    gateways reject that header with 401 — so the other var must be cleared,
-    not merely left unset. Callers pass every vendor's secret at once."""
+def test_bearer_providers_select_the_token_var(provider):
+    """These gateways take a Bearer token, so that is the var routing sets.
+
+    It no longer writes `ANTHROPIC_API_KEY: ""` alongside. That clear went to
+    `$GITHUB_ENV`, which a step-level `env:` in the caller's workflow
+    overrides — and every install declares each vendor's secret there, so it
+    never took effect. The exclusion is enforced at launch instead; see
+    test_only_the_selected_credential_reaches_the_agent.
+    """
     secret = PROVIDERS[provider].secret_env
     routing = route(resolve("claude"), provider, "", "", env(**{secret: "k"}))
-    assert routing.env["ANTHROPIC_API_KEY"] == ""
     assert routing.env["ANTHROPIC_AUTH_TOKEN"] == "k"
+    assert "ANTHROPIC_API_KEY" not in routing.env
 
 
 def test_anthropic_uses_the_x_api_key_var():
@@ -123,7 +137,29 @@ def test_anthropic_uses_the_x_api_key_var():
         resolve("claude"), "anthropic", "", "", env(ANTHROPIC_API_KEY="k")
     )
     assert routing.env["ANTHROPIC_API_KEY"] == "k"
-    assert routing.env["ANTHROPIC_AUTH_TOKEN"] == ""
+    assert "ANTHROPIC_AUTH_TOKEN" not in routing.env
+
+
+@pytest.mark.parametrize("provider", ["zai", "moonshot", "openrouter"])
+def test_only_the_selected_credential_reaches_the_agent(provider, monkeypatch):
+    """The check that actually protects the run.
+
+    Routing writes to a job-level variable; this is the process environment
+    the agent is launched with, which nothing downstream can override. A run
+    routed at a gateway must not be handed an unrelated Anthropic key, and
+    the caller's env always has one.
+    """
+    backend = resolve("claude")
+    secret = PROVIDERS[provider].secret_env
+    routing = route(backend, provider, "", "", env(**{secret: "vendor"}))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-unrelated")
+    for key, value in routing.env.items():
+        monkeypatch.setenv(key, value)
+
+    launched = backend.subprocess_env()
+
+    assert launched["ANTHROPIC_AUTH_TOKEN"] == "vendor"
+    assert "ANTHROPIC_API_KEY" not in launched
 
 
 # ─── passthrough: the backward-compatibility path ───────────────────────────
@@ -410,7 +446,7 @@ def test_openrouter_uses_bearer_for_claude():
     routing = route(resolve("claude"), "openrouter", "z-ai/glm-4.6", "",
                     env(OPENROUTER_API_KEY="or"))
     assert routing.env["ANTHROPIC_AUTH_TOKEN"] == "or"
-    assert routing.env["ANTHROPIC_API_KEY"] == ""
+    assert "ANTHROPIC_API_KEY" not in routing.env
 
 
 def test_openrouter_is_reachable_by_every_agent():

@@ -68,11 +68,36 @@ def test_anthropic_auth_token_in_subprocess_whitelist():
     assert "ANTHROPIC_AUTH_TOKEN" in run._CLAUDE_ENV_WHITELIST
 
 
-def test_claude_subprocess_env_forwards_auth_token(monkeypatch):
+def test_claude_subprocess_env_forwards_only_the_selected_credential(monkeypatch):
+    """A gateway run must not carry an unrelated Anthropic key into the agent.
+
+    This test used to assert that *both* vars are forwarded, which is what
+    the code did — and it is the bug. A caller's workflow declares every
+    vendor's secret so `provider` stays switchable per dispatch, so on a run
+    routed at z.ai an Anthropic key is sitting right there in the
+    environment.
+
+    Routing tried to prevent that by writing an empty value to
+    `$GITHUB_ENV`, which a step-level `env:` in the caller's workflow
+    silently overrides. Captured from a real run: `ANTHROPIC_API_KEY=
+    (cleared)` was written, and the next step still saw
+    `ANTHROPIC_API_KEY: ***`. The exclusion never happened.
+
+    It happens here instead, where nothing can override it: this is the
+    environment the agent process is launched with.
+    """
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-zai-token")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-default")
     env = run._claude_subprocess_env()
     assert env.get("ANTHROPIC_AUTH_TOKEN") == "test-zai-token"
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_claude_subprocess_env_uses_the_api_key_when_no_token_is_set(monkeypatch):
+    """provider=anthropic sets only the x-api-key var, and it must survive."""
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-default")
+    env = run._claude_subprocess_env()
     assert env.get("ANTHROPIC_API_KEY") == "sk-ant-default"
 
 

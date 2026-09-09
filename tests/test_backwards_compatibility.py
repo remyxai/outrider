@@ -116,15 +116,31 @@ def test_every_provider_value_the_docs_promise_is_still_accepted():
 # ─── the environment an old workflow ends up with ───────────────────────────
 
 LEGACY_ENV_EXPECTATIONS = [
-    # (provider, caller env, resulting env) — transcribed from the shell that
-    # shipped before the agent port.
+    # (provider, caller env, resulting env). The shell that shipped before
+    # the agent port also wrote an empty value for the *unselected* auth var
+    # — `ANTHROPIC_AUTH_TOKEN: ""` on anthropic, `ANTHROPIC_API_KEY: ""` on
+    # the Bearer providers — meaning "clear it".
+    #
+    # Those entries are gone, and that is not a behavior change, because the
+    # clear never took effect. These values reach the run through
+    # `$GITHUB_ENV`, which a step-level `env:` in the caller's workflow
+    # overrides — and every install declares each vendor's secret there so
+    # `provider` stays switchable. Captured from a real run:
+    #
+    #     ANTHROPIC_API_KEY=(cleared)   <- written by routing
+    #     ANTHROPIC_API_KEY: ***        <- what the next step saw
+    #
+    # The exclusion is enforced at launch now instead
+    # (ClaudeBackend.subprocess_env), which is the environment the agent
+    # process actually gets. See
+    # test_the_unselected_credential_never_reaches_the_agent below.
     ("anthropic", {"ANTHROPIC_API_KEY": "ak"},
-     {"ANTHROPIC_API_KEY": "ak", "ANTHROPIC_AUTH_TOKEN": ""}),
+     {"ANTHROPIC_API_KEY": "ak"}),
     ("zai", {"ZAI_API_KEY": "zk"},
-     {"ANTHROPIC_AUTH_TOKEN": "zk", "ANTHROPIC_API_KEY": "",
+     {"ANTHROPIC_AUTH_TOKEN": "zk",
       "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}),
     ("moonshot", {"MOONSHOT_API_KEY": "mk"},
-     {"ANTHROPIC_AUTH_TOKEN": "mk", "ANTHROPIC_API_KEY": "",
+     {"ANTHROPIC_AUTH_TOKEN": "mk",
       "ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic"}),
 ]
 
@@ -134,6 +150,38 @@ def test_legacy_workflow_gets_the_same_environment(provider, caller, expected):
     """An old workflow sends no `agent`, so it must resolve identically."""
     routing = route(resolve(None), provider, "", "", caller)
     assert routing.env == expected
+
+
+@pytest.mark.parametrize("provider,secret", [
+    ("zai", "ZAI_API_KEY"),
+    ("moonshot", "MOONSHOT_API_KEY"),
+    ("openrouter", "OPENROUTER_API_KEY"),
+])
+def test_the_unselected_credential_never_reaches_the_agent(
+    provider, secret, monkeypatch
+):
+    """What the legacy clear was *for*, enforced where it works.
+
+    A run routed at a gateway must not hand the agent an Anthropic key. The
+    caller's env has one — every install declares it — so this is the check
+    that matters, and it is done on the environment the agent is launched
+    with rather than on a job-level variable something else can overwrite.
+    """
+    backend = resolve(None)
+    routing = route(backend, provider, "", "", {secret: "vendor-key"})
+    # Simulate the run step: the caller's Anthropic key is in scope, and
+    # routing's own values are applied on top.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-unrelated")
+    for key, value in routing.env.items():
+        monkeypatch.setenv(key, value)
+
+    env = backend.subprocess_env()
+
+    assert env.get("ANTHROPIC_AUTH_TOKEN") == "vendor-key"
+    assert "ANTHROPIC_API_KEY" not in env, (
+        "an unrelated Anthropic key reached an agent routed at "
+        f"{provider} — this is the leak the clear was meant to prevent"
+    )
 
 
 def test_a_workflow_with_no_provider_at_all_is_untouched():
