@@ -2180,6 +2180,11 @@ _BOT_TOKEN = {"attempted": False, "token": "", "permissions": {}, "minted_at": 0
 # so a call made just under the wire still gets a fresh token.
 _BOT_TOKEN_MAX_AGE_S = 55 * 60  # 3300s
 
+# When this process started. A workflow-minted token is created immediately
+# before the action runs, so its remaining life is ~60 min minus our elapsed
+# runtime — see _github_token.
+_PROCESS_STARTED_AT = time.monotonic()
+
 
 def _mint_bot_token() -> str:
     """Self-mint a short-lived remyx[bot] installation token from the engine.
@@ -2268,6 +2273,33 @@ def _github_token() -> str:
     """
     explicit = os.environ.get("INPUT_GITHUB_TOKEN", "").strip()
     if explicit:
+        elapsed = time.monotonic() - _PROCESS_STARTED_AT
+        if elapsed < _BOT_TOKEN_MAX_AGE_S:
+            return explicit
+        # Past the TTL window. A workflow's mint step runs once, before the
+        # action starts, and installation tokens expire at 60 minutes — so on
+        # a long run the explicit token is dead by push time and `git push`
+        # exits 128 *after* the agent has done all the work. Observed on a
+        # 76-minute GLM run that had already produced its diff.
+        #
+        # This predates the agent port but the port is what makes it likely:
+        # slow backends (GLM, Kimi thinking mode) are now first-class, and
+        # they routinely run past the hour. Re-minting is only attempted
+        # here, at the point of use, so a fast run's behavior is untouched.
+        fresh = _mint_bot_token()
+        if fresh:
+            log.info(
+                "  ↻ workflow-minted token is past its %d-minute TTL window "
+                "(run has been %d min); using a freshly minted bot token",
+                _BOT_TOKEN_MAX_AGE_S // 60, elapsed // 60,
+            )
+            return fresh
+        log.warning(
+            "  ⚠ workflow-minted token is likely expired (run has been %d "
+            "min) and self-minting is unavailable — the push may fail with "
+            "exit 128. Pass REMYX_API_KEY so the action can re-mint, or "
+            "lower agent-timeout.", elapsed // 60,
+        )
         return explicit
     minted = _mint_bot_token()
     if minted:
