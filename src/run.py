@@ -18090,6 +18090,72 @@ def _display_status(status: str) -> str:
     return _DISPLAY_STATUS.get(status, status)
 
 
+def run_agent_smoke(target: "Target") -> dict:
+    """Verify one (agent, provider, model) configuration in seconds.
+
+    A full dispatch is the only way to know a run *works*, but it costs 10-80
+    minutes and real tokens, which makes it a terrible way to answer "did I
+    wire my secret correctly?". Six of the defects on this branch were found
+    by dispatches that spent an hour before failing on a one-line
+    misconfiguration — a wrong provider name, a stale token, a model id from
+    another vendor's vocabulary.
+
+    This does the smallest thing that exercises the whole configuration path:
+    resolve routing, run the backend's preflight, then make ONE agent call
+    with a trivial prompt and a tight turn cap. It reaches the vendor for
+    real, so it catches auth, endpoint, model-id and quota problems — the
+    things a unit test cannot — without doing any work.
+
+    Never opens a PR, never clones the target, never touches git.
+    """
+    log.info("  mode=smoke — verifying the agent/provider/model wiring only")
+    result: dict = {
+        "status": "smoke_failed",
+        "agent": _BACKEND.display_name,
+        "mode": "smoke",
+    }
+
+    ok, messages = (
+        _validate_claude_auth_env() if _BACKEND.name == "claude"
+        else _BACKEND.preflight()
+    )
+    for message in messages:
+        log.warning("  ⚠ %s", message)
+    if not ok:
+        result["error"] = "preflight failed: " + "; ".join(messages)
+        log.error("  ✗ preflight failed — the credential or model is wrong")
+        return result
+
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-smoke-"))
+    prompt = (
+        "Reply with exactly the word OK and nothing else. "
+        "Do not use any tools."
+    )
+    log.info("  → one-shot probe against %s", _BACKEND.display_name)
+    answered, text = _run_claude_oneshot(
+        workdir, prompt, min(target.claude_timeout_s, 300), max_turns=1
+    )
+
+    result["reply"] = (text or "")[:200]
+    for key in ("cost_usd", "input_tokens", "output_tokens", "claude_calls",
+                "cost_basis", "model_backend"):
+        result[key] = _RUN_COST.get(key)
+
+    if not answered:
+        result["error"] = (text or "")[:500]
+        log.error("  ✗ the agent did not answer: %s", (text or "")[:300])
+        return result
+
+    result["status"] = "smoke_ok"
+    log.info(
+        "  ✓ %s answered via %s (cost_basis=%s, %s in / %s out)",
+        _BACKEND.display_name, result.get("model_backend"),
+        result.get("cost_basis"), result.get("input_tokens"),
+        result.get("output_tokens"),
+    )
+    return result
+
+
 def _write_step_summary(result: dict) -> None:
     """Render the run outcome as Markdown into $GITHUB_STEP_SUMMARY.
 
@@ -18156,6 +18222,8 @@ def _write_step_summary(result: dict) -> None:
         "issue_opened_substitution": "🔁",
         "skipped_test_failure":    "⏭️",
         "claude_failed":           "❌",
+        "smoke_ok":                "✅",
+        "smoke_failed":            "❌",
         "rejected_path_violations":"❌",
         "error":                   "❌",
         "aborted_secret_in_payload": "🛑",
@@ -18739,7 +18807,11 @@ def main():
     log.info("  agent=%s (%s)", _BACKEND.name, _BACKEND.display_name)
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
-    if mode == "weekly-summary":
+    if mode == "smoke":
+        log.info("  mode=smoke")
+        runner = run_agent_smoke
+        failure_status = "smoke_failed"
+    elif mode == "weekly-summary":
         log.info("  mode=weekly-summary")
         runner = run_weekly_summary
         failure_status = "weekly_summary_failed"

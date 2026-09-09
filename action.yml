@@ -13,6 +13,15 @@ inputs:
   mode:
     description: |
       Run mode:
+        - "smoke": verify this repo's agent / provider / model wiring
+          in seconds and exit. Resolves routing, runs the agent's
+          preflight, then makes ONE trivial agent call with a 1-turn
+          cap. It reaches the vendor for real, so it catches a wrong
+          secret, a bad endpoint, a model id from another vendor's
+          vocabulary, or an exhausted quota — without cloning, without
+          opening anything, and without doing any work. Use it after
+          changing `agent`, `provider`, `model` or a secret, instead of
+          waiting on a full dispatch to find out.
         - "recommend" (default): scout a paper, draft a PR or open an
           Issue — the classic per-run flow.
         - "weekly-summary": aggregate the past 7 days of Outrider runs
