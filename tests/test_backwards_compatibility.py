@@ -316,3 +316,20 @@ def test_the_internal_whitelist_alias_still_resolves():
     """Renamed to _AGENT_ENV_WHITELIST; the old name is an alias because this
     repo's own tests assert on it."""
     assert run._CLAUDE_ENV_WHITELIST is run._AGENT_ENV_WHITELIST
+
+
+def test_max_turns_env_knob_accepts_both_names(monkeypatch):
+    """`REMYX_CLAUDE_MAX_TURNS` may already be set in someone's workflow.
+
+    The generalized name wins when both are present, matching how
+    agent-timeout supersedes claude-timeout.
+    """
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "run.py"
+    ).read_text()
+    assert 'os.environ.get("REMYX_AGENT_MAX_TURNS", "").strip()' in src
+    assert 'os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()' in src
+    # New name read first.
+    assert src.index("REMYX_AGENT_MAX_TURNS") < src.index(
+        'os.environ.get("REMYX_CLAUDE_MAX_TURNS"'
+    )

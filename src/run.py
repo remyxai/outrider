@@ -8208,8 +8208,13 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     Returns (success, stdout/stderr). Success means CLI exit 0 — caller still
     validates the produced changes with the path-allowlist check + tests.
 
-    ``REMYX_CLAUDE_MAX_TURNS`` (optional) caps the agent's tool-use turns to
-    bound cost; unset means no cap (avoids truncating legitimate work).
+    ``REMYX_AGENT_MAX_TURNS`` (optional) caps the agent's tool-use turns to
+    bound cost; unset means no cap (avoids truncating legitimate work). The
+    original ``REMYX_CLAUDE_MAX_TURNS`` keeps working — someone may already
+    have it set — and the generalized name wins if both are present.
+
+    Only honored by agents that expose a round-limit flag; Codex and R-CLI
+    have none, so there the wall-clock timeout is the only bound.
     """
     invocation = _strip_leading_frontmatter(
         (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
@@ -8217,7 +8222,10 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     log.info(f"  → invoking {_BACKEND.display_name} "
              f"(timeout={timeout_s}s) in {workdir}")
     cmd = _agent_base_cmd()
-    max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
+    max_turns = (
+        os.environ.get("REMYX_AGENT_MAX_TURNS", "").strip()
+        or os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
+    )
     if max_turns:
         cmd += _BACKEND.turn_cap_args(max_turns)
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
