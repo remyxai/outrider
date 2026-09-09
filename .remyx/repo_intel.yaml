@@ -30,7 +30,13 @@ observed_landing_zones:
       \ \u2192 `_build_fidelity_audit_prompt_pa"
     branch: line-anchored-feedback-cuts-token-costs-and-improves-correct
     timestamp: '2026-07-20T08:48:48Z'
-  last_observed: '2026-07-20T08:48:48Z'
+  - arxiv: 2609.02272v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: write_spec_bundle() @ src/run.py:7199, invoked from main
+      orchestration flow (lines 11120+) when arxiv_id is present
+    branch: papercompiler-faithful-paper-to-code-generation-via-reposito
+    timestamp: '2026-09-09T10:26:55Z'
+  last_observed: '2026-09-09T10:26:55Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -39,4 +45,4 @@ rejected_shapes:
   - arxiv: 2607.00990v1
     timestamp: '2026-07-18T07:32:36Z'
 coordination_signals: []
-last_updated: '2026-07-20T08:48:48Z'
+last_updated: '2026-09-09T10:26:55Z'
