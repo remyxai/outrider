@@ -477,20 +477,25 @@ def test_an_explicit_endpoint_is_still_honored():
 
 
 def test_a_verification_caveat_is_warned_at_configure_time():
-    """OpenRouter routes correctly but needs a funded account.
+    """OpenRouter routes correctly but interacts with a thin balance.
 
-    Both CLIs request a large max_tokens — Codex asks for 131,072 — which a
-    zero-balance account rejects with HTTP 402 before the model is called.
-    That is a billing state, not a compatibility problem, so the pair stays
-    verified; saying so while the caller is configuring beats letting them
-    meet it as a bare 402 partway into a dispatch.
+    It reserves the *requested* max_tokens before calling the model, and
+    both CLIs ask for a lot by default (Codex's is 131,072), so a thin
+    balance answers HTTP 402 before the model is reached. Both agents were
+    confirmed with real completions on a zero-balance account using
+    smaller-output models, so the pair stays verified — and saying this
+    while the caller is configuring beats letting them meet a bare 402
+    partway into a dispatch.
     """
     routing = route(
         resolve("codex"), "openrouter", "z-ai/glm-5.3", "",
         {"OPENROUTER_API_KEY": "k"},
     )
-    assert any("funded account" in w for w in routing.warnings)
     assert any("402" in w for w in routing.warnings)
+    assert any("max_tokens" in w for w in routing.warnings)
+    # It must not claim a paid account is required — it isn't, and an
+    # earlier revision said so.
+    assert not any("paid account" in w for w in routing.warnings)
 
 
 def test_a_provider_with_no_caveat_warns_about_nothing():

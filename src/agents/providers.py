@@ -172,18 +172,30 @@ PROVIDERS: dict[str, Provider] = {
         # blocks and usage; /v1/responses returned status="completed" with a
         # usage block. So the protocol claim is backed, not inferred.
         #
-        # Caveat for operators rather than for this registry: both agent CLIs
-        # request a very large max_tokens (Codex asks for 131,072), which a
-        # free-tier OpenRouter account rejects with HTTP 402 before the model
-        # is ever called. A paid account is required for a real run — that is
-        # a billing state, not a compatibility problem.
+        # Both agents additionally confirmed through their real CLIs, with
+        # completed generations on a *zero-balance* account:
+        #   claude, z-ai/glm-5.3, CLAUDE_CODE_MAX_OUTPUT_TOKENS=1024
+        #     -> result "OK", stop_reason end_turn, 38 in / 14 out
+        #   codex,  anthropic/claude-3-haiku | cohere/command-r-08-2024 |
+        #           openai/gpt-3.5-turbo  -> smoke_ok
+        #
+        # The operator caveat is narrower than "needs a paid account", which
+        # an earlier revision of this comment claimed and which is wrong.
+        # OpenRouter reserves the *requested* max_tokens against the balance
+        # before calling the model, and both CLIs ask for a lot by default
+        # (Claude Code 32,000; Codex sends none and OpenRouter applies the
+        # model's own default, 131,072 for glm-5.3). So a thin balance 402s
+        # on a big-output model and succeeds on a small-output one. It is a
+        # budgeting interaction, not a compatibility problem.
         verified=frozenset({
             ApiFamily.ANTHROPIC_MESSAGES, ApiFamily.OPENAI_RESPONSES,
         }),
         verification_caveat=(
-            "needs a funded account: both CLIs request a large max_tokens "
-            "(Codex asks for 131,072), which a zero-balance account rejects "
-            "with HTTP 402 before the model is called"
+            "reserves the requested max_tokens against your balance before "
+            "calling the model, and both CLIs request a lot by default "
+            "(Codex's is 131,072), so a thin balance can answer HTTP 402 "
+            "before the model is reached — verified with real completions "
+            "on a zero-balance account using smaller-output models"
         ),
     ),
     "custom": Provider(

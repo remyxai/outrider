@@ -204,7 +204,7 @@ Leave `agent` empty for Claude Code — every existing workflow keeps its exact 
 
 "Verified" means a real run reached that vendor's endpoint end-to-end. An unverified pair still runs, but the action logs a warning naming the `provider: custom` + gateway workaround rather than claiming support it hasn't demonstrated.
 
-² OpenRouter — needs a funded account: both CLIs request a large max_tokens (Codex asks for 131,072), which a zero-balance account rejects with HTTP 402 before the model is called.
+² OpenRouter — reserves the requested max_tokens against your balance before calling the model, and both CLIs request a lot by default (Codex's is 131,072), so a thin balance can answer HTTP 402 before the model is reached — verified with real completions on a zero-balance account using smaller-output models.
 
 Two rejections are deliberate rather than missing: `agent: codex` with `provider: anthropic` fails because Anthropic serves the Messages API, not OpenAI Responses — and the reverse for `agent: claude` with `provider: openai`. Both errors name the agent that *does* serve the provider.
 

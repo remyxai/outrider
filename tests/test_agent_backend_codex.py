@@ -518,3 +518,28 @@ def test_other_capabilities_are_unaffected_by_routing(monkeypatch):
     assert backend.can(Capability.STREAM_TRANSCRIPT)
     assert backend.can(Capability.OUTPUT_SCHEMA)
     assert not backend.can(Capability.TURN_CAP)
+
+
+def test_every_responses_provider_has_a_display_name():
+    """A provider whose host is unnamed labels spend with a raw hostname.
+
+    `Codex → openrouter.ai` next to `Claude Code answered via OpenRouter`
+    is the same vendor written two ways, and the fleet report slices spend
+    on this field. Falling back to the raw host is deliberate for a
+    caller's own gateway, but a provider in the registry should be named.
+    """
+    from agents.codex import _VENDOR_NAMES
+    from agents.providers import PROVIDERS, ApiFamily
+
+    unnamed = []
+    for provider in PROVIDERS.values():
+        url = provider.endpoints.get(ApiFamily.OPENAI_RESPONSES)
+        if not url:
+            continue  # vendor default, or doesn't serve this family
+        host = url.split("://", 1)[-1].split("/", 1)[0]
+        if host not in _VENDOR_NAMES:
+            unnamed.append((provider.id, host))
+    assert not unnamed, (
+        f"add these to codex's _VENDOR_NAMES or spend gets labeled with a "
+        f"bare hostname: {unnamed}"
+    )

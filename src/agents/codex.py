@@ -42,6 +42,7 @@ _VENDOR_NAMES = {
     "api.moonshot.ai": "Moonshot (Kimi)",
     "api.z.ai": "z.ai (GLM)",
     "api.openai.com": "OpenAI",
+    "openrouter.ai": "OpenRouter",
 }
 
 # Codex item types → the normalized tool vocabulary.
