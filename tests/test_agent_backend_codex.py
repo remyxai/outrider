@@ -455,12 +455,51 @@ def test_web_search_is_disabled_when_routed_off_openai(monkeypatch):
     """
     monkeypatch.setenv("CODEX_BASE_URL", "https://openrouter.ai/api/v1")
     cmd = CodexBackend().base_cmd()
-    assert "tools.web_search=false" in " ".join(cmd)
+    assert 'web_search="disabled"' in cmd
 
 
 def test_web_search_is_left_alone_on_openai(monkeypatch):
     monkeypatch.delenv("CODEX_BASE_URL", raising=False)
     assert "web_search" not in " ".join(CodexBackend().base_cmd())
+
+
+def test_web_search_uses_the_string_enum_not_a_boolean(monkeypatch):
+    """Regression guard on the exact spelling.
+
+    codex 0.151.0 takes `web_search` as a *top-level* key whose value is a
+    string enum (`disabled`, `cached`, `indexed`, `live`). The two ways to
+    get this wrong fail differently and one of them fails silently:
+
+    * `web_search=false` — rejected at config load,
+      "invalid type: unit variant, expected string only in `web_search`",
+      which takes the whole run down.
+    * `tools.web_search=false` — an unknown key, so Codex ignores it and
+      still offers the tool. Captured off a local Responses mock, the
+      request body carries `web_search` in `tools` regardless, so the
+      HTTP 400 this is meant to prevent still happens.
+    """
+    monkeypatch.setenv("CODEX_BASE_URL", "https://openrouter.ai/api/v1")
+    joined = " ".join(CodexBackend().base_cmd())
+    assert "tools.web_search" not in joined
+    assert "web_search=false" not in joined
+
+
+def test_reasoning_effort_is_named_when_routed_off_openai(monkeypatch):
+    """Codex only fills in `reasoning.effort` for catalog models.
+
+    For an unrecognized model it sends `reasoning: {"summary": "auto"}` with
+    no `effort`, and OpenRouter rejects that with "Reasoning is mandatory for
+    this endpoint". Naming one completes the field for every model.
+    """
+    monkeypatch.setenv("CODEX_BASE_URL", "https://openrouter.ai/api/v1")
+    assert 'model_reasoning_effort="medium"' in CodexBackend().base_cmd()
+
+
+def test_reasoning_effort_is_left_to_codex_on_openai(monkeypatch):
+    """On OpenAI's own endpoint Codex knows its catalog, so its per-model
+    default is better than anything we would hardcode."""
+    monkeypatch.delenv("CODEX_BASE_URL", raising=False)
+    assert "model_reasoning_effort" not in " ".join(CodexBackend().base_cmd())
 
 
 def test_web_research_capability_follows_the_routing(monkeypatch):

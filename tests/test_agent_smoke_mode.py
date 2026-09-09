@@ -8,6 +8,8 @@ that burned an hour before failing on a one-line misconfiguration.
 This mode does the smallest thing that exercises the whole configuration path,
 and reaches the vendor for real so it catches what a unit test cannot.
 """
+import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -111,3 +113,32 @@ def test_smoke_mode_is_dispatchable():
     src = (Path(__file__).resolve().parent.parent / "src" / "run.py").read_text()
     assert 'if mode == "smoke":' in src
     assert "runner = run_agent_smoke" in src
+
+
+def test_smoke_passes_the_mode_allowlist():
+    """The branch existing is not the same as the mode being reachable.
+
+    `mode: smoke` originally shipped with a dispatch branch but no entry in
+    `main()`'s allowlist, so every invocation exited 2 with "Unknown mode
+    'smoke'" before reaching it. Asserting the branch exists — which the
+    test above does — cannot see that.
+    """
+    assert "smoke" in run._MODES
+
+
+def test_every_dispatched_mode_is_on_the_allowlist():
+    """Guards the whole class of defect, not just the one instance.
+
+    Any mode `main()` dispatches on must be a mode `main()` accepts, or the
+    branch is dead code behind an "Unknown mode" exit.
+
+    Scoped to `main()`'s own source: `run.py` has other functions with a
+    local `mode` of their own (the selection-coverage gate's
+    `observe`/`enforce`/`off`), and a whole-file grep pulls those in.
+    """
+    body = inspect.getsource(run.main)
+    dispatched = set(re.findall(r'(?<![_\w])mode == "([a-z-]+)"', body))
+    assert dispatched, "found no dispatch branches to check"
+    assert dispatched <= set(run._MODES), (
+        f"dispatched but unreachable: {sorted(dispatched - set(run._MODES))}"
+    )

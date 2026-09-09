@@ -7,7 +7,9 @@ stays editable. ``--check`` verifies freshness and is run by
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -25,6 +27,61 @@ END = "<!-- END GENERATED: agent-axis -->"
 def cell(text: str) -> str:
     """Escape a table cell — a literal pipe splits the column."""
     return (text or "").replace("|", "\\|")
+
+
+@contextlib.contextmanager
+def _routed_off_vendor(backend):
+    """Temporarily point a backend at a third-party endpoint.
+
+    A capability can be routing-dependent: Codex's `web_research` comes from
+    OpenAI's server-side `web_search` tool, which no third-party Responses
+    implementation serves. Probing `can()` both ways derives that from the
+    code rather than restating it in prose that can go stale.
+    """
+    env = getattr(backend, "base_url_env", "") or ""
+    if not env:
+        yield
+        return
+    prev = os.environ.get(env)
+    os.environ[env] = "https://gateway.example/v1"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(env, None)
+        else:
+            os.environ[env] = prev
+
+
+@contextlib.contextmanager
+def _routed_at_vendor(backend):
+    """The mirror of _routed_off_vendor: the agent's own default endpoint."""
+    env = getattr(backend, "base_url_env", "") or ""
+    if not env:
+        yield
+        return
+    prev = os.environ.pop(env, None)
+    try:
+        yield
+    finally:
+        if prev is not None:
+            os.environ[env] = prev
+
+
+def _capability_cell(backend, cap_value: str) -> tuple[str, bool]:
+    """Render one capability cell, flagged when routing changes the answer."""
+    cap = next(
+        (c for c in backend.capabilities if c.value == cap_value), None
+    )
+    if cap is None:
+        return "—", False
+    with _routed_at_vendor(backend):
+        at_vendor = backend.can(cap)
+    with _routed_off_vendor(backend):
+        off_vendor = backend.can(cap)
+    if at_vendor and not off_vendor:
+        return "yes¹", True
+    return ("yes" if at_vendor else "—"), False
 
 
 def build() -> str:
@@ -94,13 +151,18 @@ def build() -> str:
     w("| Capability | " + " | ".join(f"`{n}`" for n in names) + " |")
     w("|---|" + "---|" * len(names))
     caps = sorted({c.value for n in names for c in resolve(n).capabilities})
+    footnoted = False
     for c in caps:
-        cells = " | ".join(
-            "yes" if c in {x.value for x in resolve(n).capabilities} else "—"
-            for n in names
-        )
-        w(f"| `{c}` | {cells} |")
+        rendered = [_capability_cell(resolve(n), c) for n in names]
+        footnoted = footnoted or any(flag for _, flag in rendered)
+        w(f"| `{c}` | " + " | ".join(text for text, _ in rendered) + " |")
     w("")
+    if footnoted:
+        w("¹ Only on the vendor's own endpoint. The capability comes "
+          "from a server-side tool that third-party implementations of the "
+          "same wire protocol do not serve, so routing the agent elsewhere "
+          "genuinely removes it and the run degrades as described below.")
+        w("")
     w("| Missing | Effect on the run |")
     w("|---|---|")
     w("| `turn_cap` | `claude-timeout` becomes the only spend bound. Neither "
@@ -134,6 +196,27 @@ def build() -> str:
       "serve an OpenAI **Responses** endpoint. A Chat-only provider (or a "
       "local ollama) needs a translating gateway in front of it, reached via "
       "`provider: custom` plus `model-base-url`.")
+    w("")
+    w("Two request fields also get pinned whenever Codex is routed off "
+      "OpenAI, because Codex fills them in from its own model catalog and "
+      "an unrecognized model leaves them in a shape strict gateways reject. "
+      "Both were confirmed by capturing the request body off a local "
+      "Responses mock:")
+    w("")
+    w("- `web_search=\"disabled\"` — the server-side tool is OpenAI's, not "
+      "part of the protocol. Offering it makes OpenRouter reject the whole "
+      "request (`Server tool request failed`, HTTP 400) before the model is "
+      "reached. The key is top-level and takes a string enum "
+      "(`disabled`/`cached`/`indexed`/`live`); a boolean fails config "
+      "loading, and the plausible-looking `tools.web_search` is an unknown "
+      "key that Codex ignores while still offering the tool.")
+    w("- `model_reasoning_effort=\"medium\"` — for an unrecognized model "
+      "Codex sends `reasoning: {\"summary\": \"auto\"}` with no `effort` "
+      "key, and OpenRouter answers `Reasoning is mandatory for this "
+      "endpoint`.")
+    w("")
+    w("Neither is applied on OpenAI's own endpoint, where Codex's per-model "
+      "defaults beat anything pinned here.")
     return "\n".join(out)
 
 

@@ -145,7 +145,23 @@ class CodexBackend(AgentBackend):
             # `can(WEB_RESEARCH)` reflects this, so the orchestrator skips
             # the staged research phase rather than asking for web context
             # the agent cannot fetch.
-            cmd += ["-c", "tools.web_search=false"]
+            #
+            # The key is top-level and its value is a *string* enum, not a
+            # bool: codex 0.151.0 accepts only `disabled`, `cached`,
+            # `indexed`, `live`. A boolean fails config parsing outright
+            # ("invalid type: unit variant, expected string"), and a
+            # misspelled path like `tools.web_search` is silently ignored,
+            # which is how an ineffective form can look like it worked.
+            cmd += ["-c", 'web_search="disabled"']
+            # Codex only fills in `reasoning.effort` for models it recognizes
+            # in its own catalog. Captured off a local Responses mock, the
+            # request body for an unrecognized model carries
+            # `reasoning: {"summary": "auto"}` with no `effort` key at all,
+            # and a strict implementation rejects that outright — OpenRouter
+            # answers "Reasoning is mandatory for this endpoint". Naming an
+            # effort makes the field complete for every model, recognized or
+            # not; OpenAI and Moonshot are unaffected (verified live).
+            cmd += ["-c", 'model_reasoning_effort="medium"']
         model = (os.environ.get("CODEX_MODEL") or "").strip()
         if model:
             cmd += ["-m", model]

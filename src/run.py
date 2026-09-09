@@ -18739,6 +18739,15 @@ def run_refinement_chain(target: Target, pr_number: int) -> dict:
     return chain
 
 
+#: Every mode ``main()`` accepts, and the single source for both the
+#: allowlist and its error message. Keep in step with the dispatch in
+#: ``main()`` — ``tests/test_agent_smoke_mode.py`` asserts they agree.
+_MODES = (
+    "recommend", "weekly-summary", "fidelity", "convention", "test",
+    "issue-convention", "brief", "smoke",
+)
+
+
 def main():
     # Mode dispatch: "recommend" is the classic
     # scout-and-implement run; "weekly-summary" aggregates the past week
@@ -18749,13 +18758,13 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in (
-        "recommend", "weekly-summary", "fidelity", "convention", "test",
-        "issue-convention", "brief",
-    ):
-        log.error(f"Unknown mode {mode!r}; must be 'recommend', "
-                  f"'weekly-summary', 'fidelity', 'convention', 'test', "
-                  f"'issue-convention', or 'brief'.")
+    if mode not in _MODES:
+        # Built from the same tuple the dispatch below reads, so a new mode
+        # can never be accepted by one and unlisted by the other. "smoke"
+        # shipped with a dispatch branch but no allowlist entry, and was
+        # rejected here before ever reaching it.
+        log.error("Unknown mode %r; must be one of %s.", mode,
+                  ", ".join(repr(m) for m in _MODES))
         sys.exit(2)
 
     target = build_target_from_env()
@@ -18800,9 +18809,22 @@ def main():
         # clone or prompt build, keeps a missing key from costing a full
         # dispatch's setup before failing.
         auth_ok, auth_warnings = _BACKEND.preflight()
-    for w in auth_warnings:
-        log.warning("  ⚠ auth check: %s", w)
+    # Level follows the verdict. These same messages are advisory when the
+    # check passes and fatal when it doesn't, and reporting a fatal one as
+    # "⚠ auth check: ..." left the run exiting 2 with nothing saying it had
+    # stopped — the last line the user saw looked like a warning it had
+    # carried on past.
+    for message in auth_warnings:
+        if auth_ok:
+            log.warning("  ⚠ auth check: %s", message)
+        else:
+            log.error("  ✗ auth check: %s", message)
     if not auth_ok:
+        log.error(
+            "  ✗ stopping before any %s call — fix the configuration above "
+            "and re-run. Nothing was cloned, and no tokens were spent.",
+            _BACKEND.display_name,
+        )
         sys.exit(2)
     log.info("  agent=%s (%s)", _BACKEND.name, _BACKEND.display_name)
     log.info(f"=== {target.repo} ===")

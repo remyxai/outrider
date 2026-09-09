@@ -331,3 +331,22 @@ def test_backboard_install_tolerates_either_install_location():
     body = install["run"]
     assert "command -v backboard" in body
     assert "not found after install" in body, "must fail loudly, not 127"
+
+
+def test_a_failed_auth_check_reports_at_error_level_and_says_it_stopped():
+    """A fatal preflight must not read like a warning it carried on past.
+
+    `preflight()` returns the same message list whether it passed or failed,
+    and `main()` logged every one as "⚠ auth check: ..." before exiting 2
+    with no further output. Live, `agent: backboard` + `provider: zai`
+    printed one ⚠ line and died silently — the run looked like it had
+    warned and continued.
+    """
+    src = (Path(__file__).resolve().parent.parent / "src" / "run.py").read_text()
+    block = src[src.index("if _BACKEND.name == \"claude\":\n        auth_ok"):]
+    block = block[: block.index("log.info(\"  agent=%s")]
+    # The failing branch escalates rather than reusing the warning level.
+    assert 'log.error("  ✗ auth check: %s", message)' in block
+    # And the exit is announced, naming the agent that will not be called.
+    assert "stopping before any %s call" in block
+    assert block.index("stopping before any %s call") < block.index("sys.exit(2)")

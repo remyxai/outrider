@@ -221,7 +221,9 @@ A backend may be partially capable and still usable — the affected telemetry d
 | `stream_transcript` | yes | yes | yes |
 | `token_usage` | yes | yes | yes |
 | `turn_cap` | — | yes | — |
-| `web_research` | yes | yes | yes |
+| `web_research` | yes | yes | yes¹ |
+
+¹ Only on the vendor's own endpoint. The capability comes from a server-side tool that third-party implementations of the same wire protocol do not serve, so routing the agent elsewhere genuinely removes it and the run degrades as described below.
 
 | Missing | Effect on the run |
 |---|---|
@@ -239,6 +241,13 @@ All three agents take the same `model` input. R-CLI addresses models as `<provid
 ### Codex and Chat-Completions providers
 
 `codex exec` 0.151.0 removed Chat-Completions support: a provider must serve an OpenAI **Responses** endpoint. A Chat-only provider (or a local ollama) needs a translating gateway in front of it, reached via `provider: custom` plus `model-base-url`.
+
+Two request fields also get pinned whenever Codex is routed off OpenAI, because Codex fills them in from its own model catalog and an unrecognized model leaves them in a shape strict gateways reject. Both were confirmed by capturing the request body off a local Responses mock:
+
+- `web_search="disabled"` — the server-side tool is OpenAI's, not part of the protocol. Offering it makes OpenRouter reject the whole request (`Server tool request failed`, HTTP 400) before the model is reached. The key is top-level and takes a string enum (`disabled`/`cached`/`indexed`/`live`); a boolean fails config loading, and the plausible-looking `tools.web_search` is an unknown key that Codex ignores while still offering the tool.
+- `model_reasoning_effort="medium"` — for an unrecognized model Codex sends `reasoning: {"summary": "auto"}` with no `effort` key, and OpenRouter answers `Reasoning is mandatory for this endpoint`.
+
+Neither is applied on OpenAI's own endpoint, where Codex's per-model defaults beat anything pinned here.
 
 <!-- END GENERATED: agent-axis -->
 
