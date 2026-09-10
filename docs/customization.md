@@ -31,6 +31,16 @@ Outrider tags each candidate paper with a confidence tier (`high` / `moderate` /
 - `soft`: open the PR anyway with a warning section. Right for layer / component repos (graph NN, kernels) where new standalone modules ARE the contribution.
 - `off`: skip the gate entirely.
 
+### Fidelity gate — `fidelity-policy`
+
+Controls how the pre-PR fidelity gate treats a `needs-judgment` verdict — the audit that compares the drafted diff against the paper's reference implementation before the PR opens.
+
+- `block` (default): a `needs-judgment` verdict blocks publication. The gate makes one scoped patch attempt, then skips the run if it still flags (branch mode preserves the branch instead). Keeps fabricated / hallucinated implementations out of public PRs; best for autonomous runs on arbitrary repos.
+- `advisory`: run the audit and attach the `## Coverage` matrix, but never block — the PR opens even when items are flagged. Best for curated or warm-start runs (`start-from-ref`) where a human already vetted the branch and a strict full-reference-port comparison is the wrong lens for a scoped integration.
+- `off`: skip the gate entirely (no reference clone, no audit). The other validators (path allowlist, integration check, stub density, self-review, diff-risk) still apply.
+
+Independent of the medium-confidence auto-advisory behavior, which still applies under `block` when the reference doesn't self-identify strongly with the paper.
+
 ### Draft-state policy — `draft-mode`
 
 - `always` (default): every PR opens as draft. The chain's test gate flips it to ready-for-review on a passing run.
