@@ -7288,7 +7288,7 @@ def write_spec_bundle(
             suggested_experiment=effective_experiment,
         ))
     else:
-        (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
+        spec_md = _SPEC_MD_TEMPLATE.format(
             paper_title=rec.paper_title,
             arxiv_id=rec.arxiv_id,
             tier=rec.tier,
@@ -7299,7 +7299,7 @@ def write_spec_bundle(
             selection_block=selection_block,
             suggested_experiment=effective_experiment,
             paper_abstract=rec.paper_abstract or "(abstract unavailable)",
-        ))
+        )
 
         (bundle / "PAPER.md").write_text(_PAPER_MD_TEMPLATE.format(
             paper_title=rec.paper_title,
@@ -7317,6 +7317,14 @@ def write_spec_bundle(
             suggested_experiment=effective_experiment,
         )
         (bundle / "SPEC_COMPILATION.json").write_text(compilation.to_json())
+
+        # Fold the compiled constraints into the SPEC.md the coding agent
+        # actually reads. PaperCompiler's central claim is that the compiled
+        # spec must CONSTRAIN downstream generation rather than sit unread —
+        # writing SPEC_COMPILATION.json alone (consumed nowhere) does not
+        # deliver that, so the rendered constraints are appended to SPEC.md.
+        spec_md = spec_md + "\n" + render_specification_metadata(compilation)
+        (bundle / "SPEC.md").write_text(spec_md)
 
     # CONTEXT.md — team's shipping history bullets,
     # fetched from the research-interests endpoint. Skipped entirely

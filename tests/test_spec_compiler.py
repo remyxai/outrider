@@ -132,6 +132,71 @@ def test_render_specification_metadata_includes_all_sections():
     assert "File-level constraints" in markdown
 
 
+# ─── Paper-grounded compilation (evidence, not hardcoded) ─────────────────
+
+
+_PAPERCOMPILER_ABSTRACT = (
+    "Faithfully translating research papers into repository-level implementations "
+    "remains challenging because papers require generated repositories to preserve "
+    "method logic, evaluation protocols, and cross-file consistency. PaperCompiler "
+    "grounds implementation-relevant evidence while preserving source provenance. "
+    "PaperCompiler outperforms strong baselines on Paper2CodeBench."
+)
+
+
+def test_compile_specification_grounds_requirements_in_abstract():
+    """Paper-supported requirements carry a grounding snippet from the abstract."""
+    compilation = compile_specification(
+        paper_title="PaperCompiler",
+        paper_abstract=_PAPERCOMPILER_ABSTRACT,
+    )
+    grounded = [
+        r for r in compilation.non_degradation_requirements
+        if r.evidence == "paper-supported" and r.source
+    ]
+    # Method-logic / evaluation-protocol / cross-file categories are all named
+    # in the abstract, so each should surface with provenance.
+    aspects = {r.aspect for r in grounded}
+    assert {"method_logic", "evaluation_protocol", "cross_file_consistency"} <= aspects
+    for req in grounded:
+        assert req.source, "paper-supported requirement must carry provenance"
+        assert req.source.lower() in _PAPERCOMPILER_ABSTRACT.lower() or "..." in req.source
+
+
+def test_compile_specification_derives_not_hardcodes():
+    """A thin abstract yields a non-zero, honest `unresolved` bucket."""
+    thin = compile_specification("Some Paper", "A short abstract.")
+    rich = compile_specification("PaperCompiler", _PAPERCOMPILER_ABSTRACT)
+    # The thin abstract mentions none of the constraint categories, so more of
+    # them land in `unresolved`; the rich one resolves several.
+    assert thin.resoluteness["unresolved"] > rich.resoluteness["unresolved"]
+    assert thin.resoluteness["unresolved"] >= 1
+
+
+def test_compile_specification_marks_external_delegation():
+    """Benchmark/baseline mentions are tagged externally_delegated, not paper-supported."""
+    compilation = compile_specification("PaperCompiler", _PAPERCOMPILER_ABSTRACT)
+    assert compilation.resoluteness["externally_delegated"] >= 1
+    assert any(
+        r.evidence == "externally_delegated"
+        for r in compilation.non_degradation_requirements
+    )
+
+
+def test_compile_specification_assigns_ownership_from_scope():
+    """Concrete src/ paths in the scope become ownership file-constraints."""
+    compilation = compile_specification(
+        "Paper", "Abstract",
+        suggested_experiment="Wire the scorer into src/run.py and src/spec_compiler.py",
+    )
+    owned = {
+        c.file_path for c in compilation.file_constraints
+        if c.constraint_type == "ownership"
+    }
+    assert "src/run.py" in owned
+    assert "src/spec_compiler.py" in owned
+
+
 # ─── Integration with write_spec_bundle ───────────────────────────────────
 
 
@@ -176,6 +241,52 @@ def test_write_spec_bundle_creates_compilation_json(tmp_path, monkeypatch):
     assert "cross_file_dependencies" in compilation_data
     assert "file_constraints" in compilation_data
     assert "resoluteness" in compilation_data
+
+
+def test_write_spec_bundle_folds_compilation_into_spec_md(tmp_path, monkeypatch):
+    """The compiled constraints are folded into the SPEC.md the agent reads.
+
+    This pins PaperCompiler's central claim in Outrider: the compiled spec must
+    CONSTRAIN downstream generation, so it lands in SPEC.md — not only in the
+    (otherwise unconsumed) SPEC_COMPILATION.json.
+    """
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    monkeypatch.setattr(run, "_mark_bundle_gitignored", lambda x: None)
+    monkeypatch.setattr(run, "effective_allowlist", lambda t, p: ["**/*"])
+    monkeypatch.setattr(run, "_load_environments_md", lambda x: "")
+    monkeypatch.setattr(run, "_load_fork_repo_intel", lambda x: None)
+    monkeypatch.setattr(run, "_collect_repo_orientation", lambda *a, **kw: "")
+    monkeypatch.setattr(run, "_canary_for_run", lambda x, y: "canary123")
+    monkeypatch.setattr(run, "_canary_directive_text", lambda x: "")
+
+    target = MagicMock()
+    target.repo = "test/repo"
+
+    rec = MagicMock()
+    rec.arxiv_id = "2609.02272v1"
+    rec.paper_title = "PaperCompiler"
+    rec.paper_abstract = (
+        "Papers require generated repositories to preserve method logic, "
+        "evaluation protocols, and cross-file consistency."
+    )
+    rec.tier = "high"
+    rec.relevance_score = 0.95
+    rec.interest_name = "test-interest"
+    rec.interest_context = "Test context"
+    rec.reasoning = "Test reasoning"
+    rec.suggested_experiment = "Integration into src/run.py"
+    rec.experiment_history = None
+
+    run.write_spec_bundle(workdir, target, rec, "test_package")
+
+    spec_md = (workdir / run.BUNDLE_DIR_NAME / "SPEC.md").read_text()
+    assert "Specification compilation (PaperCompiler)" in spec_md
+    assert "Non-degradation requirements" in spec_md
+    assert "Provenance accounting" in spec_md
+    # A category named in the abstract should surface as a grounded constraint.
+    assert "method_logic" in spec_md
 
 
 def test_write_spec_bundle_skips_compilation_for_brief_mode(tmp_path, monkeypatch):
