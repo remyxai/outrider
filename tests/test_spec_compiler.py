@@ -1,9 +1,10 @@
 """Tests for specification compiler integration (PaperCompiler adaptation).
 
-The spec_compiler module enriches Outrider's specification bundle with
-structured metadata: non-degradation requirements, cross-file dependencies,
-and implementation constraints. These tests verify that the compilation
-exports proper metadata and integrates cleanly into write_spec_bundle.
+The specification-compilation logic lives in ``src/run.py`` and enriches
+Outrider's specification bundle with structured metadata: non-degradation
+requirements, cross-file dependencies, and implementation constraints. These
+tests verify that the compilation exports proper metadata and integrates
+cleanly into write_spec_bundle.
 
 Run with: pytest tests/test_spec_compiler.py -q
 """
@@ -17,7 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import run
-from spec_compiler import (
+from run import (
     CrossFileDependency,
     FileConstraint,
     NonDegradationRequirement,
