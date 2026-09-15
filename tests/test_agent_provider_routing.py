@@ -612,7 +612,7 @@ def test_the_auth_var_choice_is_recorded_not_inferred():
     Inferring "Bearer if a token is present" looked equivalent and is not: a
     caller can hold a stale ANTHROPIC_AUTH_TOKEN secret and select
     provider=anthropic, and inference would then send Bearer to Anthropic and
-    earn a 401 on a configuration that works today. Caught before shipping.
+    earn a 401 on a configuration that works today.
     """
     import os
 

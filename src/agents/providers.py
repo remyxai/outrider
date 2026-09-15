@@ -179,8 +179,7 @@ PROVIDERS: dict[str, Provider] = {
         #   codex,  anthropic/claude-3-haiku | cohere/command-r-08-2024 |
         #           openai/gpt-3.5-turbo  -> smoke_ok
         #
-        # The operator caveat is narrower than "needs a paid account", which
-        # an earlier revision of this comment claimed and which is wrong.
+        # The operator caveat is narrower than "needs a paid account".
         # OpenRouter reserves the *requested* max_tokens against the balance
         # before calling the model, and both CLIs ask for a lot by default
         # (Claude Code 32,000; Codex sends none and OpenRouter applies the
