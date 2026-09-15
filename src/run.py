@@ -78,7 +78,7 @@ from exploration_structure import (
 )
 from instruction_files import render_instruction_files
 
-from agents import Capability, resolve as _resolve_agent
+from agents import ApiFamily, Capability, resolve as _resolve_agent
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -1556,10 +1556,10 @@ _Implements [{paper_title}](https://arxiv.org/abs/{arxiv_id})._
 <details>
 <summary><b>Discovery context</b></summary>
 
-> Drafted by an autonomous discovery loop — Remyx ranks recent arXiv papers against this team's research interest and shipping history; Claude Code selects the candidate most directly implementable against this repo from the lookback window and drafts it.
+> Drafted by an autonomous discovery loop — Remyx ranks recent arXiv papers against this team's research interest and shipping history; {agent_name} selects the candidate most directly implementable against this repo from the lookback window and drafts it.
 
 **Research interest**: {interest_name}
-**Implementation by**: Claude Code as autonomous agent
+**Implementation by**: {agent_name} as autonomous agent
 
 ## Why this paper for this team
 
@@ -1592,7 +1592,7 @@ _Drafted from a design brief supplied at dispatch time. No arXiv anchor — the 
 
 > Drafted by an autonomous coding loop — Remyx's Outrider action receives a design brief via workflow_dispatch, produces an implementation against this repo, and opens this PR for review. The brief is the sole input; there is no ranker-picked paper behind this PR.
 
-**Implementation by**: Claude Code as autonomous agent
+**Implementation by**: {agent_name} as autonomous agent
 
 ## Brief
 
@@ -7508,10 +7508,17 @@ _RUN_REFINE_QUERIES: list[str] = []
 
 
 def _reset_run_cost() -> None:
+    # Attribution comes back from the ACTIVE backend, not from literals. The
+    # module-level default is derived from `_initial_cost_attribution`, and
+    # main() calls this right before dispatching — so hardcoding Anthropic
+    # here threw that away on every run, and a run that never records a usage
+    # envelope (a missing binary, a timeout on the first call) reported Claude
+    # Code spend for an agent it never launched.
+    backend_name, basis = _initial_cost_attribution(_BACKEND)
     _RUN_COST.update(
         cost_usd=0.0, input_tokens=0, output_tokens=0,
         cache_read_input_tokens=0, num_turns=0, claude_calls=0,
-        model_backend="Anthropic", cost_basis="claude_code_envelope",
+        model_backend=backend_name, cost_basis=basis,
         envelopes_without_usage=0,
     )
     _RUN_REFINE_QUERIES.clear()
@@ -7599,7 +7606,19 @@ def _validate_claude_auth_env() -> tuple[bool, list[str]]:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
 
-    non_default = bool(base_url) and "api.anthropic.com" not in base_url
+    # Which credential is authoritative is a decision routing already made
+    # and recorded; re-deriving it from the base URL lets the validator and
+    # the launcher disagree. They did: `provider=anthropic` with a
+    # `model-base-url` set marks ANTHROPIC_API_KEY as selected, while the
+    # base-URL sniff below called ANTHROPIC_AUTH_TOKEN primary and hard-exited
+    # over a credential the run was never going to use.
+    selected = (os.environ.get("OUTRIDER_CLAUDE_AUTH_VAR") or "").strip()
+    if selected in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        non_default = selected == "ANTHROPIC_AUTH_TOKEN"
+    else:
+        # No marker: an unrouted run (no `provider` input), where the caller
+        # set the vars themselves and the base URL is the only signal.
+        non_default = bool(base_url) and "api.anthropic.com" not in base_url
     if non_default:
         primary_name = "ANTHROPIC_AUTH_TOKEN"
         primary_val = auth_token
@@ -7628,12 +7647,15 @@ def _validate_claude_auth_env() -> tuple[bool, list[str]]:
         primary_val = api_key
 
     if not primary_val:
-        log.error(
-            "  ✗ auth check: %s is not set — agent calls will fail with "
-            "HTTP 401. Set the secret on your repo and dispatch again.",
-            primary_name,
+        reason = (
+            f"{primary_name} is not set — agent calls will fail with HTTP "
+            f"401. Set the secret on your repo and dispatch again."
         )
-        return False, warnings
+        log.error("  ✗ auth check: %s", reason)
+        # Carried, not just logged: `mode: smoke` joins these into its
+        # reported error, and an empty list gave consumers "preflight
+        # failed: " with no cause.
+        return False, warnings + [reason]
 
     if primary_val == "-":
         log.error(
@@ -7695,6 +7717,18 @@ def _detect_backend(
         "api.moonshot.ai": "Moonshot (Kimi)",
         "openrouter.ai": "OpenRouter",
     }
+    # A vendor with no rate row still deserves its name. The loop below only
+    # consults these overrides for hosts that HAVE rates, so a gateway priced
+    # per underlying model — OpenRouter — fell out as the bare hostname and
+    # its runs grouped under a different series id than the same vendor
+    # reached any other way.
+    named_without_rates = {
+        vendor: label for vendor, label in display_overrides.items()
+        if not any(vendor in key or key in vendor for key in _BACKEND_RATES)
+    }
+    for vendor, label in named_without_rates.items():
+        if vendor in host:
+            return (label, None)
     for key, model_rates in _BACKEND_RATES.items():
         if key in host:
             rates = model_rates.get(model) if model else None
@@ -12091,9 +12125,23 @@ def process_target(target: Target) -> dict:
             # bumped timeout and forced research to fail-best-effort on
             # any run where turns took >75s on average, dropping paper
             # context from the coding session for no gain.
-            research_ok, research_log = invoke_research_phase(
-                workdir, timeout_s=target.claude_timeout_s,
-            )
+            # The staged research phase is a web-research task. An agent
+            # routed somewhere without a usable search tool (Codex off
+            # OpenAI, where the action pins web_search="disabled") would burn
+            # a full timeout on a prompt it cannot satisfy and then soft-fail
+            # on the missing findings file. Skipping is the documented
+            # degradation; running it anyway was the bug.
+            if not _BACKEND.can(Capability.WEB_RESEARCH):
+                log.info(
+                    "  ↷ staged research skipped: %s has no web-research tool "
+                    "on this routing; continuing with the single-pass flow",
+                    _BACKEND.display_name,
+                )
+                research_ok, research_log = False, "web research unavailable"
+            else:
+                research_ok, research_log = invoke_research_phase(
+                    workdir, timeout_s=target.claude_timeout_s,
+                )
             result["research_phase_ok"] = research_ok
             result["research_log_tail"] = research_log[-1000:]
 
@@ -12955,6 +13003,10 @@ def build_pr_body(
         else:
             license_section = _render_license_section(rec)
         return _ensure_coauthor_trailer(_PR_BODY_TEMPLATE_BRIEF.format(
+            # The PR is published on someone else's repo; attributing the
+            # work to an agent that never ran is a claim, not a cosmetic
+            # label.
+            agent_name=_BACKEND.display_name,
             suggested_experiment=rec.suggested_experiment or "(no brief provided)",
             test_section=test_section,
             license_section=license_section,
@@ -12962,6 +13014,7 @@ def build_pr_body(
             attribution_url=CANONICAL_ATTRIBUTION_URL,
         ))
     return _ensure_coauthor_trailer(_PR_BODY_TEMPLATE.format(
+        agent_name=_BACKEND.display_name,
         paper_title=rec.paper_title,
         arxiv_id=rec.arxiv_id,
         interest_name=rec.interest_name or "(unnamed)",
@@ -18106,6 +18159,7 @@ _DISPLAY_STATUS = {
     "claude_failed": "agent_failed",
     "fidelity_failed_claude": "fidelity_failed_agent",
     "pre_pr_fidelity_failed_claude": "pre_pr_fidelity_failed_agent",
+    "issue_convention_failed_claude": "issue_convention_failed_agent",
 }
 
 
@@ -18811,6 +18865,35 @@ def main():
         # inert for anything else, which would leave a `model-base-url` run
         # on another agent silently talking to the vendor default instead of
         # the endpoint the caller named.
+        #
+        # Two cases it must NOT do that in, because routing already refused
+        # the override and applying it here would win anyway:
+        #
+        #   a named provider  — the registry owns that vendor's endpoint. A
+        #     leftover `model-base-url` from the pre-provider era would send
+        #     the provider's key to a different vendor's host and 401.
+        #   a native router   — its base_url_env is the router's own control
+        #     plane, not a model endpoint. Repointing it aims R-CLI at the
+        #     wrong service entirely.
+        provider_id = (os.environ.get("INPUT_PROVIDER") or "").strip()
+        endpoint_is_callers = not provider_id or provider_id == "custom"
+        if _BACKEND.api_family == ApiFamily.NATIVE_ROUTER:
+            log.warning(
+                "  ⚠ model-base-url is ignored for agent=%s: %s is its "
+                "router control plane, not a model endpoint. Address a "
+                "different backend with provider/model instead.",
+                _BACKEND.name, _BACKEND.base_url_env or "(none)",
+            )
+            target.model_base_url = ""
+        elif not endpoint_is_callers:
+            log.warning(
+                "  ⚠ model-base-url is ignored for provider=%s: the action "
+                "resolves that vendor's endpoint itself. Use provider=custom "
+                "to point at your own.",
+                provider_id,
+            )
+            target.model_base_url = ""
+    if target.model_base_url:
         base_url_var = _BACKEND.base_url_env or "ANTHROPIC_BASE_URL"
         os.environ[base_url_var] = target.model_base_url
         backend_name, backend_rates = _detect_backend(target.model_base_url)

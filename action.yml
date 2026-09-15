@@ -656,6 +656,11 @@ runs:
         gh-graph --selftest
 
     - name: Install cocoindex-code AST search
+      # Gated: the install pulls ~1 GB of torch/transformers and adds 60-90s
+      # to every run, which the input exists to let a caller opt out of. The
+      # guard was lost when this step was rewritten to be agent-aware, which
+      # made the input a no-op and the opt-out a lie.
+      if: ${{ inputs.enable-cocoindex == 'true' }}
       shell: bash
       # The `ccc` binary is the portable surface: every agent has a shell
       # tool, so a binary on PATH works for all of them. The skill wrapper is
@@ -685,6 +690,9 @@ runs:
         command -v ccc >/dev/null 2>&1 && echo "ccc on PATH" || echo "WARNING: ccc missing"
 
     - name: Write ENVIRONMENTS.md so the selection agent knows ccc is available
+      # Same gate: advertising a tool the previous step was told not to
+      # install sends the agent after a binary that is not there.
+      if: ${{ inputs.enable-cocoindex == 'true' }}
       shell: bash
       # The surface text names the invocation path the ACTIVE agent actually
       # has. Telling Codex or R-CLI about a "/ccc slash command" sends them
@@ -726,6 +734,13 @@ runs:
         # right operand — observed via the v1.0.3 push failure.)
         GITHUB_TOKEN: ${{ github.token }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        # The provider axis, so a failure message can name the secret that
+        # actually needs fixing. Composite-action inputs are NOT auto-exposed
+        # as INPUT_* to a `run:` step, so without this the provider-specific
+        # remedy ("set ZAI_API_KEY") silently degraded to the agent's own
+        # credential name on every routed run. (INPUT_AGENT is already set
+        # further down this same block.)
+        INPUT_PROVIDER: ${{ inputs.provider }}
         TARGET_REPO: ${{ github.repository }}
         INPUT_INTEREST_ID: ${{ inputs.interest-id }}
         INPUT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}

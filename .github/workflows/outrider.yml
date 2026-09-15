@@ -31,6 +31,15 @@ on:
         description: 'Enable the multi-pass staged-synthesis flow (the refiner sets true). Empty/false = single-pass.'
         required: false
         default: 'false'
+      agent:
+        description: 'Which coding-agent CLI runs the implementation — a separate axis from provider, which picks the model behind it.'
+        type: choice
+        required: false
+        default: 'claude'
+        options:
+          - claude
+          - codex
+          - backboard
       provider:
         description: 'anthropic (default) or zai for GLM.'
         type: choice
@@ -81,21 +90,6 @@ jobs:
       # stays on Remyx's side; this uses the REMYX_API_KEY already in secrets.
       # If it can't be minted (e.g. App not installed), the token is empty and
       # the action falls back to the workflow's built-in GITHUB_TOKEN.
-      - name: Configure provider auth
-        shell: bash
-        env:
-          ANTHROPIC_API_KEY_SECRET: ${{ secrets.ANTHROPIC_API_KEY }}
-          ZAI_API_KEY_SECRET: ${{ secrets.ZAI_API_KEY }}
-          MODEL_INPUT: ${{ inputs.model }}
-        run: |
-          if [ "${{ inputs.provider }}" = "zai" ]; then
-            echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY_SECRET" >> "$GITHUB_ENV"
-          else
-            echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_SECRET" >> "$GITHUB_ENV"
-          fi
-          if [ -n "$MODEL_INPUT" ]; then
-            echo "ANTHROPIC_MODEL=$MODEL_INPUT" >> "$GITHUB_ENV"
-          fi
       - name: Mint Remyx bot token
         id: remyx-bot
         shell: bash
@@ -104,8 +98,27 @@ jobs:
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
       - uses: ./
+        # Every credential the action might read. It picks the one its
+        # `agent` / `provider` select and ignores the rest; a missing secret
+        # is an empty string and fails clean naming the one it needed.
+        # Deliberately absent: CODEX_API_KEY, which the action *derives* from
+        # the provider's secret — declaring it empty here would shadow the
+        # derived value, because a step-level `env:` beats `$GITHUB_ENV`.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          BACKBOARD_API_KEY: ${{ secrets.BACKBOARD_API_KEY }}
         with:
           interest-id: '29ca03e7-454d-446c-9941-32c96c53d95d'
+          # The two backend axes. This workflow is the reference shape the
+          # docs point at, so it routes the way the action documents rather
+          # than resolving auth in a step of its own.
+          agent: ${{ inputs.agent }}
+          provider: ${{ inputs.provider }}
+          model: ${{ inputs.model }}
           # remyx[bot] token (empty → action falls back to GITHUB_TOKEN).
           github-token: ${{ steps.remyx-bot.outputs.token }}
           pin-arxiv: ${{ inputs.pin-arxiv }}
@@ -115,6 +128,7 @@ jobs:
           start-from-ref: ${{ inputs.start-from-ref }}
           lead-content: ${{ inputs.lead-content }}
           staged-synthesis: ${{ inputs.staged-synthesis }}
-          # Explicit `base-url` wins (self-hosted proxy, on-prem endpoint);
-          # otherwise fall back to the per-provider default.
-          model-base-url: ${{ inputs.base-url != '' && inputs.base-url || (inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '') }}
+          # Only for an endpoint the registry does not own (provider=custom,
+          # a self-hosted proxy). Every named provider's endpoint comes from
+          # the action's own registry, so hardcoding one here would drift.
+          model-base-url: ${{ inputs.base-url }}
