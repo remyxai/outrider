@@ -116,8 +116,9 @@ Outrider tracks token counts straight from each Claude Code response envelope. C
 | (none + step-summary warning) | Backend isn't in the rate table; falling back to the CLI's value with a "may be approximate" annotation. Token counts stay accurate; dollars are approximate by however much the backend's pricing differs from Anthropic's |
 | `agent_envelope` | A non-Claude agent reported authoritative dollars itself (R-CLI's `usage` event carries `costUsd`), so its figure is used directly |
 | `unavailable` | The agent reports tokens but no dollars, and the endpoint host has no rate row — Outrider reports no cost rather than a fabricated `$0.00`. Token counts stay exact |
+| `backend_rate_table_approx` | The host has a rate table but the named model has no row, so the figure uses the host's default-tier rates. The step summary says "approximated from" rather than "computed from" |
 
-When `ANTHROPIC_MODEL` names a model not in the host's rate row (e.g. a newly-released tier we haven't added yet), cost is computed at the host's default-tier rates (glm-5.2 for z.ai; kimi-k3 for Moonshot) — closer than nothing, but off by the tier delta (3-4x on tier pairs). Customers routing at a backend Outrider doesn't yet recognize see accurate token counts and a step-summary annotation flagging the cost approximation.
+When `ANTHROPIC_MODEL` names a model not in the host's rate row, cost is computed at the host's default-tier rates (glm-5.2 for z.ai; kimi-k3 for Moonshot) — off by the tier delta, up to 3-4x on tier pairs — and reported as `backend_rate_table_approx`. `glm-5.3` is in that position today: it is the `provider: zai` default and has no rate row yet. A run that names no model keeps `backend_rate_table`. A backend with no rate table at all reports accurate tokens and a step-summary note.
 
 
 The step summary shows the agent + backend pair on every run:
@@ -235,7 +236,7 @@ A backend may be partially capable and still usable — the affected telemetry d
 |---|---|
 | `turn_cap` | `claude-timeout` becomes the only spend bound. Neither Codex nor R-CLI has a round-limit flag, so keep the timeout tight on cron-driven installs. |
 | `cost_usd` | Cost resolves from the per-host rate table instead of the CLI's own figure (`cost_basis: backend_rate_table`); with no rate row it reports `cost_basis: unavailable` rather than a fabricated `$0.00`. Token counts stay exact either way. |
-| `stream_transcript` | Selection coverage reports `basis: unavailable` and the coverage gate runs in `observe` mode, so a quiet agent is not punished for being quiet. |
+| `stream_transcript` | Selection coverage reports `basis: unavailable` and the coverage gate runs in `observe` mode, so a quiet agent is not punished for being quiet. Having the capability is not sufficient: an agent whose transcript carries no countable reads or searches reports the same basis rather than an under-explored pick. |
 | `web_research` | The staged research phase is skipped; the coding session runs without web context. |
 | `guardrail_policy` | The injection-hardening tool gate that Claude Code runs get is **not** in effect, and the run logs a warning saying so. The post-hoc diff validators still apply. |
 | `output_schema` | Verdict passes fall back to extracting JSON from the model's prose. |

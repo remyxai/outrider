@@ -196,7 +196,10 @@ def build() -> str:
       "`$0.00`. Token counts stay exact either way. |")
     w("| `stream_transcript` | Selection coverage reports "
       "`basis: unavailable` and the coverage gate runs in `observe` mode, so "
-      "a quiet agent is not punished for being quiet. |")
+      "a quiet agent is not punished for being quiet. Having the capability "
+      "is not sufficient: an agent whose transcript carries no countable "
+      "reads or searches reports the same basis rather than an "
+      "under-explored pick. |")
     w("| `web_research` | The staged research phase is skipped; the coding "
       "session runs without web context. |")
     w("| `guardrail_policy` | The injection-hardening tool gate that Claude "
