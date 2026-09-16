@@ -1,0 +1,130 @@
+{
+  "_note": "Every workflow shape that exists on customer repos, recorded as the inputs it hands the action and the environment it hands them in. Derived from the templates that GENERATED those installs, not invented \u2014 that is the point. A combination nobody enumerated is exactly how v1.8.0 shipped a regression: the pre-axis CLI template passes `provider` AND `model-base-url` together, and no test had ever put those two in the same run.",
+  "_regenerating": "When a template changes, add the new shape; never edit an old one. An install in the wild does not update itself, so its shape is history, not configuration.",
+  "shapes": [
+    {
+      "name": "pre-axis engine install",
+      "provenance": "engine render_workflow_yaml before the agent axis: a fork-side Configure step writes the credential, the action is handed no agent and no provider",
+      "inputs": {},
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-caller-supplied"
+      },
+      "expects": {
+        "routing_wrote": {},
+        "effective_endpoint": null,
+        "note": "the caller's own auth is left completely alone"
+      }
+    },
+    {
+      "name": "pre-axis engine install, routed at a gateway",
+      "provenance": "same, with the Configure step's proxied arm: it sets the token and base URL itself",
+      "inputs": {},
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "sk-zai-caller-supplied",
+        "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"
+      },
+      "expects": {
+        "routing_wrote": {},
+        "effective_endpoint": null,
+        "note": "untouched: no provider input means no auth manipulation"
+      }
+    },
+    {
+      "name": "pre-axis CLI setup-local install",
+      "provenance": "remyxai-cli outrider_local._render_local_workflow before the agent axis \u2014 passes provider AND model-base-url in the same with: block",
+      "inputs": {
+        "provider": "zai",
+        "model": "glm-5.2"
+      },
+      "env": {
+        "ZAI_API_KEY": "sk-zai-secret"
+      },
+      "expects": {
+        "routing_wrote": {
+          "ANTHROPIC_AUTH_TOKEN": "sk-zai-secret",
+          "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+          "ANTHROPIC_MODEL": "glm-5.2"
+        },
+        "effective_endpoint": "https://api.z.ai/api/anthropic",
+        "note": ""
+      }
+    },
+    {
+      "name": "pre-axis CLI install pointed at a self-hosted gateway",
+      "provenance": "the same template dispatched with --base-url: a proxy in front of the vendor. THIS is the shape v1.8.0 broke",
+      "inputs": {
+        "provider": "zai",
+        "model": "glm-5.2",
+        "model-base-url": "https://gateway.internal/anthropic"
+      },
+      "env": {
+        "ZAI_API_KEY": "sk-zai-secret"
+      },
+      "expects": {
+        "routing_wrote": {
+          "ANTHROPIC_AUTH_TOKEN": "sk-zai-secret",
+          "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+          "ANTHROPIC_MODEL": "glm-5.2"
+        },
+        "effective_endpoint": "https://gateway.internal/anthropic",
+        "note": "the caller's endpoint wins; a warning names the override"
+      }
+    },
+    {
+      "name": "pre-axis install with a caller-supplied endpoint and no provider",
+      "provenance": "the oldest documented custom-backend shape: caller sets its own base URL and auth, action passes through",
+      "inputs": {
+        "model-base-url": "https://onprem.internal/v1"
+      },
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-onprem"
+      },
+      "expects": {
+        "routing_wrote": {},
+        "effective_endpoint": "https://onprem.internal/v1",
+        "note": ""
+      }
+    },
+    {
+      "name": "current CLI install, agent axis",
+      "provenance": "remyxai-cli after the agent axis: agent and provider both named",
+      "inputs": {
+        "agent": "codex",
+        "provider": "openai",
+        "model": "gpt-5.4-mini"
+      },
+      "env": {
+        "OPENAI_API_KEY": "sk-openai-secret"
+      },
+      "expects": {
+        "routing_wrote": {
+          "CODEX_API_KEY": "sk-openai-secret",
+          "CODEX_BASE_URL": "",
+          "CODEX_MODEL": "gpt-5.4-mini"
+        },
+        "effective_endpoint": null,
+        "note": ""
+      }
+    },
+    {
+      "name": "current engine install, native router",
+      "provenance": "engine render_workflow_yaml with agent=backboard: the router's own key is the only credential",
+      "inputs": {
+        "agent": "backboard",
+        "provider": "openai",
+        "model": "gpt-5.4-mini"
+      },
+      "env": {
+        "BACKBOARD_API_KEY": "bb-secret"
+      },
+      "expects": {
+        "routing_wrote": {
+          "BACKBOARD_MODEL": "openai/gpt-5.4-mini"
+        },
+        "effective_endpoint": null,
+        "note": ""
+      }
+    }
+  ],
+  "_two_halves": "Routing (configure_backend) and launch (run.main applying model-base-url) are separate steps, and the v1.8.0 regression lived in the second one \u2014 a check that only exercised routing would have passed it. Both are asserted: what routing writes to the job env, and the endpoint the agent is actually launched against."
+}
