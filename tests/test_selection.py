@@ -539,3 +539,70 @@ def test_selection_timeout_falls_back_to_480_without_target(tmp_path, monkeypatc
     monkeypatch.setattr(run, "_run_claude_oneshot_streaming", fake_streaming)
     run.select_recommendation(tmp_path, "pkg", [geo, count])  # no target
     assert captured["timeout_s"] == 480
+
+
+# ─── Codification readiness assessment ─────────────────────────────────────
+
+
+def test_spec_bundle_includes_codification_gaps_when_detected(tmp_path):
+    """Specification bundles include codification readiness gap analysis."""
+    tgt = Target(repo="remyxai/VQASynth", interest_id="x")
+    # Create a recommendation with an underspecified abstract using the helper
+    under_spec = run._paper_to_recommendation(
+        {
+            "title": "Vague Method",
+            "resource_id": "2609.10539v1",
+            "relevance_score": 0.8,
+            "reasoning": "test reasoning",
+            "interest_name": "test",
+            "resource": {
+                "abstract": (
+                    "We propose a method that is suitable for various tasks, "
+                    "typically chosen appropriately, and generally useful."
+                ),
+            },
+        },
+        fallback_interest_name="test",
+        interest_context="test context",
+        experiment_history="",
+    )
+    # Override suggested_experiment to test the assessment
+    under_spec.suggested_experiment = "Implement the method."
+    run.write_spec_bundle(tmp_path, tgt, under_spec, "test")
+    spec = (tmp_path / ".remyx-recommendation" / "SPEC.md").read_text()
+    # Gap assessment should be present for vague specifications
+    assert "Codification Readiness Advisory" in spec
+    assert "IdeaAMBIG" in spec
+    assert "Note:" in spec
+
+
+def test_spec_bundle_omits_codification_gaps_when_well_specified(tmp_path):
+    """Well-specified methods should not trigger gap warnings in the bundle."""
+    tgt = Target(repo="remyxai/VQASynth", interest_id="x")
+    well_spec = run._paper_to_recommendation(
+        {
+            "title": "Well-Specified Method",
+            "resource_id": "2609.10539v1",
+            "relevance_score": 0.8,
+            "reasoning": "test reasoning",
+            "interest_name": "test",
+            "resource": {
+                "abstract": (
+                    "We propose a method with learning rate 0.001, batch size 32, "
+                    "dropout 0.1, cross-entropy loss, and Adam optimizer. "
+                    "The model uses 3 layers with 256 hidden units and ReLU activation. "
+                    "We evaluate using accuracy and F1 on standard benchmarks."
+                ),
+            },
+        },
+        fallback_interest_name="test",
+        interest_context="test context",
+        experiment_history="",
+    )
+    # Override suggested_experiment to test the assessment
+    well_spec.suggested_experiment = "Implement the model."
+    run.write_spec_bundle(tmp_path, tgt, well_spec, "test")
+    spec = (tmp_path / ".remyx-recommendation" / "SPEC.md").read_text()
+    # Gap assessment should be absent for well-specified methods
+    assert "Codification Readiness Advisory" not in spec
+    assert "## Paper abstract" in spec  # Should still have the abstract section

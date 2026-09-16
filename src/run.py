@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codification_readiness import assess_codification_readiness
 from diff_risk_score import (
     DIFF_RISK_ISSUE_THRESHOLD,
     render_risk_detail,
@@ -272,7 +273,7 @@ tier: {tier}
 
 {suggested_experiment}
 
-## Paper abstract
+{codification_gaps_section}## Paper abstract
 
 {paper_abstract}
 """
@@ -7360,6 +7361,18 @@ def write_spec_bundle(
             suggested_experiment=effective_experiment,
         ))
     else:
+        # Assess codification readiness of the method specification
+        codification_gaps = assess_codification_readiness(
+            paper_title=rec.paper_title or "",
+            paper_abstract=rec.paper_abstract or "",
+            suggested_experiment=effective_experiment,
+        )
+        codification_gaps_section = (
+            codification_gaps + "\n\n"
+            if codification_gaps
+            else ""
+        )
+
         (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
             paper_title=rec.paper_title,
             arxiv_id=rec.arxiv_id,
@@ -7370,6 +7383,7 @@ def write_spec_bundle(
             reasoning=rec.reasoning or "(no reasoning provided)",
             selection_block=selection_block,
             suggested_experiment=effective_experiment,
+            codification_gaps_section=codification_gaps_section,
             paper_abstract=rec.paper_abstract or "(abstract unavailable)",
         ))
 
