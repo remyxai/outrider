@@ -179,3 +179,59 @@ def test_the_run_step_receives_both_axes():
                 if "Recommend + implement" in (s.get("name") or ""))
     assert step["env"]["INPUT_PROVIDER"] == "${{ inputs.provider }}"
     assert step["env"]["INPUT_AGENT"] == "${{ inputs.agent }}"
+
+
+# ─── degradation that has to actually happen ───────────────────────────────
+
+
+def test_research_is_staged_only_where_the_agent_can_search(monkeypatch):
+    """The capability was declared and dynamically degraded but never
+    consulted, so a Codex run routed off OpenAI — where the action pins
+    `web_search="disabled"` — staged a web-research phase anyway, burned a
+    full timeout on a prompt it cannot satisfy, and soft-failed on the missing
+    findings file."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    assert run.should_stage_research() is True
+
+    run = _run_module(monkeypatch, INPUT_AGENT="codex", CODEX_API_KEY="k")
+    assert run.should_stage_research() is True, "Codex on OpenAI can search"
+
+    # Routed off OpenAI, the action disables the tool — so there is nothing
+    # for a research phase to do.
+    run = _run_module(monkeypatch, INPUT_AGENT="codex", CODEX_API_KEY="k",
+                      CODEX_BASE_URL="https://api.moonshot.ai/v1")
+    assert run.should_stage_research() is False
+
+
+# ─── an endpoint override only applies where routing accepts one ───────────
+
+
+def test_an_override_reaches_an_endpoint_the_caller_owns(monkeypatch):
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    applied, warning = run.endpoint_override("https://proxy.internal/v1",
+                                             provider_id="custom")
+    assert applied == "https://proxy.internal/v1" and warning == ""
+    # No provider at all is the oldest supported shape: the caller wired it.
+    applied, warning = run.endpoint_override("https://proxy.internal/v1")
+    assert applied == "https://proxy.internal/v1" and warning == ""
+
+
+def test_a_named_providers_endpoint_is_not_overridable(monkeypatch):
+    """Routing discards the override for a named provider, but this is applied
+    after routing, so it won. A leftover `model-base-url` from the
+    pre-provider era sent the provider's key to a different vendor's host."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    applied, warning = run.endpoint_override("https://api.z.ai/api/anthropic",
+                                             provider_id="moonshot")
+    assert applied == ""
+    assert "provider=moonshot" in warning
+
+
+def test_a_native_routers_control_plane_is_not_a_model_endpoint(monkeypatch):
+    """Its base-URL env var addresses the router itself. Repointing it aims
+    the agent at the wrong service entirely."""
+    run = _run_module(monkeypatch, INPUT_AGENT="backboard", BACKBOARD_API_KEY="k")
+    applied, warning = run.endpoint_override("https://proxy.internal/v1",
+                                             provider_id="custom")
+    assert applied == ""
+    assert "control plane" in warning

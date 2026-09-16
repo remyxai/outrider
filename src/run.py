@@ -8247,6 +8247,54 @@ def _render_sibling_impls_block(
     return "\n".join(lines)
 
 
+def should_stage_research(backend=None) -> bool:
+    """Whether the staged research phase can do anything on this routing.
+
+    It is a web-research task. An agent with no usable search tool — Codex
+    routed off OpenAI, where the action pins ``web_search="disabled"`` —
+    would burn a full timeout on a prompt it cannot satisfy and then soft-fail
+    on the missing findings file. Skipping is the documented degradation; the
+    capability was declared and dynamically degraded but never consulted, so
+    the degradation did not exist.
+    """
+    backend = backend or _BACKEND
+    return bool(backend.can(Capability.WEB_RESEARCH))
+
+
+def endpoint_override(base_url: str, backend=None, provider_id: str = "") -> tuple[str, str]:
+    """``(url_to_apply, warning)`` for a caller-supplied ``model-base-url``.
+
+    Routing already decided whether an override is admissible, and applying
+    one it refused wins anyway because this is set on the parent process after
+    routing. Two cases must not do that:
+
+    * **a named provider** — the registry owns that vendor's endpoint, so a
+      leftover override from the pre-provider era sends the provider's key to
+      a different vendor's host and 401s;
+    * **a native router** — its base-URL env var is the router's own control
+      plane, not a model endpoint, so repointing it aims the agent at the
+      wrong service entirely.
+    """
+    backend = backend or _BACKEND
+    if not base_url:
+        return "", ""
+    if backend.api_family == ApiFamily.NATIVE_ROUTER:
+        return "", (
+            f"model-base-url is ignored for agent={backend.name}: "
+            f"{backend.base_url_env or '(none)'} is its router control plane, "
+            f"not a model endpoint. Address a different backend with "
+            f"provider/model instead."
+        )
+    provider_id = (provider_id or "").strip()
+    if provider_id and provider_id != "custom":
+        return "", (
+            f"model-base-url is ignored for provider={provider_id}: the "
+            f"action resolves that vendor's endpoint itself. Use "
+            f"provider=custom to point at your own."
+        )
+    return base_url, ""
+
+
 def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, str]:
     """Invoke the research-phase Claude Code CLI pass.
 
@@ -12131,7 +12179,7 @@ def process_target(target: Target) -> dict:
             # a full timeout on a prompt it cannot satisfy and then soft-fail
             # on the missing findings file. Skipping is the documented
             # degradation; running it anyway was the bug.
-            if not _BACKEND.can(Capability.WEB_RESEARCH):
+            if not should_stage_research():
                 log.info(
                     "  ↷ staged research skipped: %s has no web-research tool "
                     "on this routing; continuing with the single-pass flow",
@@ -18875,24 +18923,13 @@ def main():
         #   a native router   — its base_url_env is the router's own control
         #     plane, not a model endpoint. Repointing it aims R-CLI at the
         #     wrong service entirely.
-        provider_id = (os.environ.get("INPUT_PROVIDER") or "").strip()
-        endpoint_is_callers = not provider_id or provider_id == "custom"
-        if _BACKEND.api_family == ApiFamily.NATIVE_ROUTER:
-            log.warning(
-                "  ⚠ model-base-url is ignored for agent=%s: %s is its "
-                "router control plane, not a model endpoint. Address a "
-                "different backend with provider/model instead.",
-                _BACKEND.name, _BACKEND.base_url_env or "(none)",
-            )
-            target.model_base_url = ""
-        elif not endpoint_is_callers:
-            log.warning(
-                "  ⚠ model-base-url is ignored for provider=%s: the action "
-                "resolves that vendor's endpoint itself. Use provider=custom "
-                "to point at your own.",
-                provider_id,
-            )
-            target.model_base_url = ""
+        applied, warning = endpoint_override(
+            target.model_base_url,
+            provider_id=os.environ.get("INPUT_PROVIDER") or "",
+        )
+        if warning:
+            log.warning("  ⚠ %s", warning)
+        target.model_base_url = applied
     if target.model_base_url:
         base_url_var = _BACKEND.base_url_env or "ANTHROPIC_BASE_URL"
         os.environ[base_url_var] = target.model_base_url
