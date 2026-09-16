@@ -7776,6 +7776,35 @@ def _detect_backend(
     return (host, None)
 
 
+def _rate_basis(base_url: str, model: str) -> str:
+    """``backend_rate_table`` only when the *named* model has a rate row.
+
+    `_detect_backend` falls back to the host's default model when the exact
+    id is missing, which is closer than nothing but is not the rate card the
+    run actually paid. Reporting that as `backend_rate_table` renders in the
+    step summary as "computed from <vendor> PAYG rates", i.e. authoritative,
+    for a number computed from a different model's prices. Live case: this
+    branch makes `glm-5.3` the z.ai default and the table has rows only for
+    glm-5.2 and glm-4.6.
+
+    The tokens stay exact either way; only the dollars are an approximation,
+    and now they say so.
+    """
+    if not model:
+        # No model named: the run used whatever the vendor defaults to, and
+        # the table's per-host default is the standing assumption about what
+        # that is. Unchanged behavior — this is the common shape for installs
+        # that never pinned a model, and relabelling their history would be a
+        # telemetry change without a telemetry reason.
+        return "backend_rate_table"
+    host = (base_url or "").split("://", 1)[-1].split("/", 1)[0]
+    for key, model_rates in _BACKEND_RATES.items():
+        if key in host:
+            return ("backend_rate_table" if model in model_rates
+                    else "backend_rate_table_approx")
+    return "backend_rate_table"
+
+
 def _record_claude_usage(env: dict) -> None:
     """Accumulate one `claude --output-format json` envelope's usage.
 
@@ -7839,7 +7868,7 @@ def _record_claude_usage(env: dict) -> None:
             _RUN_COST["cost_usd"] += (
                 in_tok * rate_in + out_tok * rate_out + cache_in * rate_cache
             ) / 1_000_000
-            _RUN_COST["cost_basis"] = "backend_rate_table"
+            _RUN_COST["cost_basis"] = _rate_basis(base_url, model)
         else:
             # Token counts stay accurate; dollars are simply not knowable for
             # this (agent, model) pair yet. Never fabricate them.
@@ -7852,7 +7881,7 @@ def _record_claude_usage(env: dict) -> None:
         rate_in, rate_out, rate_cache = rates
         cost = (in_tok * rate_in + out_tok * rate_out + cache_in * rate_cache) / 1_000_000
         _RUN_COST["cost_usd"] += cost
-        _RUN_COST["cost_basis"] = "backend_rate_table"
+        _RUN_COST["cost_basis"] = _rate_basis(base_url, model)
     else:
         _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
         _RUN_COST["cost_basis"] = "claude_code_envelope"
@@ -18644,6 +18673,12 @@ def _write_step_summary(result: dict) -> None:
     # the dollars are authoritative for that rate sheet.
     if cost_basis == "backend_rate_table":
         cost_note = f" *(computed from {backend} PAYG rates)*"
+    elif cost_basis == "backend_rate_table_approx":
+        # The named model has no rate row, so this used the host's default
+        # model's card. Saying "computed from PAYG rates" for that would
+        # dress an approximation as the vendor's own arithmetic.
+        cost_note = (f" *(approximated from {backend} rates — no rate card "
+                     f"for this model yet)*")
     elif backend != "Anthropic":
         cost_note = (" *(Anthropic-rate estimate on backend tokens; "
                      "see provider billing for the real number)*")

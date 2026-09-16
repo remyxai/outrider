@@ -393,3 +393,31 @@ def test_the_fidelity_remediation_push_does_not_reach_for_origin():
     assert '"git", "fetch", authed' in block
     assert '"git", "push", authed' in block
     assert '"git", "push", "origin", branch' not in block
+
+
+# ─── dollars computed from another model's card say so ─────────────────────
+
+
+def test_an_exact_rate_card_is_reported_as_authoritative(monkeypatch):
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    assert run._rate_basis("https://api.z.ai/api/anthropic", "glm-5.2") == \
+        "backend_rate_table"
+
+
+def test_a_fallback_rate_card_is_not(monkeypatch):
+    """`_detect_backend` falls back to the host's default model when the exact
+    id is missing. Reporting that as `backend_rate_table` renders in the step
+    summary as "computed from PAYG rates" — authoritative — for a number
+    computed from a different model's prices. This branch makes `glm-5.3` the
+    z.ai default, and the table has rows only for glm-5.2 and glm-4.6."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    assert run._rate_basis("https://api.z.ai/api/anthropic", "glm-5.3") == \
+        "backend_rate_table_approx"
+    # Tokens stay exact either way; only the dollars are approximate.
+    assert run._rate_basis("https://api.moonshot.ai/anthropic", "kimi-k3") == \
+        "backend_rate_table"
+    # And an install that never pinned a model keeps its historical basis:
+    # the per-host default is the standing assumption about what the vendor
+    # served, and relabelling that history needs a telemetry reason.
+    assert run._rate_basis("https://api.z.ai/api/anthropic", "") == \
+        "backend_rate_table"
