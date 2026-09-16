@@ -73,17 +73,27 @@ def _paths_in_tool_use(name: str, inp: dict) -> list[str]:
         val = inp.get(key)
         return [val] if isinstance(val, str) and val.strip() else []
     if name == "Bash":
-        cmd = inp.get("command")
-        if not isinstance(cmd, str) or not cmd:
-            return []
-        out: list[str] = []
-        for tok in _PATHISH_RE.findall(cmd):
-            tok = tok.strip("'\"`,;:()")
-            # Skip URLs and flag-looking tokens.
-            if tok and "://" not in tok and not tok.startswith("-"):
-                out.append(tok)
-        return out
+        return paths_in_command(inp.get("command"))
     return []
+
+
+def paths_in_command(command) -> list[str]:
+    """Repo paths a shell command appears to touch.
+
+    A `sed -n '1,40p' src/run.py` is exploration even though no structured
+    path field records it, so the command string is scanned for path-ish
+    tokens. Backend-neutral: every agent reports its shell command the same
+    way on the normalized event, so this heuristic applies to all of them.
+    """
+    if not isinstance(command, str) or not command:
+        return []
+    out: list[str] = []
+    for tok in _PATHISH_RE.findall(command):
+        tok = tok.strip("'\"`,;:()")
+        # Skip URLs and flag-looking tokens.
+        if tok and "://" not in tok and not tok.startswith("-"):
+            out.append(tok)
+    return out
 
 
 def _structure_label(
@@ -109,11 +119,11 @@ def _structure_label(
     return "linear"
 
 
-def exploration_structure_from_events(events: list[dict]) -> dict:
+def exploration_structure_from_events(events: list) -> dict:
     """Classify selection-pass exploration as linear vs domain-scoped.
 
-    Walks the ordered transcript, extracts the repo paths each ``tool_use``
-    touched, and derives the structure dimension the paper studies:
+    Walks the ordered normalized transcript, groups the paths each agent
+    *turn* touched, and derives the structure dimension the paper studies:
 
     - ``domains`` / ``domain_list`` — distinct subsystems the agent reached.
     - ``domain_switches`` — transitions between subsystems in read order.
@@ -122,6 +132,10 @@ def exploration_structure_from_events(events: list[dict]) -> dict:
     - ``linearity`` — share of path-bearing turns that read exactly one path
       (1.0 = strictly one-per-step; lower = more batched).
     - ``structure`` — the collapsed label (see :func:`_structure_label`).
+
+    Turn grouping is what separates branching from linear exploration, so it
+    is carried on the event rather than inferred from adjacency: several reads
+    in one turn is one branching step, not several linear ones.
 
     Pure over ``events``; safe on a malformed or empty stream.
     """
@@ -132,32 +146,30 @@ def exploration_structure_from_events(events: list[dict]) -> dict:
     max_turn_width = 0
     path_turns = 0
 
+    widths: dict[int, int] = {}
     for ev in events:
-        msg = ev.get("message") if isinstance(ev, dict) else None
-        content = (msg or {}).get("content")
-        if not isinstance(content, list):
+        if getattr(ev, "kind", None) != "tool_use":
             continue
-        turn_width = 0
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            paths = _paths_in_tool_use(
-                block.get("name") or "", block.get("input") or {}
-            )
-            if not paths:
-                continue
-            turn_width += 1
-            for p in paths:
-                dom = _domain_of(p)
-                ordered_domains.append(dom)
-                domain_set.add(dom)
-        if turn_width:
-            path_turns += 1
-            max_turn_width = max(max_turn_width, turn_width)
-            if turn_width >= 2:
-                parallel_turns += 1
-            else:
-                single_turns += 1
+        # A shell call carries no structured path, but the command names the
+        # files it read — that is exploration and has always counted.
+        paths = list(ev.paths) or (
+            paths_in_command(ev.command) if ev.tool == "execute" else []
+        )
+        if not paths:
+            continue
+        widths[ev.turn] = widths.get(ev.turn, 0) + 1
+        for path in paths:
+            dom = _domain_of(path)
+            ordered_domains.append(dom)
+            domain_set.add(dom)
+
+    for width in widths.values():
+        path_turns += 1
+        max_turn_width = max(max_turn_width, width)
+        if width >= 2:
+            parallel_turns += 1
+        else:
+            single_turns += 1
 
     domain_switches = sum(
         1 for a, b in zip(ordered_domains, ordered_domains[1:]) if a != b

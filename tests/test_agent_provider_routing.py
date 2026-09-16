@@ -1,0 +1,664 @@
+"""(agent, provider) routing: parity with the shipped behavior, then reach.
+
+Routing used to live in `case` arms in action.yml, one branch per agent. This
+suite exists for two reasons:
+
+1. **Parity.** The Claude Code paths are in production. The expected values
+   below are transcribed from the shell they replaced, so a drift in the
+   resolver fails here rather than in a customer's dispatch.
+2. **Extensibility.** Compatibility is a join — an agent speaks one API
+   family, a provider serves several — so the tests assert the *derivation*
+   rather than a hand-written matrix. Adding a provider row should light up
+   every agent that speaks its family, with no test edits.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+import pytest
+
+from agents import PROVIDERS, agent_matrix, available, resolve
+from agents.providers import ApiFamily, AuthStyle, RoutingError, resolve as route
+
+
+def env(**kw):
+    return dict(kw)
+
+
+# ─── parity with the shell that shipped ─────────────────────────────────────
+#
+# Transcribed from action.yml's "Configure backend from provider input" step.
+#
+# That shell also wrote `""` for the *unselected* auth var, meaning "clear
+# it" — Claude Code reads two credential vars and callers pass every
+# vendor's secret at once. Those entries are gone and nothing observable
+# changed, because the clear never worked: these values reach the run
+# through `$GITHUB_ENV`, which a step-level `env:` in the caller's workflow
+# overrides, and every install declares those secrets there. Captured from
+# a real run — `ANTHROPIC_API_KEY=(cleared)` written, `ANTHROPIC_API_KEY:
+# ***` seen one step later.
+#
+# The exclusion now happens in ClaudeBackend.subprocess_env, on the
+# environment the agent is actually launched with. See
+# test_only_the_selected_credential_reaches_the_agent.
+
+CLAUDE_PARITY = [
+    (
+        "anthropic",
+        env(ANTHROPIC_API_KEY="ak-1"),
+        {"ANTHROPIC_API_KEY": "ak-1",
+         "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_API_KEY"},
+    ),
+    (
+        "zai",
+        env(ZAI_API_KEY="zk-1"),
+        {
+            "ANTHROPIC_AUTH_TOKEN": "zk-1",
+            "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+            "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_AUTH_TOKEN",
+        },
+    ),
+    (
+        "moonshot",
+        env(MOONSHOT_API_KEY="mk-1"),
+        {
+            "ANTHROPIC_AUTH_TOKEN": "mk-1",
+            "ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic",
+            "OUTRIDER_CLAUDE_AUTH_VAR": "ANTHROPIC_AUTH_TOKEN",
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize("provider,caller_env,expected", CLAUDE_PARITY)
+def test_claude_routing_matches_the_shipped_shell(provider, caller_env, expected):
+    routing = route(resolve("claude"), provider, "", "", caller_env)
+    assert routing.env == expected
+
+
+def test_claude_unset_model_stays_unset():
+    """The shipped step wrote ANTHROPIC_MODEL only when `model` was given.
+
+    Injecting the registry's default here would silently change which model
+    existing z.ai / Moonshot workflows run.
+    """
+    routing = route(resolve("claude"), "zai", "", "", env(ZAI_API_KEY="zk"))
+    assert "ANTHROPIC_MODEL" not in routing.env
+
+
+def test_claude_explicit_model_is_honored():
+    routing = route(
+        resolve("claude"), "zai", "glm-4.6", "", env(ZAI_API_KEY="zk")
+    )
+    assert routing.env["ANTHROPIC_MODEL"] == "glm-4.6"
+
+
+def test_claude_custom_leaves_the_callers_auth_alone():
+    """The caller supplied the endpoint, so they own the auth choice —
+    clearing either var could break a working on-prem setup."""
+    routing = route(
+        resolve("claude"), "custom", "", "https://proxy.internal/v1",
+        env(ANTHROPIC_AUTH_TOKEN="tok"),
+    )
+    assert "ANTHROPIC_API_KEY" not in routing.env
+    assert "ANTHROPIC_AUTH_TOKEN" not in routing.env
+
+
+def test_claude_custom_requires_a_credential():
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("claude"), "custom", "", "https://x/v1", env())
+    assert "ANTHROPIC_API_KEY" in str(exc.value)
+
+
+def test_claude_custom_requires_a_base_url():
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("claude"), "custom", "", "", env(ANTHROPIC_API_KEY="k"))
+    assert "model-base-url" in str(exc.value)
+
+
+# ─── the mutual exclusion that motivated all of it ──────────────────────────
+
+@pytest.mark.parametrize("provider", ["zai", "moonshot"])
+def test_bearer_providers_select_the_token_var(provider):
+    """These gateways take a Bearer token, so that is the var routing sets.
+
+    It no longer writes `ANTHROPIC_API_KEY: ""` alongside. That clear went to
+    `$GITHUB_ENV`, which a step-level `env:` in the caller's workflow
+    overrides — and every install declares each vendor's secret there, so it
+    never took effect. The exclusion is enforced at launch instead; see
+    test_only_the_selected_credential_reaches_the_agent.
+    """
+    secret = PROVIDERS[provider].secret_env
+    routing = route(resolve("claude"), provider, "", "", env(**{secret: "k"}))
+    assert routing.env["ANTHROPIC_AUTH_TOKEN"] == "k"
+    assert "ANTHROPIC_API_KEY" not in routing.env
+
+
+def test_anthropic_uses_the_x_api_key_var():
+    routing = route(
+        resolve("claude"), "anthropic", "", "", env(ANTHROPIC_API_KEY="k")
+    )
+    assert routing.env["ANTHROPIC_API_KEY"] == "k"
+    assert "ANTHROPIC_AUTH_TOKEN" not in routing.env
+
+
+@pytest.mark.parametrize("provider", ["zai", "moonshot", "openrouter"])
+def test_only_the_selected_credential_reaches_the_agent(provider, monkeypatch):
+    """The check that actually protects the run.
+
+    Routing writes to a job-level variable; this is the process environment
+    the agent is launched with, which nothing downstream can override. A run
+    routed at a gateway must not be handed an unrelated Anthropic key, and
+    the caller's env always has one.
+    """
+    backend = resolve("claude")
+    secret = PROVIDERS[provider].secret_env
+    routing = route(backend, provider, "", "", env(**{secret: "vendor"}))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-unrelated")
+    for key, value in routing.env.items():
+        monkeypatch.setenv(key, value)
+
+    launched = backend.subprocess_env()
+
+    assert launched["ANTHROPIC_AUTH_TOKEN"] == "vendor"
+    assert "ANTHROPIC_API_KEY" not in launched
+
+
+# ─── passthrough: the backward-compatibility path ───────────────────────────
+
+def test_empty_provider_changes_nothing():
+    routing = route(resolve("claude"), "", "", "", env(ANTHROPIC_API_KEY="k"))
+    assert routing.env == {}
+
+
+def test_empty_provider_ignores_model_for_claude_exactly_as_before():
+    """Backwards compatibility, deliberately preserving a documented wart.
+
+    `model` is documented as always applying, but the shipped step wrote it
+    only inside the provider-gated branch. Honoring it would change what
+    existing installs do — a `model` the default backend does not serve
+    currently works because it is ignored, and would start 404ing. Frozen.
+    """
+    routing = route(resolve("claude"), "", "claude-haiku-4-5", "", env())
+    assert routing.env == {}
+
+
+def test_empty_provider_honors_model_for_the_new_agents():
+    """Codex and R-CLI have no shipped behavior to preserve, so they get the
+    documented behavior."""
+    routing = route(resolve("codex"), "", "gpt-5-nano", "", env())
+    assert routing.env == {"CODEX_MODEL": "gpt-5-nano"}
+
+
+# ─── codex: same registry, different API family ─────────────────────────────
+
+def test_codex_routes_at_moonshot():
+    routing = route(
+        resolve("codex"), "moonshot", "", "", env(MOONSHOT_API_KEY="mk")
+    )
+    assert routing.env["CODEX_BASE_URL"] == "https://api.moonshot.ai/v1"
+    assert routing.env["CODEX_API_KEY"] == "mk"
+    # Codex has no default of its own, so the registry's applies.
+    assert routing.env["CODEX_MODEL"] == "kimi-k3"
+
+
+def test_the_same_provider_maps_to_different_endpoints_per_family():
+    """One `provider` value, two protocols. This is the crux of the design:
+    Moonshot serves both families, at different paths."""
+    claude = route(resolve("claude"), "moonshot", "", "", env(MOONSHOT_API_KEY="k"))
+    codex = route(resolve("codex"), "moonshot", "", "", env(MOONSHOT_API_KEY="k"))
+    assert claude.env["ANTHROPIC_BASE_URL"].endswith("/anthropic")
+    assert codex.env["CODEX_BASE_URL"].endswith("/v1")
+
+
+def test_codex_rejects_a_provider_that_does_not_serve_its_family():
+    """Anthropic serves Messages, not Responses. Routing it anyway would be
+    worse than failing, and the message must name a working agent."""
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("codex"), "anthropic", "", "", env(ANTHROPIC_API_KEY="k"))
+    message = str(exc.value)
+    assert "does not serve" in message
+    assert "agent=claude" in message
+
+
+def test_codex_cannot_reach_zai_and_says_so():
+    """z.ai does not serve the OpenAI Responses API — verified with a real
+    key: /api/paas/v4/responses returns 404 while /chat/completions exists.
+
+    It is Chat-Completions-only and codex-cli 0.151.0 removed Chat support,
+    so this pair is impossible rather than merely unproven. Failing fast with
+    a message naming the working agent beats a mid-run 404.
+    """
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("codex"), "zai", "glm-5.3", "", env(ZAI_API_KEY="zk"))
+    message = str(exc.value)
+    assert "does not serve" in message
+    assert "agent=claude" in message
+
+
+def test_claude_still_reaches_zai_directly():
+    """Direct provider access must not depend on any router: a dev with only
+    a ZAI_API_KEY gets a working config."""
+    routing = route(resolve("claude"), "zai", "", "", env(ZAI_API_KEY="zk"))
+    assert routing.env["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
+    assert routing.env["ANTHROPIC_AUTH_TOKEN"] == "zk"
+    assert routing.warnings == [], "a verified direct pair must not warn"
+
+
+def test_verified_pair_does_not_warn():
+    routing = route(
+        resolve("codex"), "moonshot", "", "", env(MOONSHOT_API_KEY="mk")
+    )
+    assert routing.warnings == []
+
+
+# ─── backboard: a native router ─────────────────────────────────────────────
+
+def test_backboard_composes_provider_and_model():
+    routing = route(
+        resolve("backboard"), "openai", "gpt-5.5", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "openai/gpt-5.5"
+
+
+def test_backboard_leaves_a_model_already_prefixed_with_this_provider():
+    routing = route(
+        resolve("backboard"), "openai", "openai/gpt-5.5", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "openai/gpt-5.5"
+
+
+def test_backboard_prefixes_a_multi_segment_model_id():
+    """Backboard ids are often three levels deep — `openrouter/~z-ai/glm-latest`.
+
+    A bare `contains "/"` test read `~z-ai/glm-latest` as already qualified
+    and dropped the provider segment, and the router rejected the id. Found
+    on a real run against the live catalogue.
+    """
+    routing = route(
+        resolve("backboard"), "openrouter", "~z-ai/glm-latest", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "openrouter/~z-ai/glm-latest"
+
+
+def test_backboard_does_not_double_prefix():
+    routing = route(
+        resolve("backboard"), "openrouter", "openrouter/~z-ai/glm-latest", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "openrouter/~z-ai/glm-latest"
+
+
+def test_backboard_sets_no_endpoint():
+    """It resolves models itself; Outrider must not try to point it anywhere."""
+    routing = route(
+        resolve("backboard"), "openai", "gpt-5.5", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert "BACKBOARD_API_URL" not in routing.env
+
+
+def test_backboard_provider_without_a_model_is_an_error():
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("backboard"), "openai", "", "", env(BACKBOARD_API_KEY="bk"))
+    assert "<provider>/<model>" in str(exc.value)
+
+
+# ─── missing credentials ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("agent,provider,secret", [
+    ("claude", "zai", "ZAI_API_KEY"),
+    ("claude", "moonshot", "MOONSHOT_API_KEY"),
+    ("codex", "moonshot", "MOONSHOT_API_KEY"),
+    ("codex", "openai", "OPENAI_API_KEY"),
+])
+def test_missing_secret_names_the_variable(agent, provider, secret):
+    with pytest.raises(RoutingError) as exc:
+        route(resolve(agent), provider, "kimi-k3", "", env())
+    assert secret in str(exc.value)
+
+
+# ─── the matrix is derived, not maintained ──────────────────────────────────
+
+def test_matrix_covers_every_agent():
+    agents = {row["agent"] for row in agent_matrix()}
+    assert agents == set(available())
+
+
+def test_matrix_pairs_are_all_actually_routable():
+    """Every pair the matrix advertises must resolve without error — the docs
+    are generated from this, so an unroutable row would be a false promise."""
+    for row in agent_matrix():
+        if row["provider"].startswith("("):
+            continue  # native router — no provider axis
+        provider = PROVIDERS[row["provider"]]
+        backend = resolve(row["agent"])
+        # provider=custom carries no secret of its own — the credential comes
+        # from the agent's own key var.
+        secret = provider.secret_env or backend.key_env
+        caller = env(**{secret: "test-key"})
+        base = "https://gw.internal/v1" if provider.caller_supplied_endpoint else ""
+        route(resolve(row["agent"]), row["provider"], "m", base, caller)
+
+
+def test_adding_a_provider_needs_no_agent_changes():
+    """Extensibility guard: a new Provider row serving an existing family
+    becomes usable by that family's agents with no other edit."""
+    from agents.providers import Provider
+
+    fake = Provider(
+        id="_fake", display_name="Fake", secret_env="FAKE_API_KEY",
+        endpoints={ApiFamily.OPENAI_RESPONSES: "https://fake.test/v1"},
+        default_model={ApiFamily.OPENAI_RESPONSES: "fake-1"},
+        verified=frozenset({ApiFamily.OPENAI_RESPONSES}),
+    )
+    PROVIDERS["_fake"] = fake
+    try:
+        routing = route(
+            resolve("codex"), "_fake", "", "", env(FAKE_API_KEY="fk")
+        )
+        assert routing.env["CODEX_BASE_URL"] == "https://fake.test/v1"
+        assert routing.env["CODEX_MODEL"] == "fake-1"
+        # And it must NOT become available to an agent speaking another family.
+        with pytest.raises(RoutingError):
+            route(resolve("claude"), "_fake", "", "", env(FAKE_API_KEY="fk"))
+    finally:
+        PROVIDERS.pop("_fake", None)
+
+
+def test_every_agent_declares_an_api_family():
+    for name in available():
+        assert resolve(name).api_family is not None, name
+
+
+def test_auth_style_defaults_to_bearer():
+    """Most gateways are Bearer; only Anthropic's own is x-api-key."""
+    assert PROVIDERS["moonshot"].auth_style(
+        ApiFamily.ANTHROPIC_MESSAGES
+    ) is AuthStyle.BEARER
+    assert PROVIDERS["anthropic"].auth_style(
+        ApiFamily.ANTHROPIC_MESSAGES
+    ) is AuthStyle.API_KEY
+
+
+def test_native_router_accepts_provider_ids_this_registry_never_heard_of():
+    """Backboard's catalogue includes openrouter, cerebras, featherless…
+
+    Outrider never picks an endpoint for a native router, so validating its
+    provider ids against this registry would reject valid combinations and go
+    stale. Unknown ids pass through; the vendor rejects what it doesn't know.
+    """
+    for pid in ("openrouter", "cerebras", "featherless"):
+        routing = route(
+            resolve("backboard"), pid, "some-model", "",
+            env(BACKBOARD_API_KEY="bk"),
+        )
+        assert routing.env["BACKBOARD_MODEL"] == f"{pid}/some-model"
+
+
+def test_a_non_router_agent_still_rejects_an_unknown_provider():
+    """The passthrough is specific to native routers — Claude Code and Codex
+    need a real endpoint, so an id this registry has never heard of must
+    still fail rather than route somewhere arbitrary."""
+    with pytest.raises(RoutingError) as exc:
+        route(resolve("claude"), "some-vendor-we-do-not-know", "x", "", env())
+    assert "unknown provider" in str(exc.value)
+
+
+def test_a_native_router_accepts_the_same_unknown_id():
+    """Same input, opposite outcome — because Backboard resolves it and
+    Outrider does not have to."""
+    routing = route(
+        resolve("backboard"), "some-vendor-we-do-not-know", "m", "",
+        env(BACKBOARD_API_KEY="bk"),
+    )
+    assert routing.env["BACKBOARD_MODEL"] == "some-vendor-we-do-not-know/m"
+
+
+# ─── OpenRouter: the provider every agent can reach ─────────────────────────
+
+def test_openrouter_serves_both_api_families():
+    """One key, one provider id, any agent — which is why it is worth having.
+
+    Probed: /api/v1/responses and /api/v1/messages both answer 401 (the
+    latter in Anthropic's own error shape) while a bogus path on the same
+    host 404s.
+    """
+    provider = PROVIDERS["openrouter"]
+    assert provider.serves(ApiFamily.ANTHROPIC_MESSAGES)
+    assert provider.serves(ApiFamily.OPENAI_RESPONSES)
+
+
+def test_openrouter_base_urls_differ_by_family():
+    """The clients append different suffixes: Claude Code adds /v1/messages
+    to its base, Codex adds /responses. One shared base URL would 404 one of
+    them."""
+    claude = route(resolve("claude"), "openrouter", "z-ai/glm-4.6", "",
+                   env(OPENROUTER_API_KEY="or"))
+    codex = route(resolve("codex"), "openrouter", "z-ai/glm-4.6", "",
+                  env(OPENROUTER_API_KEY="or"))
+    assert claude.env["ANTHROPIC_BASE_URL"] == "https://openrouter.ai/api"
+    assert codex.env["CODEX_BASE_URL"] == "https://openrouter.ai/api/v1"
+
+
+def test_openrouter_uses_bearer_for_claude():
+    routing = route(resolve("claude"), "openrouter", "z-ai/glm-4.6", "",
+                    env(OPENROUTER_API_KEY="or"))
+    assert routing.env["ANTHROPIC_AUTH_TOKEN"] == "or"
+    assert "ANTHROPIC_API_KEY" not in routing.env
+
+
+def test_openrouter_is_reachable_by_every_agent():
+    """The point of the join: one row lights up every agent whose family it
+    serves, and backboard reaches it natively."""
+    reachable = {
+        row["agent"] for row in agent_matrix()
+        if row["provider"] in ("openrouter", "(any — agent-resolved)")
+    }
+    assert reachable == set(available())
+
+
+def test_openrouter_is_verified_on_both_families():
+    """Backed by real completions against z-ai/glm-5.3: /v1/messages returned
+    an Anthropic-shaped message, /v1/responses returned status="completed".
+    So neither pair warns about protocol compatibility any more."""
+    for agent in ("claude", "codex"):
+        routing = route(resolve(agent), "openrouter", "z-ai/glm-5.3", "",
+                        env(OPENROUTER_API_KEY="or"))
+        assert not any("unverified" in w for w in routing.warnings), agent
+
+
+def test_a_provider_with_no_default_model_warns_when_none_is_named():
+    """OpenRouter ids are namespaced (`z-ai/glm-4.6`), so there is no sane
+    default to invent. Without a model the agent sends its own default id,
+    which the provider will not recognise — say so."""
+    routing = route(resolve("claude"), "openrouter", "", "",
+                    env(OPENROUTER_API_KEY="or"))
+    assert any("no model named" in w for w in routing.warnings)
+
+
+def test_a_provider_with_a_default_model_does_not_warn():
+    routing = route(resolve("codex"), "moonshot", "", "",
+                    env(MOONSHOT_API_KEY="mk"))
+    assert not any("no model named" in w for w in routing.warnings)
+
+
+def test_a_vendor_default_provider_clears_any_inherited_base_url():
+    """Without this, a stale base URL wins and the run talks to the wrong
+    vendor using this vendor's key.
+
+    Observed while smoke-testing the matrix: `codex` + `openai` reported
+    `model_backend = "Codex → Moonshot (Kimi)"` and 401'd, because a
+    CODEX_BASE_URL from an earlier step survived. Same reasoning as Claude
+    Code's mutually-exclusive auth vars — an unset value is not enough, it
+    has to be cleared.
+    """
+    routing = route(
+        resolve("codex"), "openai", "gpt-5-nano", "",
+        env(OPENAI_API_KEY="ok", CODEX_BASE_URL="https://stale.example/v1"),
+    )
+    assert routing.env["CODEX_BASE_URL"] == "", "must be actively cleared"
+    assert routing.env["CODEX_API_KEY"] == "ok"
+
+
+def test_an_explicit_endpoint_is_still_honored():
+    routing = route(
+        resolve("codex"), "moonshot", "kimi-k3", "", env(MOONSHOT_API_KEY="mk")
+    )
+    assert routing.env["CODEX_BASE_URL"] == "https://api.moonshot.ai/v1"
+
+
+# ─── a verified provider can still carry a precondition ─────────────────
+
+
+def test_a_verification_caveat_is_warned_at_configure_time():
+    """OpenRouter routes correctly but interacts with a thin balance.
+
+    It reserves the *requested* max_tokens before calling the model, and
+    both CLIs ask for a lot by default (Codex's is 131,072), so a thin
+    balance answers HTTP 402 before the model is reached. Both agents were
+    confirmed with real completions on a zero-balance account using
+    smaller-output models, so the pair stays verified — and saying this
+    while the caller is configuring beats letting them meet a bare 402
+    partway into a dispatch.
+    """
+    routing = route(
+        resolve("codex"), "openrouter", "z-ai/glm-5.3", "",
+        {"OPENROUTER_API_KEY": "k"},
+    )
+    assert any("402" in w for w in routing.warnings)
+    assert any("max_tokens" in w for w in routing.warnings)
+    # It must not claim a paid account is required — it isn't, and an
+    # earlier revision said so.
+    assert not any("paid account" in w for w in routing.warnings)
+
+
+def test_a_provider_with_no_caveat_warns_about_nothing():
+    routing = route(
+        resolve("codex"), "moonshot", "kimi-k3", "",
+        {"MOONSHOT_API_KEY": "k"},
+    )
+    assert routing.warnings == []
+
+
+def test_the_caveat_does_not_replace_the_unverified_warning():
+    """The two are different claims and must not collapse into each other:
+    unverified means we could not confirm the protocol at all, a caveat
+    means we did and it carries a precondition."""
+    routing = route(
+        resolve("codex"), "custom", "m", "https://gw.example/v1",
+        {"CODEX_API_KEY": "k"},
+    )
+    assert not any("funded account" in w for w in routing.warnings)
+
+
+def test_every_caveat_belongs_to_a_verified_provider():
+    """A caveat on an unverified provider would never be reached — the
+    unverified warning wins that branch — so it would be dead data."""
+    for pid, provider in PROVIDERS.items():
+        if provider.verification_caveat:
+            assert provider.verified, (
+                f"{pid} carries a verification_caveat but is unverified, so "
+                f"the caveat can never be surfaced"
+            )
+
+
+def test_a_gateway_run_carries_no_anthropic_key_at_all():
+    """The credential-hygiene reason this matters, not just tidiness.
+
+    Claude Code does not choose between its two credential vars when both
+    are set — verified against a local server, it sends **both headers**:
+
+        Authorization: Bearer <token>
+        x-api-key: <key>
+
+    So on a run routed at z.ai, an unrelated Anthropic key was travelling to
+    z.ai on every request. The gateway reads the Bearer token and ignores
+    the extra header, so the run succeeds and nothing looks wrong — which is
+    why it went unnoticed. The clear that was supposed to prevent it was
+    itself overridden by the caller's `env:` block.
+
+    Asserted against the launch environment, which is what the agent gets.
+    """
+    backend = resolve("claude")
+    for provider in ("zai", "moonshot", "openrouter"):
+        secret = PROVIDERS[provider].secret_env
+        routing = route(backend, provider, "m", "", env(**{secret: "vendor"}))
+        launched_env = dict(routing.env)
+        launched_env["ANTHROPIC_API_KEY"] = "sk-ant-REAL"   # caller's key
+        import os
+        saved = {k: os.environ.get(k) for k in launched_env}
+        try:
+            os.environ.update(launched_env)
+            launched = backend.subprocess_env()
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        assert "ANTHROPIC_API_KEY" not in launched, (
+            f"an Anthropic key would be sent to {provider} as x-api-key"
+        )
+
+
+def test_the_auth_var_choice_is_recorded_not_inferred():
+    """Presence is not the same question as selection.
+
+    Inferring "Bearer if a token is present" looked equivalent and is not: a
+    caller can hold a stale ANTHROPIC_AUTH_TOKEN secret and select
+    provider=anthropic, and inference would then send Bearer to Anthropic and
+    earn a 401 on a configuration that works today.
+    """
+    import os
+
+    backend = resolve("claude")
+    routing = route(backend, "anthropic", "", "", env(ANTHROPIC_API_KEY="ak"))
+    assert routing.env[backend.AUTH_VAR_MARKER] == "ANTHROPIC_API_KEY"
+
+    saved = {k: os.environ.get(k) for k in
+             ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+              backend.AUTH_VAR_MARKER)}
+    try:
+        os.environ["ANTHROPIC_API_KEY"] = "ak"
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = "stale-gateway-token"
+        os.environ.update(routing.env)
+        launched = backend.subprocess_env()
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert launched["ANTHROPIC_API_KEY"] == "ak"
+    assert "ANTHROPIC_AUTH_TOKEN" not in launched
+
+
+def test_a_caller_supplied_endpoint_records_no_choice():
+    """`provider: custom` means the caller owns the auth decision, so nothing
+    is dropped — they may legitimately have supplied either var."""
+    backend = resolve("claude")
+    routing = route(backend, "custom", "", "https://gw.example/v1",
+                    env(ANTHROPIC_API_KEY="caller-key"))
+    assert backend.AUTH_VAR_MARKER not in routing.env
+
+
+def test_the_marker_never_reaches_the_agent():
+    """It is this action's bookkeeping, not something Claude Code reads."""
+    import os
+
+    backend = resolve("claude")
+    saved = os.environ.get(backend.AUTH_VAR_MARKER)
+    try:
+        os.environ[backend.AUTH_VAR_MARKER] = "ANTHROPIC_API_KEY"
+        assert backend.AUTH_VAR_MARKER not in backend.subprocess_env()
+    finally:
+        if saved is None:
+            os.environ.pop(backend.AUTH_VAR_MARKER, None)
+        else:
+            os.environ[backend.AUTH_VAR_MARKER] = saved

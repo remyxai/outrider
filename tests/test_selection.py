@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import run  # noqa: E402
+from agents.claude import normalize_events  # noqa: E402
 from run import Target  # noqa: E402
 
 
@@ -229,7 +230,7 @@ def test_select_attaches_coverage_telemetry(tmp_path, monkeypatch):
     """Every parseable verdict carries selection_coverage +
     selection_context_efficiency, computed from the transcript."""
     geo, count = _make_candidates()
-    events = [
+    events = normalize_events([
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash",
              "input": {"command": 'gh search code "load_dataset" --repo o/r'}},
@@ -242,7 +243,7 @@ def test_select_attaches_coverage_telemetry(tmp_path, monkeypatch):
             {"type": "tool_result", "tool_use_id": "t2",
              "content": "\n".join(f"line{i}" for i in range(200))},
         ]}},
-    ]
+    ])
     monkeypatch.setattr(
         run, "_run_claude_oneshot_streaming",
         lambda wd, p, t, **kw: (

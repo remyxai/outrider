@@ -159,7 +159,7 @@ def test_step_summary_credit_balance_renders_topup_section(tmp_path, monkeypatch
     }, tmp_path, monkeypatch)
     assert "Anthropic credit balance exhausted" in out
     assert "console.anthropic.com/settings/billing" in out
-    assert "4 Claude calls" in out
+    assert "4 Claude Code calls" in out  # names the agent, not "Claude"
 
 
 def test_step_summary_invalid_key_renders_secret_section(tmp_path, monkeypatch):
@@ -188,7 +188,8 @@ def test_step_summary_unknown_failure_renders_tail(tmp_path, monkeypatch):
         "claude_log_tail": "Unexpected error: model returned malformed json",
     }, tmp_path, monkeypatch)
     # Generic failures fall through to a collapsed details block with the tail.
-    assert "Claude agent failure tail" in out
+    assert "Claude Code failure tail" in out  # names the agent precisely;
+    # was "Claude agent failure tail" before the port made it per-agent
     assert "malformed json" in out
     # Specific-action sections should NOT fire.
     assert "Anthropic credit balance" not in out
@@ -202,7 +203,9 @@ def test_step_summary_succeeds_when_claude_log_tail_missing(tmp_path, monkeypatc
         "claude_calls": 0,
     }, tmp_path, monkeypatch)
     # Headline still renders even without the tail-derived action block.
-    assert "claude_failed" in out
+    # Displayed form is agent-neutral; the stored/posted value is still
+    # `claude_failed` (see test_agent_cross_phase.py).
+    assert "agent_failed" in out
     # No specific-action section fires when there's no tail content.
     assert "Anthropic credit balance" not in out
     assert "ANTHROPIC_API_KEY secret invalid" not in out

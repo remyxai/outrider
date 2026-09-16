@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import run  # noqa: E402
+from agents.claude import normalize_events  # noqa: E402
 
 
 # ── segment-aware shell classifier ─────────────────────────────────────────
@@ -53,16 +54,37 @@ def test_classify_head_with_file_vs_stdin():
 
 # ── tool_use classification (native tools) ──────────────────────────────────
 
-def test_classify_native_read_and_grep():
-    assert run._classify_tool_use("Read", {"file_path": "x.py"}) == ["file_read"]
-    assert run._classify_tool_use("Grep", {"pattern": "x"}) == ["search"]
-    assert run._classify_tool_use("WebFetch", {"url": "http://x"}) == ["file_read"]
+def test_classify_normalized_tools():
+    """Classification keys off the neutral verb, not a vendor tool name.
+
+    That is what makes the same coverage numbers comparable across agents:
+    Claude's `Read`, Codex's `file_change` and R-CLI's `read` all arrive here
+    as "read".
+    """
+    assert run._classify_tool_use("read") == ["file_read"]
+    assert run._classify_tool_use("search") == ["search"]
+    assert run._classify_tool_use("glob") == ["search"]
+    assert run._classify_tool_use("web_fetch") == ["file_read"]
+    # A web *search* is not a repo file read.
+    assert run._classify_tool_use("web_search") == []
+    assert run._classify_tool_use("write") == []
+
+
+def test_classify_shell_still_inspects_the_command():
+    """`grep`-shaped shell work is a search whichever CLI ran it."""
+    assert run._classify_tool_use(
+        "execute", 'gh search code "x" --repo o/r') == ["search"]
 
 
 # ── transcript → coverage ───────────────────────────────────────────────────
 
 def _events():
-    return [
+    """A real Claude-shaped transcript, normalized the way a run would be.
+
+    The parsers consume agents.base.Event now; authoring the fixture in the
+    vendor shape keeps this suite covering the adapter as well.
+    """
+    return normalize_events([
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "s1", "name": "Bash",
              "input": {"command": 'gh search code "foo" --repo o/r'}},
@@ -83,7 +105,7 @@ def _events():
             {"type": "tool_result", "tool_use_id": "r2",
              "content": [{"type": "text", "text": "x\ny\nz"}]},
         ]}},
-    ]
+    ])
 
 
 def test_coverage_counts_and_ratio():
@@ -107,7 +129,7 @@ def test_coverage_empty_transcript():
 
 def test_coverage_result_lines_only_for_reads():
     # A search's tool_result must not contribute to visible_lines.
-    events = [
+    events = normalize_events([
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "s1", "name": "Grep",
              "input": {"pattern": "x"}},
@@ -116,7 +138,7 @@ def test_coverage_result_lines_only_for_reads():
             {"type": "tool_result", "tool_use_id": "s1",
              "content": "hit1\nhit2\nhit3"},
         ]}},
-    ]
+    ])
     cov = run._selection_coverage_from_events(events)
     assert cov["searches"] == 1
     assert cov["visible_lines"] == 0

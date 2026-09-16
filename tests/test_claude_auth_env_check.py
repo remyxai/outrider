@@ -79,18 +79,27 @@ def test_non_default_backend_literal_dash_fails(monkeypatch):
     assert ok is False
 
 
-def test_non_default_backend_both_vars_set_warns(monkeypatch):
-    """Both auth vars set under a non-default backend — Claude Code
-    prefers API_KEY which non-Anthropic backends reject. Warn (don't
-    fail) since the AUTH_TOKEN value may still be the intended one,
-    but flag the likely workflow bug."""
+def test_non_default_backend_both_vars_set_does_not_warn(monkeypatch):
+    """Both credential vars in scope is normal, so it must not warn.
+
+    A workflow declares every vendor's secret so `provider` stays switchable
+    per dispatch — so a run routed at a gateway *always* has an Anthropic key
+    in scope. This used to warn, and the warning was wrong twice over: Claude
+    Code does not "prefer ANTHROPIC_API_KEY" (given both it sends **both**
+    headers, verified against a local server), and the remedy it offered —
+    "set only ANTHROPIC_AUTH_TOKEN" — was not something a caller could act
+    on.
+
+    Warning on an expected, already-handled state is how operators learn to
+    ignore warnings. The condition is resolved at launch instead: the agent
+    gets only the credential routing selected.
+    """
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fakebutlongenoughxxxx")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "zai-fakebutlongenoughxxxx")
     ok, warnings = run._validate_claude_auth_env()
     assert ok is True
-    assert any("Both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN" in w
-               for w in warnings)
+    assert not any("Both ANTHROPIC_API_KEY" in w for w in warnings), warnings
 
 
 def test_default_backend_with_both_vars_does_not_warn(monkeypatch):

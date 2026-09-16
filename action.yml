@@ -13,6 +13,15 @@ inputs:
   mode:
     description: |
       Run mode:
+        - "smoke": verify this repo's agent / provider / model wiring
+          in seconds and exit. Resolves routing, runs the agent's
+          preflight, then makes ONE trivial agent call with a 1-turn
+          cap. It reaches the vendor for real, so it catches a wrong
+          secret, a bad endpoint, a model id from another vendor's
+          vocabulary, or an exhausted quota — without cloning, without
+          opening anything, and without doing any work. Use it after
+          changing `agent`, `provider`, `model` or a secret, instead of
+          waiting on a full dispatch to find out.
         - "recommend" (default): scout a paper, draft a PR or open an
           Issue — the classic per-run flow.
         - "weekly-summary": aggregate the past 7 days of Outrider runs
@@ -233,6 +242,19 @@ inputs:
       a larger pool just widens the window the selection pass sees).
     required: false
     default: '25'
+  agent-timeout:
+    description: |
+      Wall-clock seconds for each coding-agent phase (selection, deep-search,
+      preflight, audit, implementation, self-review).
+
+      Generalized name for `claude-timeout`, which still works and always
+      will — pass either. If both are set this one wins. Neither agent added
+      in the agent port has a round-limit flag, so on `codex` and `backboard`
+      this is the *only* spend bound: keep it tight on cron-driven installs,
+      and comfortably below the job's own `timeout-minutes` so one slow phase
+      cannot consume the whole run.
+    required: false
+    default: ''
   claude-timeout:
     description: |
       Wall-clock seconds for the Claude Code agent calls (preflight
@@ -368,43 +390,86 @@ inputs:
     default: ''
   model-base-url:
     description: |
-      Optional override for the Claude Code subprocess's ANTHROPIC_BASE_URL.
-      Use this to route the coding agent to any Anthropic-Messages-compatible
-      backend — e.g. z.ai's GLM Coding Plan, AWS Bedrock, GCP Vertex, an
-      on-prem proxy. The ANTHROPIC_API_KEY repo secret should hold the
-      backend's API key when this is set, not your Anthropic key. Empty
-      (default) = api.anthropic.com. Note: when set, the `total_cost_usd`
-      that the Claude Code CLI reports is computed with Anthropic-rate
-      pricing applied to the backend's tokens — it's an estimate, not a
-      bill. Token counts remain accurate.
+      Optional endpoint override for the selected agent — the action sets
+      that agent's own base-URL env var (`ANTHROPIC_BASE_URL`,
+      `CODEX_BASE_URL`, ...). Use it to reach any backend that speaks the
+      API family the agent speaks: an on-prem gateway, AWS Bedrock, GCP
+      Vertex, or a vendor not in the registry. The endpoint must serve
+      the agent's family — `docs/backends.md` names which family each
+      agent speaks. Empty (default) = the agent's vendor default.
 
-      For the known backends `zai` / `moonshot`, prefer the `provider`
-      input below — it configures both this URL and the correct auth env
-      var (Bearer vs x-api-key) from a single field, and picks up the
-      right per-vendor secret without a fork-side case-switch. Use
-      `model-base-url` directly only for custom / on-prem endpoints not
-      covered by the `provider` shortlist.
+      Prefer the `provider` input for any backend the registry already
+      knows. It sets this URL, the credential *and* the correct auth
+      header style (Bearer vs x-api-key) from a single field, and picks
+      up the right per-vendor secret without a fork-side case-switch.
+      Reach for `model-base-url` only for endpoints `provider` does not
+      cover, in which case pair it with `provider: custom`.
+
+      Note on cost when you point an agent off its vendor: a dollar
+      figure the agent's own CLI reports is computed with that vendor's
+      pricing applied to another backend's tokens, so Outrider ignores it
+      and resolves cost from the per-host rate table instead
+      (`cost_basis: backend_rate_table`). With no rate row for the host
+      it reports `cost_basis: unavailable` rather than a fabricated
+      `$0.00`. Token counts stay exact either way.
+    required: false
+    default: ''
+  agent:
+    description: |
+      Which coding-agent CLI runs the implementation. This is a separate
+      axis from `provider`, which selects the *model* backend: the same
+      agent can route at several models, and not every pair is meaningful.
+
+      Recognized values:
+        - `` (empty, default) or `claude`: Claude Code. Existing behavior,
+          byte-for-byte — every pre-existing workflow keeps this path.
+        - `codex`: OpenAI Codex (`codex exec`). Requires `CODEX_API_KEY` in
+          the caller's env block. Reports tokens but no dollar figure, and
+          has no round-limit flag, so `claude-timeout` is the only spend
+          bound — keep it tight.
+        - `backboard`: Backboard R-CLI. Requires `BACKBOARD_API_KEY` in the
+          caller's env block. Reports authoritative cost. Also has no
+          round-limit flag.
+
+      `provider` applies to `claude` and `codex`, but they reach different
+      endpoint families: `claude` routes over Anthropic *Messages*-compatible
+      backends, `codex` over OpenAI *Responses*-compatible ones. Moonshot
+      serves both, so `provider: moonshot` works with either agent. `backboard`
+      carries its own router, and composes the two into R-CLI's own
+      `<provider>/<model>` form — so `provider: openai` + `model: gpt-5.5`
+      does the right thing there too.
+
+      Capability differences degrade telemetry, never the run: a backend
+      that reports no dollars is recorded as `cost_basis: unavailable`
+      rather than $0.00, and one that reports no tool transcript runs the
+      selection coverage gate in observe mode instead of failing every pick.
     required: false
     default: ''
   provider:
     description: |
-      Which Anthropic-Messages-compatible backend to route the coding
-      agent at. Consolidates the auth-env + base-URL wiring that forks
-      previously duplicated in a workflow-level Configure step.
+      Which model backend to route the coding agent at. A separate axis
+      from `agent`, which selects the agent CLI itself. Consolidates the
+      auth-env + base-URL wiring that forks previously duplicated in a
+      workflow-level Configure step.
+
+      An agent speaks one API family and a provider serves one or more,
+      so only pairs that share a family are valid. The action resolves
+      that itself and rejects an impossible pair up front, naming the
+      agent that *does* serve your provider. The full pair table is in
+      docs/backends.md — generated from the same registry the action
+      reads, so it cannot drift from the code.
 
       Recognized values:
         - `` (empty, default): existing behavior — pass through
           `model-base-url` as-is, no auth manipulation. Backward-compatible.
-        - `anthropic`: default Anthropic API. Requires `ANTHROPIC_API_KEY`
-          in the caller's env block.
-        - `zai`: z.ai GLM Coding Plan. Requires `ZAI_API_KEY` in the
-          caller's env block. Sets `ANTHROPIC_AUTH_TOKEN` (Bearer) and
-          `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`.
-        - `moonshot`: Moonshot Kimi. Requires `MOONSHOT_API_KEY` in the
-          caller's env block. Sets `ANTHROPIC_AUTH_TOKEN` (Bearer) and
-          `ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic`.
+        - a named provider — `anthropic`, `openai`, `zai`, `moonshot`,
+          `openrouter` at time of writing. The action sets the selected
+          agent's credential, endpoint and model env vars for you, with
+          the right auth header style for that vendor. Each provider
+          reads its own conventionally-named secret: `ZAI_API_KEY` for
+          `zai`, `MOONSHOT_API_KEY` for `moonshot`, and so on.
         - `custom`: use `model-base-url` + caller-supplied auth env var
-          for anything not in the shortlist above.
+          for anything not in the registry.
 
       Secrets aren't magically visible inside the composite action — the
       caller MUST pass the required secret via the `env:` block on the
@@ -415,17 +480,27 @@ inputs:
     default: ''
   model:
     description: |
-      Optional model name — sets `ANTHROPIC_MODEL` for the Claude Code
-      subprocess. When set, cost telemetry looks up the specific per-model
-      rate in the backend rate table (see `_BACKEND_RATES` in src/run.py)
+      Optional model id for whichever agent is selected — the action sets
+      that agent's own model env var (`ANTHROPIC_MODEL`, `CODEX_MODEL`,
+      ...). When set, cost telemetry looks up the specific per-model rate
+      in the backend rate table (see `_BACKEND_RATES` in src/run.py)
       rather than falling back to the host's flagship-tier default.
 
-      Examples: `claude-opus-4-8`, `claude-haiku-4-5`, `glm-5.2`,
-      `glm-4.6`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`.
+      Use the id your provider lists, not another vendor's — a model id
+      from the wrong vocabulary is the most common misconfiguration here.
+      Examples: `claude-opus-4-8` or `claude-haiku-4-5` on `anthropic`,
+      `glm-5.3` on `zai`, `kimi-k3` or `kimi-k2.7-code` on `moonshot`,
+      `gpt-5.4-mini` on `openai`, and namespaced ids on a gateway
+      (`z-ai/glm-5.3` on `openrouter`). R-CLI addresses models as
+      `<provider>/<model>`; the action composes that form for you, so
+      pass the bare id there too.
 
-      Empty (default) → the caller's own `ANTHROPIC_MODEL` env var wins if
-      set; otherwise the backend picks its own default and cost telemetry
-      uses the host's flagship-tier rates.
+      `mode: smoke` checks a model id against the vendor for real in
+      seconds — cheaper than discovering it mid-dispatch.
+
+      Empty (default) → the caller's own model env var wins if set;
+      otherwise the agent picks its own default and cost telemetry uses
+      the host's flagship-tier rates.
     required: false
     default: ''
   enable-cocoindex:
@@ -490,16 +565,73 @@ runs:
       with:
         python-version: '3.11'
 
-    - name: Set up Node (for Claude Code CLI)
+    - name: Configure the model backend
+      shell: bash
+      # One step for every agent. All routing knowledge lives in
+      # src/agents/providers.py, so adding a provider or an agent never
+      # requires editing this file again — and the docs table is generated
+      # from the same registry, so the two cannot drift.
+      #
+      # Composite-action env inheritance: the caller's `env:` block on the
+      # `- uses: remyxai/outrider@v1` step propagates to every step here, so
+      # whichever vendor secrets the caller passed are readable directly.
+      # Writing to $GITHUB_ENV makes the resolved credential / base URL /
+      # model visible to the recommend step that runs run.py.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
+      run: python ${{ github.action_path }}/src/configure_backend.py
+
+    - name: Set up Node (for the agent CLI)
       uses: actions/setup-node@v4
       with:
         node-version: '20'
 
-    - name: Install Claude Code CLI
+    - name: Install the coding-agent CLI
       shell: bash
+      # One agent per run. Installing only the selected CLI keeps the common
+      # (Claude Code) path's install time unchanged.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
       run: |
-        npm install -g @anthropic-ai/claude-code
-        claude --version
+        set -eu
+        case "${INPUT_AGENT:-}" in
+          ''|claude)
+            npm install -g @anthropic-ai/claude-code
+            claude --version
+            ;;
+          codex)
+            npm install -g @openai/codex
+            codex --version
+            ;;
+          backboard)
+            # Native binary (~99 MB), not an npm package.
+            #
+            # BACKBOARD_INSTALL must be *exported*, not prefixed onto the
+            # pipeline: `VAR=x curl ... | sh` sets VAR for curl, not for the
+            # sh that actually runs the installer, so the install silently
+            # lands in $HOME/.backboard and any hardcoded path 127s.
+            export BACKBOARD_INSTALL="$RUNNER_TEMP/backboard"
+            curl -fsSL https://app.backboard.io/api/cli | sh
+            # Resolve wherever it actually landed: the installer also links
+            # the binary onto PATH itself, so accept either location rather
+            # than depending on one layout staying put.
+            BB="$BACKBOARD_INSTALL/bin/backboard"
+            [ -x "$BB" ] || BB="$(command -v backboard || true)"
+            if [ -z "$BB" ] || [ ! -x "$BB" ]; then
+              echo "::error::backboard CLI not found after install" >&2
+              exit 1
+            fi
+            dirname "$BB" >> "$GITHUB_PATH"
+            "$BB" --version
+            ;;
+          *)
+            echo "::error::unknown agent '$INPUT_AGENT'; must be one of: claude, codex, backboard" >&2
+            exit 1
+            ;;
+        esac
 
     - name: Install pytest + remyxai CLI + pyyaml (validation + selection-pass tool-use + repo-intel loader)
       shell: bash
@@ -523,56 +655,71 @@ runs:
         install -m 0755 "${{ github.action_path }}/src/gh_graph.py" /usr/local/bin/gh-graph
         gh-graph --selftest
 
-    - name: Install cocoindex-code as Claude Code skill
+    - name: Install cocoindex-code AST search
+      # Gated: the install pulls ~1 GB of torch/transformers and adds 60-90s
+      # to every run, which the input exists to let a caller opt out of. The
+      # guard was lost when this step was rewritten to be agent-aware, which
+      # made the input a no-op and the opt-out a lie.
+      id: cocoindex
       if: ${{ inputs.enable-cocoindex == 'true' }}
       shell: bash
-      # Attach cocoindex-code as a Claude Code skill so the Outrider agent
-      # can perform AST-based semantic code search during selection and
-      # implementation, and so the convention-precedents enrichment on
-      # Issue bodies has ccc on PATH to enumerate structural precedents
-      # for sibling claims. Costs ~60-90s runner time on install; free
-      # thereafter. Set enable-cocoindex=false to skip.
-      #
-      # Idempotent — if the workflow already installed cocoindex (older
-      # setup-local flow from v0.4.4), the `command -v` guard skips the
-      # duplicate install.
+      # The `ccc` binary is the portable surface: every agent has a shell
+      # tool, so a binary on PATH works for all of them. The skill wrapper is
+      # agent-native and only installed where the agent actually reads one —
+      # the backend declares that via `skills_home`.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
       run: |
+        set -eu
         if ! command -v ccc >/dev/null 2>&1; then
           pipx install 'cocoindex-code[full]'
         fi
-        mkdir -p ~/.claude/skills
-        if [ ! -e ~/.claude/skills/cocoindex-code ]; then
-          git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
-          ln -sfn /tmp/cocoindex-code ~/.claude/skills/cocoindex-code
+        SKILLS_HOME=$(python "${{ github.action_path }}/src/agent_tooling.py" --skills-home)
+        if [ -n "$SKILLS_HOME" ]; then
+          mkdir -p "$HOME/$SKILLS_HOME"
+          if [ ! -e "$HOME/$SKILLS_HOME/cocoindex-code" ]; then
+            git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
+            ln -sfn /tmp/cocoindex-code "$HOME/$SKILLS_HOME/cocoindex-code"
+          fi
+          echo "installed cocoindex-code skill into ~/$SKILLS_HOME"
+        else
+          echo "agent has no skills mechanism — ccc is reachable on PATH only"
         fi
-        # Sanity check that ccc is on PATH. `ccc --version` would need a
-        # dedicated version flag that the typer app doesn't expose (raises
-        # a red "No such option" error box that scares readers even when
+        # `ccc --version` needs a flag the typer app doesn't expose (it
+        # raises a red "No such option" box that scares readers even when
         # suppressed). `command -v` is quiet and definitive.
-        command -v ccc >/dev/null 2>&1 && echo "ccc installed: $(command -v ccc)" || echo "warning: ccc not on PATH after install"
+        if command -v ccc >/dev/null 2>&1; then
+          echo "ccc on PATH"
+          echo "installed=true" >> "$GITHUB_OUTPUT"
+        else
+          # Non-fatal by design, but it has to be *recorded*: the next step
+          # writes the file that tells the agent this tool exists, and an
+          # agent sent after a binary that is not there reads as the model
+          # ignoring instructions. Seen on a real run, where the install
+          # failed and ENVIRONMENTS.md advertised ccc anyway.
+          echo "WARNING: ccc missing"
+          echo "installed=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Write ENVIRONMENTS.md so the selection agent knows ccc is available
-      if: ${{ inputs.enable-cocoindex == 'true' }}
+      # Same gate, plus the install's own verdict: advertising a tool that was
+      # not installed — because the caller opted out, or because the install
+      # failed — sends the agent after a binary that is not there.
+      if: ${{ inputs.enable-cocoindex == 'true' && steps.cocoindex.outputs.installed == 'true' }}
       shell: bash
-      # ENVIRONMENTS.md is read by the selection pass in run.py to surface
-      # workflow-attached tooling to the agent. Written to CWD (the target
-      # repo checkout) so the selection agent picks it up during the same
-      # run. Not committed — this is a runtime file only.
-      #
-      # Only writes when no ENVIRONMENTS.md exists — respects a
-      # user-customized file listing additional workflow-attached tools.
+      # The surface text names the invocation path the ACTIVE agent actually
+      # has. Telling Codex or R-CLI about a "/ccc slash command" sends them
+      # looking for a command they cannot run.
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
       run: |
+        set -eu
         if [ ! -f ENVIRONMENTS.md ]; then
-          cat > ENVIRONMENTS.md <<'EOF'
-        - title: cocoindex-code AST search available
-          description: cocoindex-code AST-based semantic code search is pre-installed as a Claude Code skill.
-          resource: https://github.com/cocoindex-io/cocoindex-code
-          tags: [outrider, environment, cocoindex-code, ast-search]
-          surface: |
-            # Environment: cocoindex-code AST search
-            - Available as a Claude Code skill for grounding call-site claims on real AST paths.
-            - Invocable via /ccc slash command or ambient use during selection/implementation.
-        EOF
+          python "${{ github.action_path }}/src/agent_tooling.py" \
+            --environments-md > ENVIRONMENTS.md
+          echo "wrote ENVIRONMENTS.md for agent=${INPUT_AGENT:-claude}"
+        else
+          echo "ENVIRONMENTS.md already present — leaving the repo's own file"
         fi
 
     - name: Configure git identity
@@ -587,84 +734,6 @@ runs:
         git config --global user.name "remyx-ai[bot]"
         git config --global user.email "289541483+remyx-ai[bot]@users.noreply.github.com"
 
-    - name: Configure backend from provider input
-      if: ${{ inputs.provider != '' }}
-      shell: bash
-      # Consolidates the per-fork Configure step that previously mapped
-      # `provider` → (auth env var, base URL, secret name). Runs only when
-      # the caller sets `provider`; empty (default) preserves existing
-      # behavior — model-base-url and auth env vars pass through untouched.
-      #
-      # Composite-action env inheritance: the caller's `env:` block on the
-      # `- uses: remyxai/outrider@v1` step propagates to every step here,
-      # so ANTHROPIC_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY (whichever
-      # the caller passed) are readable via os.environ / bash env directly.
-      # Writing to $GITHUB_ENV makes the resulting ANTHROPIC_AUTH_TOKEN /
-      # ANTHROPIC_BASE_URL visible to subsequent composite steps (including
-      # the recommend step that runs run.py).
-      env:
-        INPUT_PROVIDER: ${{ inputs.provider }}
-        INPUT_MODEL: ${{ inputs.model }}
-        INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
-      run: |
-        set -eu
-        # Mutual-exclusion enforcement: callers typically pass every backend's
-        # secret via the top-level env block ({ANTHROPIC,ZAI,MOONSHOT}_API_KEY
-        # all set) so `provider` can be dispatch-time-switchable. Per the
-        # docs/backends.md auth-header matrix, having both ANTHROPIC_API_KEY
-        # and ANTHROPIC_AUTH_TOKEN set makes Claude Code prefer x-api-key —
-        # which non-Anthropic backends reject with 401. Each branch below
-        # clears the non-selected auth var to $GITHUB_ENV (empty string,
-        # which Claude Code and the CLI's auth validator both treat as
-        # unset for the mutual-exclusion check).
-        case "$INPUT_PROVIDER" in
-          anthropic)
-            if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-              echo "::error::provider=anthropic requires ANTHROPIC_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            # ANTHROPIC_API_KEY is already in the parent env — no override needed
-            echo "ANTHROPIC_AUTH_TOKEN=" >> "$GITHUB_ENV"
-            ;;
-          zai)
-            if [ -z "${ZAI_API_KEY:-}" ]; then
-              echo "::error::provider=zai requires ZAI_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_API_KEY=" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic" >> "$GITHUB_ENV"
-            ;;
-          moonshot)
-            if [ -z "${MOONSHOT_API_KEY:-}" ]; then
-              echo "::error::provider=moonshot requires MOONSHOT_API_KEY in the caller's env block" >&2
-              exit 1
-            fi
-            echo "ANTHROPIC_AUTH_TOKEN=$MOONSHOT_API_KEY" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_API_KEY=" >> "$GITHUB_ENV"
-            echo "ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic" >> "$GITHUB_ENV"
-            ;;
-          custom)
-            if [ -z "$INPUT_MODEL_BASE_URL" ]; then
-              echo "::error::provider=custom requires model-base-url to be set" >&2
-              exit 1
-            fi
-            if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
-              echo "::error::provider=custom requires ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in the caller's env block" >&2
-              exit 1
-            fi
-            # model-base-url passes through via INPUT_MODEL_BASE_URL to run.py.
-            # No clearing here — caller supplied exactly what they want.
-            ;;
-          *)
-            echo "::error::unknown provider '$INPUT_PROVIDER'; must be one of: anthropic, zai, moonshot, custom" >&2
-            exit 1
-            ;;
-        esac
-        if [ -n "$INPUT_MODEL" ]; then
-          echo "ANTHROPIC_MODEL=$INPUT_MODEL" >> "$GITHUB_ENV"
-        fi
-
     - name: Recommend + implement + open PR
       id: recommend
       shell: bash
@@ -678,6 +747,13 @@ runs:
         # right operand — observed via the v1.0.3 push failure.)
         GITHUB_TOKEN: ${{ github.token }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        # The provider axis, so a failure message can name the secret that
+        # actually needs fixing. Composite-action inputs are NOT auto-exposed
+        # as INPUT_* to a `run:` step, so without this the provider-specific
+        # remedy ("set ZAI_API_KEY") silently degraded to the agent's own
+        # credential name on every routed run. (INPUT_AGENT is already set
+        # further down this same block.)
+        INPUT_PROVIDER: ${{ inputs.provider }}
         TARGET_REPO: ${{ github.repository }}
         INPUT_INTEREST_ID: ${{ inputs.interest-id }}
         INPUT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
@@ -688,6 +764,8 @@ runs:
         INPUT_TEST_INTEGRATION_POLICY: ${{ inputs.test-integration-policy }}
         INPUT_FIDELITY_POLICY: ${{ inputs.fidelity-policy }}
         INPUT_CLAUDE_TIMEOUT: ${{ inputs.claude-timeout }}
+        # Generalized alias; run.py prefers this when both are set.
+        INPUT_AGENT_TIMEOUT: ${{ inputs.agent-timeout }}
         INPUT_PIN_ARXIV: ${{ inputs.pin-arxiv }}
         INPUT_SEARCH_METHOD: ${{ inputs.search-method }}
         INPUT_PUBLISH: ${{ inputs.publish }}
@@ -707,6 +785,8 @@ runs:
         # Inline refinement chain toggle (recommend mode continues into
         # fidelity → convention → test by default; 'false' opts out).
         INPUT_CHAIN: ${{ inputs.chain }}
+        # Which coding-agent CLI run.py drives. Empty = Claude Code.
+        INPUT_AGENT: ${{ inputs.agent }}
         # Weekly Discussion summary (opt-in second scheduled job).
         REMYX_MODE: ${{ inputs.mode }}
         REMYX_WEEKLY_DISCUSSION_ID: ${{ inputs.weekly-discussion-id }}

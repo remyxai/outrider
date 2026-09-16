@@ -17,6 +17,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import run  # noqa: E402  (existing, non-new call-site module)
 import exploration_structure as es  # noqa: E402
+from agents.claude import normalize_events  # noqa: E402
+
+
+def _norm(events):
+    """Raw Claude-shaped transcript -> normalized events.
+
+    These fixtures are authored in the vendor shape on purpose: the parsers
+    consume agents.base.Event now, so running them through the adapter keeps
+    this suite covering normalization as well as the structure classifier.
+    """
+    return normalize_events(events)
+
 
 
 def _read(turn_paths):
@@ -56,7 +68,7 @@ def test_bash_skips_urls_and_flags():
 def test_linear_single_subsystem():
     # One read per step, all under src/ → the paper's structural-mismatch shape.
     events = [_read(["src/a.py"]), _read(["src/b.py"]), _read(["src/c.py"])]
-    out = es.exploration_structure_from_events(events)
+    out = es.exploration_structure_from_events(_norm(events))
     assert out["structure"] == "linear"
     assert out["domains"] == 1
     assert out["linearity"] == 1.0
@@ -70,7 +82,7 @@ def test_domain_scoped_parallel_branching():
         _read(["src/run.py", "tests/test_run.py", "docs/guide.md"]),
         _read(["src/gh_graph.py", "tests/test_axis.py"]),
     ]
-    out = es.exploration_structure_from_events(events)
+    out = es.exploration_structure_from_events(_norm(events))
     assert out["structure"] == "domain-scoped"
     assert out["domains"] == 3
     assert out["parallel_turns"] == 2
@@ -82,14 +94,14 @@ def test_domain_scoped_parallel_branching():
 def test_branching_within_one_subsystem():
     # Batched, but every read stays in src/ → branching, not domain-scoped.
     events = [_read(["src/a.py", "src/b.py"])]
-    out = es.exploration_structure_from_events(events)
+    out = es.exploration_structure_from_events(_norm(events))
     assert out["structure"] == "branching"
     assert out["domains"] == 1
 
 
 def test_domain_switches_counted_in_order():
     events = [_read(["src/a.py"]), _read(["tests/b.py"]), _read(["src/c.py"])]
-    out = es.exploration_structure_from_events(events)
+    out = es.exploration_structure_from_events(_norm(events))
     # src → tests → src = 2 switches; sequential single steps over 2 domains
     # with ≥2 switches still reads as domain-scoped.
     assert out["domain_switches"] == 2
@@ -97,15 +109,15 @@ def test_domain_switches_counted_in_order():
 
 
 def test_empty_and_no_path_events():
-    assert es.exploration_structure_from_events([])["structure"] == "none"
+    assert es.exploration_structure_from_events(_norm([]))["structure"] == "none"
     no_path = [{"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": "s1", "name": "Grep",
          "input": {"pattern": "x"}}]}}]
-    assert es.exploration_structure_from_events(no_path)["structure"] == "none"
+    assert es.exploration_structure_from_events(_norm(no_path))["structure"] == "none"
 
 
 def test_summary_string_is_human_readable():
-    out = es.exploration_structure_from_events([_read(["src/a.py"])])
+    out = es.exploration_structure_from_events(_norm([_read(["src/a.py"])]))
     s = es.structure_summary(out)
     assert "linear" in s and "domains" in s
 
@@ -124,7 +136,7 @@ def test_coverage_merges_structure_dimension():
             {"type": "tool_result", "tool_use_id": "r1", "content": "a\nb"},
         ]}},
     ]
-    cov = run._selection_coverage_from_events(events)
+    cov = run._selection_coverage_from_events(_norm(events))
     # Original dimensions still present and unchanged in shape.
     assert cov["file_reads"] == 2
     assert "search_to_read_ratio" in cov
@@ -137,7 +149,7 @@ def test_coverage_merges_structure_dimension():
 
 def test_structure_disabled_via_env(monkeypatch):
     monkeypatch.setenv("REMYX_SELECTION_EXPLORATION_STRUCTURE", "off")
-    cov = run._selection_coverage_from_events([_read(["src/a.py"])])
+    cov = run._selection_coverage_from_events(_norm([_read(["src/a.py"])]))
     assert "exploration_structure" not in cov
     # Core coverage dimensions remain intact when the dimension is disabled.
     assert cov["file_reads"] == 1

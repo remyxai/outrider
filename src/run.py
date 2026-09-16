@@ -62,6 +62,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -77,13 +78,18 @@ from exploration_structure import (
 )
 from instruction_files import render_instruction_files
 
+from agents import ApiFamily, Capability, resolve as _resolve_agent
+
 # ─── Configuration ─────────────────────────────────────────────────────────
 
 # Mirror REMYX_API_KEY → REMYXAI_API_KEY so the `remyxai` CLI authenticates
 # in subprocesses spawned by the selection pass (Claude Code shell-out). The
 # CLI reads REMYXAI_API_KEY; the action canonically uses REMYX_API_KEY.
+# Stripped on the way across: a secret pasted with a trailing newline is a
+# legal repo secret and an illegal HTTP header, and the CLI would hit the
+# same wall this action now guards against.
 if os.environ.get("REMYX_API_KEY") and not os.environ.get("REMYXAI_API_KEY"):
-    os.environ["REMYXAI_API_KEY"] = os.environ["REMYX_API_KEY"]
+    os.environ["REMYXAI_API_KEY"] = os.environ["REMYX_API_KEY"].strip()
 
 REMYX_API_BASE = os.environ.get("REMYX_API_BASE", "https://engine.remyx.ai")
 REMYX_RECOMMENDATION_PERIOD = os.environ.get("REMYX_RECOMMENDATION_PERIOD", "week")
@@ -175,6 +181,11 @@ def _mark_bundle_gitignored(workdir) -> None:
 # recognizable cause. Currently Anthropic-only; when alternative agent CLIs
 # land, these become a per-agent lookup (`_AGENT_URLS = {"claude": ...,
 # "aider": ...}`) keyed by the agent type recorded in the result dict.
+# The active coding-agent backend, resolved once at startup from the `agent`
+# action input. Unset resolves to Claude Code, so every pre-port run keeps its
+# exact argv and env — the invariant pinned by test_agent_backend_invariant.py.
+_BACKEND = _resolve_agent(os.environ.get("INPUT_AGENT"))
+
 _ANTHROPIC_BILLING_URL = "https://console.anthropic.com/settings/billing"
 _ANTHROPIC_KEYS_URL = "https://console.anthropic.com/settings/keys"
 
@@ -1548,10 +1559,10 @@ _Implements [{paper_title}](https://arxiv.org/abs/{arxiv_id})._
 <details>
 <summary><b>Discovery context</b></summary>
 
-> Drafted by an autonomous discovery loop — Remyx ranks recent arXiv papers against this team's research interest and shipping history; Claude Code selects the candidate most directly implementable against this repo from the lookback window and drafts it.
+> Drafted by an autonomous discovery loop — Remyx ranks recent arXiv papers against this team's research interest and shipping history; {agent_name} selects the candidate most directly implementable against this repo from the lookback window and drafts it.
 
 **Research interest**: {interest_name}
-**Implementation by**: Claude Code as autonomous agent
+**Implementation by**: {agent_name} as autonomous agent
 
 ## Why this paper for this team
 
@@ -1584,7 +1595,7 @@ _Drafted from a design brief supplied at dispatch time. No arXiv anchor — the 
 
 > Drafted by an autonomous coding loop — Remyx's Outrider action receives a design brief via workflow_dispatch, produces an implementation against this repo, and opens this PR for review. The brief is the sole input; there is no ranker-picked paper behind this PR.
 
-**Implementation by**: Claude Code as autonomous agent
+**Implementation by**: {agent_name} as autonomous agent
 
 ## Brief
 
@@ -2172,6 +2183,11 @@ _BOT_TOKEN = {"attempted": False, "token": "", "permissions": {}, "minted_at": 0
 # so a call made just under the wire still gets a fresh token.
 _BOT_TOKEN_MAX_AGE_S = 55 * 60  # 3300s
 
+# When this process started. A workflow-minted token is created immediately
+# before the action runs, so its remaining life is ~60 min minus our elapsed
+# runtime — see _github_token.
+_PROCESS_STARTED_AT = time.monotonic()
+
 
 def _mint_bot_token() -> str:
     """Self-mint a short-lived remyx[bot] installation token from the engine.
@@ -2207,9 +2223,15 @@ def _mint_bot_token() -> str:
         log.info(f"  bot token stale (age {int(age_s)}s > "
                  f"{_BOT_TOKEN_MAX_AGE_S}s); re-minting")
     _BOT_TOKEN["attempted"] = True
-    api_key = (
-        os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
-    )
+    # Same validation as every other engine call, but never fatal here: this
+    # path degrades to GITHUB_TOKEN by design. Without it a malformed secret
+    # surfaced as a masked urllib error — "Invalid header value b'***'" —
+    # which says nothing about which secret is wrong.
+    try:
+        api_key = _engine_api_key()
+    except RuntimeError as e:
+        log.warning(f"  ⚠ {e}")
+        return ""
     repo = (os.environ.get("TARGET_REPO") or "").strip()
     repo = repo.split("github.com/")[-1].strip("/")
     if not api_key or "/" not in repo:
@@ -2260,6 +2282,33 @@ def _github_token() -> str:
     """
     explicit = os.environ.get("INPUT_GITHUB_TOKEN", "").strip()
     if explicit:
+        elapsed = time.monotonic() - _PROCESS_STARTED_AT
+        if elapsed < _BOT_TOKEN_MAX_AGE_S:
+            return explicit
+        # Past the TTL window. A workflow's mint step runs once, before the
+        # action starts, and installation tokens expire at 60 minutes — so on
+        # a long run the explicit token is dead by push time and `git push`
+        # exits 128 *after* the agent has done all the work. Observed on a
+        # 76-minute GLM run that had already produced its diff.
+        #
+        # This predates the agent port but the port is what makes it likely:
+        # slow backends (GLM, Kimi thinking mode) are now first-class, and
+        # they routinely run past the hour. Re-minting is only attempted
+        # here, at the point of use, so a fast run's behavior is untouched.
+        fresh = _mint_bot_token()
+        if fresh:
+            log.info(
+                "  ↻ workflow-minted token is past its %d-minute TTL window "
+                "(run has been %d min); using a freshly minted bot token",
+                _BOT_TOKEN_MAX_AGE_S // 60, elapsed // 60,
+            )
+            return fresh
+        log.warning(
+            "  ⚠ workflow-minted token is likely expired (run has been %d "
+            "min) and self-minting is unavailable — the push may fail with "
+            "exit 128. Pass REMYX_API_KEY so the action can re-mint, or "
+            "lower agent-timeout.", elapsed // 60,
+        )
         return explicit
     minted = _mint_bot_token()
     if minted:
@@ -2633,6 +2682,28 @@ def _apply_branch_collision_suffix(
     return fallback
 
 
+def _engine_api_key() -> str:
+    """The engine credential, validated before it becomes a header.
+
+    A secret pasted with a stray newline — two values concatenated, a copied
+    line break — is a legal repo secret and an illegal HTTP header, so the
+    run died on `Invalid header value b'***'` from inside urllib, with the
+    value masked and nothing pointing at the secret. Whitespace is stripped
+    and a value that still cannot be a header fails with the name of the
+    secret to fix.
+    """
+    raw = os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY") or ""
+    api_key = raw.strip()
+    if api_key and (len(api_key.split()) > 1 or "\n" in api_key or "\r" in api_key):
+        raise RuntimeError(
+            "REMYX_API_KEY contains whitespace or a line break, so it cannot "
+            "be sent as an HTTP header. It usually means the secret was "
+            "pasted with a newline or holds more than one value. Re-set it: "
+            "gh secret set REMYX_API_KEY"
+        )
+    return api_key
+
+
 def strip_html(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
@@ -2643,7 +2714,7 @@ def strip_html(s: str) -> str:
 def _remyx_get(path: str, *, params: dict | None = None) -> dict:
     """GET against the Remyx engine API with the configured API key.
     Raises RuntimeError on non-2xx response."""
-    api_key = os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
+    api_key = _engine_api_key()
     if not api_key:
         raise RuntimeError(
             "REMYX_API_KEY (or REMYXAI_API_KEY) is required. Generate one "
@@ -2674,7 +2745,7 @@ def _remyx_get(path: str, *, params: dict | None = None) -> dict:
 def _remyx_post(path: str, body: dict) -> dict:
     """POST against the Remyx engine API with the configured API key.
     Raises RuntimeError on non-2xx response. Mirrors ``_remyx_get``."""
-    api_key = os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
+    api_key = _engine_api_key()
     if not api_key:
         raise RuntimeError(
             "REMYX_API_KEY (or REMYXAI_API_KEY) is required. Generate one "
@@ -5542,8 +5613,13 @@ def prepare_workdir(target: Target) -> Path:
         # Explicit refspec so ``origin/<ref>`` remote-tracking exists too —
         # commit_and_push's sanity check resolves ``origin/<start-from-ref>``,
         # and a plain ``git fetch origin <ref>`` only updates FETCH_HEAD.
+        # Same re-authentication as every other credentialed git call: origin
+        # was rewritten token-less a few lines up, so this fetch carries the
+        # token in a one-shot URL. On a public repo it worked anonymously,
+        # which is exactly why the gap survived — a private install would have
+        # failed here with "could not read Username".
         subprocess.run(
-            ["git", "fetch", "--depth", "20", "origin",
+            ["git", "fetch", "--depth", "20", _authenticated_remote(target.repo),
              f"{start_from_ref}:refs/remotes/origin/{start_from_ref}"],
             cwd=workdir, check=True, env=clone_env,
         )
@@ -7419,6 +7495,19 @@ def write_spec_bundle(
 # Per-run token/cost totals, accumulated across every `claude` call in a
 # run (pre-flight, selection, implementation, self-review) and surfaced in
 # the RUN SUMMARY + $GITHUB_OUTPUT.
+def _initial_cost_attribution(backend) -> tuple[str, str]:
+    """Starting ``(model_backend, cost_basis)`` for a run on ``backend``.
+
+    Only meaningful when a run ends before any usage envelope is recorded —
+    an auth failure, a missing binary, an oversized prompt. Claude Code keeps
+    its historical defaults; any other agent starts at "unavailable" rather
+    than claiming Anthropic spend it never made.
+    """
+    if backend.name == "claude":
+        return "Anthropic", "claude_code_envelope"
+    return backend.cost_label(), "unavailable"
+
+
 _RUN_COST = {
     "cost_usd": 0.0,
     "input_tokens": 0,
@@ -7433,8 +7522,11 @@ _RUN_COST = {
     # rate card, or "claude_code_envelope" when we trusted the CLI's
     # total_cost_usd field (correct for Anthropic, approximate for
     # unknown backends).
-    "model_backend": "Anthropic",
-    "cost_basis": "claude_code_envelope",
+    # Defaults describe the *configured* agent, not Claude Code: a run that
+    # fails before any usage is recorded would otherwise report a Codex or
+    # R-CLI failure as Anthropic spend. See _initial_cost_attribution.
+    "model_backend": _initial_cost_attribution(_BACKEND)[0],
+    "cost_basis": _initial_cost_attribution(_BACKEND)[1],
     # Number of `--output-format json` envelopes that parsed cleanly,
     # were not error envelopes, but carried no input/output token counts.
     # Observed against some non-Anthropic backends where the CLI's
@@ -7452,10 +7544,17 @@ _RUN_REFINE_QUERIES: list[str] = []
 
 
 def _reset_run_cost() -> None:
+    # Attribution comes back from the ACTIVE backend, not from literals. The
+    # module-level default is derived from `_initial_cost_attribution`, and
+    # main() calls this right before dispatching — so hardcoding Anthropic
+    # here threw that away on every run, and a run that never records a usage
+    # envelope (a missing binary, a timeout on the first call) reported Claude
+    # Code spend for an agent it never launched.
+    backend_name, basis = _initial_cost_attribution(_BACKEND)
     _RUN_COST.update(
         cost_usd=0.0, input_tokens=0, output_tokens=0,
         cache_read_input_tokens=0, num_turns=0, claude_calls=0,
-        model_backend="Anthropic", cost_basis="claude_code_envelope",
+        model_backend=backend_name, cost_basis=basis,
         envelopes_without_usage=0,
     )
     _RUN_REFINE_QUERIES.clear()
@@ -7543,29 +7642,56 @@ def _validate_claude_auth_env() -> tuple[bool, list[str]]:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
 
-    non_default = bool(base_url) and "api.anthropic.com" not in base_url
+    # Which credential is authoritative is a decision routing already made
+    # and recorded; re-deriving it from the base URL lets the validator and
+    # the launcher disagree. They did: `provider=anthropic` with a
+    # `model-base-url` set marks ANTHROPIC_API_KEY as selected, while the
+    # base-URL sniff below called ANTHROPIC_AUTH_TOKEN primary and hard-exited
+    # over a credential the run was never going to use.
+    selected = (os.environ.get("OUTRIDER_CLAUDE_AUTH_VAR") or "").strip()
+    if selected in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        non_default = selected == "ANTHROPIC_AUTH_TOKEN"
+    else:
+        # No marker: an unrouted run (no `provider` input), where the caller
+        # set the vars themselves and the base URL is the only signal.
+        non_default = bool(base_url) and "api.anthropic.com" not in base_url
     if non_default:
         primary_name = "ANTHROPIC_AUTH_TOKEN"
         primary_val = auth_token
+        # Both credential vars being set is normal, not a problem: a
+        # workflow declares every vendor's secret so `provider` stays
+        # switchable per dispatch, so a run routed at a gateway always has an
+        # Anthropic key in scope too. This used to warn, and the warning was
+        # wrong twice over — Claude Code does not "prefer ANTHROPIC_API_KEY"
+        # (given both, it sends *both* headers), and the advice to "set only
+        # ANTHROPIC_AUTH_TOKEN" was something the caller could not act on.
+        #
+        # The condition is handled where it counts: the agent is launched
+        # with only the credential routing selected, so nothing here needs
+        # the operator's attention. Saying which one that is beats warning
+        # about a state the action has already resolved.
         if api_key and auth_token:
-            warnings.append(
-                "Both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set "
-                "while a non-default backend is configured. Claude Code "
-                "will prefer ANTHROPIC_API_KEY (x-api-key), which "
-                "non-Anthropic backends typically reject with HTTP 401. "
-                "Set only ANTHROPIC_AUTH_TOKEN for non-default backends."
+            log.info(
+                "  auth check: both credential vars are in scope (a workflow "
+                "declares every vendor's secret); the agent will be launched "
+                "with %s only",
+                os.environ.get("OUTRIDER_CLAUDE_AUTH_VAR")
+                or "ANTHROPIC_AUTH_TOKEN",
             )
     else:
         primary_name = "ANTHROPIC_API_KEY"
         primary_val = api_key
 
     if not primary_val:
-        log.error(
-            "  ✗ auth check: %s is not set — agent calls will fail with "
-            "HTTP 401. Set the secret on your repo and dispatch again.",
-            primary_name,
+        reason = (
+            f"{primary_name} is not set — agent calls will fail with HTTP "
+            f"401. Set the secret on your repo and dispatch again."
         )
-        return False, warnings
+        log.error("  ✗ auth check: %s", reason)
+        # Carried, not just logged: `mode: smoke` joins these into its
+        # reported error, and an empty list gave consumers "preflight
+        # failed: " with no cause.
+        return False, warnings + [reason]
 
     if primary_val == "-":
         log.error(
@@ -7625,7 +7751,20 @@ def _detect_backend(
     display_overrides = {
         "api.z.ai": "z.ai (GLM)",
         "api.moonshot.ai": "Moonshot (Kimi)",
+        "openrouter.ai": "OpenRouter",
     }
+    # A vendor with no rate row still deserves its name. The loop below only
+    # consults these overrides for hosts that HAVE rates, so a gateway priced
+    # per underlying model — OpenRouter — fell out as the bare hostname and
+    # its runs grouped under a different series id than the same vendor
+    # reached any other way.
+    named_without_rates = {
+        vendor: label for vendor, label in display_overrides.items()
+        if not any(vendor in key or key in vendor for key in _BACKEND_RATES)
+    }
+    for vendor, label in named_without_rates.items():
+        if vendor in host:
+            return (label, None)
     for key, model_rates in _BACKEND_RATES.items():
         if key in host:
             rates = model_rates.get(model) if model else None
@@ -7635,6 +7774,35 @@ def _detect_backend(
                     rates = model_rates.get(default_model)
             return (display_overrides.get(key, host), rates)
     return (host, None)
+
+
+def _rate_basis(base_url: str, model: str) -> str:
+    """``backend_rate_table`` only when the *named* model has a rate row.
+
+    `_detect_backend` falls back to the host's default model when the exact
+    id is missing, which is closer than nothing but is not the rate card the
+    run actually paid. Reporting that as `backend_rate_table` renders in the
+    step summary as "computed from <vendor> PAYG rates", i.e. authoritative,
+    for a number computed from a different model's prices. Live case: this
+    branch makes `glm-5.3` the z.ai default and the table has rows only for
+    glm-5.2 and glm-4.6.
+
+    The tokens stay exact either way; only the dollars are an approximation,
+    and now they say so.
+    """
+    if not model:
+        # No model named: the run used whatever the vendor defaults to, and
+        # the table's per-host default is the standing assumption about what
+        # that is. Unchanged behavior — this is the common shape for installs
+        # that never pinned a model, and relabelling their history would be a
+        # telemetry change without a telemetry reason.
+        return "backend_rate_table"
+    host = (base_url or "").split("://", 1)[-1].split("/", 1)[0]
+    for key, model_rates in _BACKEND_RATES.items():
+        if key in host:
+            return ("backend_rate_table" if model in model_rates
+                    else "backend_rate_table_approx")
+    return "backend_rate_table"
 
 
 def _record_claude_usage(env: dict) -> None:
@@ -7667,18 +7835,53 @@ def _record_claude_usage(env: dict) -> None:
             _RUN_COST.get("envelopes_without_usage", 0) + 1
         )
 
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    # Read the endpoint from whichever var the ACTIVE agent routes with.
+    # Hardcoding ANTHROPIC_BASE_URL meant a Codex run at Moonshot reported
+    # cost_basis="unavailable" and $0.00 despite the rate table having rows
+    # for that host — the base URL was simply in CODEX_BASE_URL.
+    base_url = os.environ.get(_BACKEND.base_url_env or "ANTHROPIC_BASE_URL", "")
     # Prefer the envelope's model (what was actually served) over the env
     # var (what we requested) — same in practice, but envelope wins when
     # both are present.
-    model = env.get("model") or os.environ.get("ANTHROPIC_MODEL", "")
+    model = (
+        env.get("model")
+        or os.environ.get(_BACKEND.model_env or "ANTHROPIC_MODEL", "")
+    )
+
+    if _BACKEND.name != "claude":
+        # Non-Claude agents don't speak ANTHROPIC_BASE_URL, so the base-url
+        # sniff would silently attribute every run to "Anthropic". Resolve on
+        # the agent axis instead: trust the envelope's dollars when the CLI
+        # reports them, else the rate table, else say so rather than emit a
+        # figure the agent never produced.
+        _RUN_COST["model_backend"] = _BACKEND.cost_label(model)
+        if _BACKEND.can(Capability.COST_USD):
+            _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
+            _RUN_COST["cost_basis"] = "agent_envelope"
+            return
+        # No dollars from the CLI — fall back to the per-host rate table,
+        # which is keyed by endpoint host and so serves any agent routing at
+        # a host we have rows for.
+        _, rates = _detect_backend(base_url, model)
+        if rates is not None:
+            rate_in, rate_out, rate_cache = rates
+            _RUN_COST["cost_usd"] += (
+                in_tok * rate_in + out_tok * rate_out + cache_in * rate_cache
+            ) / 1_000_000
+            _RUN_COST["cost_basis"] = _rate_basis(base_url, model)
+        else:
+            # Token counts stay accurate; dollars are simply not knowable for
+            # this (agent, model) pair yet. Never fabricate them.
+            _RUN_COST["cost_basis"] = "unavailable"
+        return
+
     backend_name, rates = _detect_backend(base_url, model)
     if rates is not None and "api.anthropic.com" not in base_url:
         # Compute from tokens × backend rates (USD per million).
         rate_in, rate_out, rate_cache = rates
         cost = (in_tok * rate_in + out_tok * rate_out + cache_in * rate_cache) / 1_000_000
         _RUN_COST["cost_usd"] += cost
-        _RUN_COST["cost_basis"] = "backend_rate_table"
+        _RUN_COST["cost_basis"] = _rate_basis(base_url, model)
     else:
         _RUN_COST["cost_usd"] += float(env.get("total_cost_usd") or 0.0)
         _RUN_COST["cost_basis"] = "claude_code_envelope"
@@ -7737,98 +7940,51 @@ def _record_claude_usage(env: dict) -> None:
 # explicitly with a comment naming the case. Don't broaden to `ANTHROPIC_*`
 # wildcards — future Anthropic env vars may carry telemetry tokens the
 # agent shouldn't see verbatim.
-_CLAUDE_ENV_WHITELIST: tuple[str, ...] = (
-    "ANTHROPIC_API_KEY",
-    # ANTHROPIC_AUTH_TOKEN — used by Claude Code as a Bearer credential
-    # for non-default backends (z.ai's GLM Coding Plan requires this:
-    # https://docs.z.ai/devpack/tool/claude). When set, Claude Code sends
-    # "Authorization: Bearer <token>" instead of "x-api-key: <key>". z.ai's
-    # gateway rejects x-api-key with HTTP 401, so without this whitelist
-    # entry, any glm-routed run fails at auth.
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_MODEL",
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "TERM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "CI",
-    "GITHUB_ACTIONS",
-    # GITHUB_TOKEN is intentionally not exposed to the coding agent — a
-    # write-scoped token in the agent's context is an exfiltration risk. The
-    # orchestrator holds its own token separately (clone/push unaffected); the
-    # agent's `gh` reads use unauthenticated access (fine for public repos).
-)
+# The env vars the active agent's subprocess may inherit. The whitelist and
+# its security rationale live on the backend that owns those auth vars.
+_AGENT_ENV_WHITELIST: tuple[str, ...] = _BACKEND.env_whitelist()
+
+# Back-compat alias: this name was module-level in run.py before the agent
+# port and tests assert on it directly. Purely internal, so it costs nothing
+# to keep pointing at the same tuple.
+_CLAUDE_ENV_WHITELIST: tuple[str, ...] = _AGENT_ENV_WHITELIST
 
 
 def _claude_subprocess_env() -> dict[str, str]:
-    """Build the env dict for Claude CLI subprocess invocations.
+    """Build the env dict for agent CLI subprocess invocations.
 
-    Returns a minimal whitelist of the parent env, stripping every var
-    not on ``_CLAUDE_ENV_WHITELIST``. Defense in depth at the launch
-    boundary — the v1.6.4 outbound-body scrubber catches secrets at
-    egress; this stops them from entering the agent's context at all.
+    Returns a minimal whitelist of the parent env, stripping every var not on
+    the active backend's whitelist. Defense in depth at the launch boundary —
+    the v1.6.4 outbound-body scrubber catches secrets at egress; this stops
+    them from entering the agent's context at all.
     """
-    env: dict[str, str] = {}
-    for name in _CLAUDE_ENV_WHITELIST:
-        v = os.environ.get(name)
-        if v is not None:
-            env[name] = v
-    return env
+    return _BACKEND.subprocess_env()
 
 
-# Injection-hardening Bash gate for the SPAWNED agent. NOTE: the repo's own
-# .claude/hooks/pre-bash-gate.sh does NOT reach this agent (it governs only
-# Claude Code sessions working on this repo). The agent runs with cwd set to the
-# target checkout, so its hooks must be delivered explicitly via `--settings`.
-_AGENT_BASH_GATE = Path(__file__).with_name("agent_bash_gate.sh")
+_GUARDRAIL_NOTE_LOGGED = False
 
 
-def _agent_hardening_settings_arg() -> list[str]:
-    """`--settings` arg loading the injection-hardening PreToolUse Bash gate.
+def _agent_base_cmd() -> list[str]:
+    """argv prefix for the active backend, including its guardrail policy.
 
-    The gate (``agent_bash_gate.sh``) strips high-leverage Bash capabilities
-    (package installs, network egress, ``gh`` writes, ``git push``) so an agent
-    that *complies* with an instruction injected via untrusted issue/PR text
-    still can't reach them — the paper (arXiv:2607.20759) shows detecting the
-    intent doesn't work, so we remove the reach instead. PreToolUse hooks fire
-    in headless ``-p`` mode even under ``--dangerously-skip-permissions``
-    (verified).
+    For Claude Code that policy is a `--settings` PreToolUse Bash gate which
+    strips high-leverage capabilities (package installs, network egress, `gh`
+    writes, `git push`) so an agent that *complies* with an instruction
+    injected via untrusted issue/PR text still can't reach them — detecting
+    the intent doesn't work (arXiv:2607.20759), so we remove the reach.
 
-    Returns ``[]`` (with a loud error log) if the hook file is missing, so a
-    packaging error degrades to the prior open behavior rather than crashing
-    every dispatch. The hook shipping is a repo invariant, so this should never
-    fire in practice.
+    A backend that can't express such a policy is not silently accepted: the
+    note is logged loudly so an unguarded run is visible in the job log.
     """
-    if not _AGENT_BASH_GATE.exists():
-        log.error(
-            "agent_bash_gate.sh missing at %s — coding session runs WITHOUT the "
-            "injection-hardening Bash gate.",
-            _AGENT_BASH_GATE,
-        )
-        return []
-    settings = {
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": str(_AGENT_BASH_GATE)}],
-                }
-            ]
-        }
-    }
-    return ["--settings", json.dumps(settings)]
+    global _GUARDRAIL_NOTE_LOGGED
+    cmd = _BACKEND.base_cmd()
+    note = _BACKEND.guardrail_note()
+    if note and not _GUARDRAIL_NOTE_LOGGED:
+        # Once per run, not once per invocation — a dispatch makes half a
+        # dozen agent calls and repeating this buries the rest of the log.
+        log.warning("\u26a0 %s", note)
+        _GUARDRAIL_NOTE_LOGGED = True
+    return cmd
 
 
 def _format_agent_cli_failure(
@@ -7861,110 +8017,131 @@ def _format_agent_cli_failure(
     return "\n".join(parts)
 
 
-def _run_claude_json(
-    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
-) -> tuple[bool, str]:
-    """Run `claude … --output-format json -p <prompt>`, accumulate token/cost
-    usage into _RUN_COST, and return (ok, model_text).
+def _relativize_events(events: list, cwd: Path) -> list:
+    """Rewrite absolute tool paths as repo-relative.
 
-    With --output-format json the CLI prints a single envelope object
-    ({result, total_cost_usd, usage, num_turns, is_error, …}); the model's
-    actual answer is in `result`, so callers that parse a JSON decision out
-    of the answer get the inner text, not the envelope. Falls back to raw
-    stdout (no usage recorded) if the envelope doesn't parse.
+    Agents report the paths they touched as absolute (Claude Code's
+    `file_path`, R-CLI's resolved `read` target). The exploration-structure
+    parser derives a subsystem from the *first* path segment, so an absolute
+    path files every read under `tmp` (or `home`) instead of `src` — the
+    domain-coverage signal silently collapses to one bucket. Relativizing
+    once here keeps that fix in a single place for every backend.
     """
-    cmd = [*cmd_prefix, "--output-format", "json", "-p", prompt]
+    if not events:
+        return events
+    try:
+        root = str(Path(cwd).resolve())
+    except OSError:
+        return events
+    prefix = root.rstrip("/") + "/"
+    out = []
+
+    def rel(path: str) -> str:
+        # The workdir root itself is a legitimate target (a directory glob or
+        # listing). Left absolute it files under `tmp` / `home` and pollutes
+        # the domain histogram, so it becomes the repo root marker instead.
+        if path.rstrip("/") == root:
+            return "."
+        return path[len(prefix):] if path.startswith(prefix) else path
+
+    for event in events:
+        if not event.paths:
+            out.append(event)
+            continue
+        rewritten = tuple(rel(p) for p in event.paths)
+        out.append(
+            event if rewritten == event.paths
+            else dataclasses.replace(event, paths=rewritten)
+        )
+    return out
+
+
+def _run_agent(
+    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int,
+    *, stream: bool = False,
+) -> tuple[bool, str, list]:
+    """Run the active agent CLI once and normalize the result.
+
+    Returns ``(ok, text, events)``. ``text`` is the agent's final message;
+    ``events`` is the normalized transcript (empty unless ``stream`` and the
+    backend has STREAM_TRANSCRIPT). Token/cost usage is accumulated into
+    ``_RUN_COST`` here, so every backend is accounted identically.
+
+    Output that can't be parsed at all falls through to
+    ``_format_agent_cli_failure``, which puts the CLI's stderr last so the
+    real cause survives the caller's tail-slice.
+    """
+    cmd, stdin_text = _BACKEND.finalize_cmd(cmd_prefix, prompt, stream=stream)
+    # Backends that put the prompt in argv return stdin_text=None, and
+    # `input=None` leaves the child *inheriting* our stdin. On a runner that
+    # is an open pipe which never delivers, so Claude Code waits for it and
+    # logs "no stdin data received in 3s, proceeding without it" — measured
+    # at ~2.5s of dead time on every call, times the dozens of calls a
+    # dispatch makes. Worse, that warning lands on stderr, so it gets
+    # embedded in the reported error text and makes unrelated failures look
+    # like stdin problems. Closing stdin outright removes both.
+    delivery = (
+        {"stdin": subprocess.DEVNULL} if stdin_text is None
+        else {"input": stdin_text}
+    )
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, env=_claude_subprocess_env(),
             capture_output=True, text=True, timeout=timeout_s,
+            **delivery,
         )
     except subprocess.TimeoutExpired:
-        return False, f"claude CLI timed out after {timeout_s}s"
+        return False, _BACKEND.timeout_message(timeout_s), []
     except FileNotFoundError:
-        return False, ("claude CLI not found on PATH "
-                       "(install: npm install -g @anthropic-ai/claude-code)")
-    raw = (proc.stdout or "").strip()
-    try:
-        env = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        env = None
-    if isinstance(env, dict):
-        _record_claude_usage(env)
-        text = env.get("result") or ""
-        is_error = bool(env.get("is_error")) or proc.returncode != 0
-        # On error, always append the CLI stderr — the envelope's `result`
-        # often omits the operational cause (e.g. usage limit) that stderr
-        # carries. Skip if stderr is already echoed inside `result`.
-        if is_error and proc.stderr and proc.stderr.strip() not in text:
-            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
-        return (not is_error), text
-    # Envelope didn't parse — surface the CLI's exit code and stderr so the
-    # real failure cause reaches `claude_log_tail`. No usage recorded (no
-    # envelope to account).
-    return proc.returncode == 0, _format_agent_cli_failure(
-        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
+        return False, _BACKEND.not_found_message(), []
+    except OSError as exc:
+        # E2BIG (prompt too large for argv), ENOMEM, ENOEXEC — the process
+        # never started, so there is no output to parse. Return it as a normal
+        # agent failure; the orchestrator's downgrade path handles it the way
+        # it handles any other failed invocation, instead of the whole
+        # dispatch dying on an unhandled exception.
+        return False, f"{_BACKEND.tool} CLI could not be started: {exc}", []
+
+    result = _BACKEND.parse(
+        proc.returncode, proc.stdout or "", proc.stderr or "", stream=stream
     )
+    if result is None:
+        return (
+            proc.returncode == 0,
+            _format_agent_cli_failure(
+                cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
+            ),
+            [],
+        )
+    for note in result.diagnostics:
+        log.warning("  \u26a0 agent: %s", note)
+    for envelope in result.usage_envelopes:
+        _record_claude_usage(envelope)
+    return result.ok, result.text, _relativize_events(result.events, cwd)
+
+
+def _run_claude_json(
+    cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
+) -> tuple[bool, str]:
+    """One-shot agent call returning ``(ok, final_message)``.
+
+    Name kept from before the agent port — it is a monkeypatch seam in a large
+    number of tests.
+    """
+    ok, text, _events = _run_agent(cmd_prefix, prompt, cwd, timeout_s)
+    return ok, text
 
 
 def _run_claude_stream(
     cmd_prefix: list[str], prompt: str, cwd: Path, timeout_s: int
-) -> tuple[bool, str, list[dict]]:
-    """Like ``_run_claude_json`` but with the full tool transcript.
+) -> tuple[bool, str, list]:
+    """Like :func:`_run_claude_json` but also returns the tool transcript.
 
-    Runs ``claude … --output-format stream-json --verbose -p <prompt>`` and
-    parses the JSONL event stream. Returns ``(ok, text, events)`` where
-    ``text`` is the final result event's answer string (same string the json
-    envelope's ``result`` field carries, so verdict parsing is unchanged) and
-    ``events`` is every parsed stream event — the selection coverage parser
-    walks the ``tool_use`` / ``tool_result`` blocks in it.
-
-    Token/cost usage is recorded exactly once, off the terminal
-    ``{"type": "result", …}`` event (same shape as the json envelope), so
-    accounting matches ``_run_claude_json``. ``--verbose`` is required by the
-    CLI when ``stream-json`` is paired with ``-p``.
+    ``events`` is the normalized transcript the selection-coverage and
+    exploration-structure parsers walk. Name kept from before the agent port
+    for the same monkeypatch-seam reason.
     """
-    cmd = [*cmd_prefix, "--output-format", "stream-json", "--verbose",
-           "-p", prompt]
-    try:
-        proc = subprocess.run(
-            cmd, cwd=cwd, env=_claude_subprocess_env(),
-            capture_output=True, text=True, timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"claude CLI timed out after {timeout_s}s", []
-    except FileNotFoundError:
-        return False, ("claude CLI not found on PATH "
-                       "(install: npm install -g @anthropic-ai/claude-code)"), []
-    events: list[dict] = []
-    for line in (proc.stdout or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(ev, dict):
-            events.append(ev)
-    final = next(
-        (e for e in reversed(events) if e.get("type") == "result"), None
-    )
-    if final is not None:
-        _record_claude_usage(final)
-        text = final.get("result") or ""
-        is_error = bool(final.get("is_error")) or proc.returncode != 0
-        # On error, always append the CLI stderr — the result event's text
-        # often omits the operational cause (e.g. usage limit) that stderr
-        # carries. Skip if stderr is already echoed inside the result text.
-        if is_error and proc.stderr and proc.stderr.strip() not in text:
-            text = (text + "\n--- STDERR ---\n" + proc.stderr.strip()).strip()
-        return (not is_error), text, events
-    # No terminal result event — surface exit code + stderr so the real
-    # failure cause reaches `claude_log_tail`.
-    return proc.returncode == 0, _format_agent_cli_failure(
-        cmd_prefix[0], proc.returncode, proc.stdout, proc.stderr
-    ), events
+    return _run_agent(cmd_prefix, prompt, cwd, timeout_s, stream=True)
 
 
 def _strip_leading_frontmatter(text: str) -> str:
@@ -8135,6 +8312,54 @@ def _render_sibling_impls_block(
     return "\n".join(lines)
 
 
+def should_stage_research(backend=None) -> bool:
+    """Whether the staged research phase can do anything on this routing.
+
+    It is a web-research task. An agent with no usable search tool — Codex
+    routed off OpenAI, where the action pins ``web_search="disabled"`` —
+    would burn a full timeout on a prompt it cannot satisfy and then soft-fail
+    on the missing findings file. Skipping is the documented degradation; the
+    capability was declared and dynamically degraded but never consulted, so
+    the degradation did not exist.
+    """
+    backend = backend or _BACKEND
+    return bool(backend.can(Capability.WEB_RESEARCH))
+
+
+def endpoint_override(base_url: str, backend=None, provider_id: str = "") -> tuple[str, str]:
+    """``(url_to_apply, warning)`` for a caller-supplied ``model-base-url``.
+
+    Routing already decided whether an override is admissible, and applying
+    one it refused wins anyway because this is set on the parent process after
+    routing. Two cases must not do that:
+
+    * **a named provider** — the registry owns that vendor's endpoint, so a
+      leftover override from the pre-provider era sends the provider's key to
+      a different vendor's host and 401s;
+    * **a native router** — its base-URL env var is the router's own control
+      plane, not a model endpoint, so repointing it aims the agent at the
+      wrong service entirely.
+    """
+    backend = backend or _BACKEND
+    if not base_url:
+        return "", ""
+    if backend.api_family == ApiFamily.NATIVE_ROUTER:
+        return "", (
+            f"model-base-url is ignored for agent={backend.name}: "
+            f"{backend.base_url_env or '(none)'} is its router control plane, "
+            f"not a model endpoint. Address a different backend with "
+            f"provider/model instead."
+        )
+    provider_id = (provider_id or "").strip()
+    if provider_id and provider_id != "custom":
+        return "", (
+            f"model-base-url is ignored for provider={provider_id}: the "
+            f"action resolves that vendor's endpoint itself. Use "
+            f"provider=custom to point at your own."
+        )
+    return base_url, ""
+
+
 def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, str]:
     """Invoke the research-phase Claude Code CLI pass.
 
@@ -8157,13 +8382,13 @@ def invoke_research_phase(workdir: Path, timeout_s: int = 600) -> tuple[bool, st
         (workdir / BUNDLE_DIR_NAME / "RESEARCH_INVOCATION.md").read_text()
     )
     log.info(f"  → invoking research phase (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
+    cmd = _agent_base_cmd()
     # Cap turns via the same knob the coding invocation honors, but with a
     # tighter default for the research phase (8 turns per the prompt's
     # bounded-budget instruction).
     max_turns = os.environ.get("REMYX_RESEARCH_MAX_TURNS", "8").strip()
     if max_turns:
-        cmd += ["--max-turns", max_turns]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
     findings_path = workdir / BUNDLE_DIR_NAME / "web_findings.json"
     if ok and not findings_path.exists():
@@ -8187,17 +8412,26 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     Returns (success, stdout/stderr). Success means CLI exit 0 — caller still
     validates the produced changes with the path-allowlist check + tests.
 
-    ``REMYX_CLAUDE_MAX_TURNS`` (optional) caps the agent's tool-use turns to
-    bound cost; unset means no cap (avoids truncating legitimate work).
+    ``REMYX_AGENT_MAX_TURNS`` (optional) caps the agent's tool-use turns to
+    bound cost; unset means no cap (avoids truncating legitimate work). The
+    original ``REMYX_CLAUDE_MAX_TURNS`` keeps working — someone may already
+    have it set — and the generalized name wins if both are present.
+
+    Only honored by agents that expose a round-limit flag; Codex and R-CLI
+    have none, so there the wall-clock timeout is the only bound.
     """
     invocation = _strip_leading_frontmatter(
         (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
     )
-    log.info(f"  → invoking Claude Code (timeout={timeout_s}s) in {workdir}")
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
-    max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
+    log.info(f"  → invoking {_BACKEND.display_name} "
+             f"(timeout={timeout_s}s) in {workdir}")
+    cmd = _agent_base_cmd()
+    max_turns = (
+        os.environ.get("REMYX_AGENT_MAX_TURNS", "").strip()
+        or os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
+    )
     if max_turns:
-        cmd += ["--max-turns", max_turns]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     ok, text = _run_claude_json(cmd, invocation, workdir, timeout_s)
     if not ok:
         # The returned `text` is tail-truncated downstream (telemetry keeps
@@ -8206,7 +8440,8 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
         # untruncated — so the complete error (e.g. usage limit / credit
         # balance) is always recoverable from the run logs.
         log.error(
-            "Claude Code implementation call failed — full output:\n%s", text
+            "%s implementation call failed — full output:\n%s",
+            _BACKEND.display_name, text
         )
     return ok, text[-4000:]   # last 4KB retained for the telemetry log tail
 
@@ -8227,9 +8462,9 @@ def _run_claude_oneshot(
     `max_turns` caps tool-use rounds for agentic flows (selection now uses
     this to bound spend). None = no cap (matches prior behavior).
     """
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
+    cmd = _agent_base_cmd()
     if max_turns is not None:
-        cmd += ["--max-turns", str(max_turns)]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     return _run_claude_json(cmd, prompt, workdir, timeout_s)
 
 
@@ -8244,9 +8479,9 @@ def _run_claude_oneshot_streaming(
     selection pass uses this; the other one-shot callers (pre-flight,
     self-review, audit) stay on the cheaper single-envelope runner.
     """
-    cmd = ["claude", "--dangerously-skip-permissions", *_agent_hardening_settings_arg()]
+    cmd = _agent_base_cmd()
     if max_turns is not None:
-        cmd += ["--max-turns", str(max_turns)]
+        cmd += _BACKEND.turn_cap_args(max_turns)
     return _run_claude_stream(cmd, prompt, workdir, timeout_s)
 
 
@@ -8684,65 +8919,57 @@ def _classify_shell_command(cmd: str) -> list[str]:
     return out
 
 
-def _classify_tool_use(name: str, inp: dict) -> list[str]:
-    """Classifications for one ``tool_use`` block (Bash, Read, Grep, …)."""
-    if name == "Bash":
-        return _classify_shell_command((inp or {}).get("command") or "")
-    if name in ("Read", "WebFetch"):
+def _classify_tool_use(tool: str, command: str | None = None) -> list[str]:
+    """Coverage classes for one normalized tool call.
+
+    ``tool`` is the neutral verb the backend emitted (read / search / glob /
+    execute / web_fetch / …), not a vendor tool name, so this stays identical
+    across agents. Shell commands still get their own classification because a
+    `grep`-shaped command is a search regardless of which CLI ran it.
+    """
+    if tool == "execute":
+        return _classify_shell_command(command or "")
+    if tool in ("read", "web_fetch"):
         return ["file_read"]
-    if name in ("Grep", "Glob"):
+    if tool in ("search", "glob"):
         return ["search"]
     return []
 
 
-def _count_result_lines(content: object) -> int:
-    """Line count of a ``tool_result`` payload (string or text-block list)."""
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        text = "\n".join(
-            b.get("text", "") for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
-    else:
-        text = str(content)
-    return len(text.splitlines()) if text else 0
-
-
-def _selection_coverage_from_events(events: list[dict]) -> dict:
-    """Parse a stream-json transcript into per-run exploration coverage.
+def _selection_coverage_from_events(events: list) -> dict:
+    """Parse a normalized transcript into per-run exploration coverage.
 
     Pairs each file-read ``tool_use`` with its ``tool_result`` by id so
     ``visible_lines`` reflects content the agent actually saw. Returns
     ``searches`` / ``file_reads`` / ``visible_lines`` / ``search_to_read_ratio``.
+
+    Consumes :class:`agents.base.Event`, so every backend's transcript is
+    measured the same way — the vendor-specific shapes were absorbed by the
+    adapter that produced them.
     """
     searches = 0
     file_reads = 0
     visible_lines = 0
     read_ids: set[str] = set()
+
+    # Two passes, because the pairing is by id and event ORDER is not a
+    # contract: Claude Code emits tool_use before its tool_result, but R-CLI
+    # emits tool:result *before* the tool:requested that carries the call's
+    # structured input. A single ordered pass silently scored every R-CLI run
+    # at visible_lines=0 — the exact signal the coverage gate keys on.
     for ev in events:
-        msg = ev.get("message") if isinstance(ev, dict) else None
-        content = (msg or {}).get("content")
-        if not isinstance(content, list):
+        if getattr(ev, "kind", None) != "tool_use":
             continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type")
-            if btype == "tool_use":
-                classes = _classify_tool_use(
-                    block.get("name") or "", block.get("input") or {}
-                )
-                searches += classes.count("search")
-                reads = classes.count("file_read")
-                file_reads += reads
-                if reads and block.get("id"):
-                    read_ids.add(block["id"])
-            elif btype == "tool_result":
-                if block.get("tool_use_id") in read_ids:
-                    visible_lines += _count_result_lines(block.get("content"))
+        classes = _classify_tool_use(ev.tool, ev.command)
+        searches += classes.count("search")
+        reads = classes.count("file_read")
+        file_reads += reads
+        if reads and ev.id:
+            read_ids.add(ev.id)
+
+    for ev in events:
+        if getattr(ev, "kind", None) == "tool_result" and ev.id in read_ids:
+            visible_lines += ev.lines
     coverage = {
         "searches": searches,
         "file_reads": file_reads,
@@ -8792,6 +9019,64 @@ def _apply_coverage_gate(
         "REMYX_SELECTION_COVERAGE_GATE", "observe"
     ).lower().strip()
     if mode == "off":
+        return data
+    # Two ways coverage can be unmeasurable, and neither means the agent
+    # explored nothing:
+    #
+    #   no transcript at all — the capability says so up front;
+    #   a transcript this parser cannot read for coverage — the agent
+    #     streamed tool activity (exploration_structure saw domains) but none
+    #     of it in the vocabulary the floor counts. Observed on a real Codex
+    #     run: 8 domains of activity, and searches / file_reads /
+    #     visible_lines all zero, which recorded `under_explored: true` for a
+    #     pick that was nothing of the sort — and under `enforce` would have
+    #     downgraded every Codex pick to a skip.
+    #
+    # The floor is calibrated to one agent's transcript vocabulary, so a zero
+    # from another agent is a measurement gap until proven otherwise.
+    structure = coverage.get("exploration_structure") or {}
+    # Every signal at zero means the parse produced nothing at all, which is
+    # a measurement gap rather than evidence. An agent that genuinely
+    # explored nothing still leaves *some* trace: it ran, it edited files. So
+    # an all-zero parse says the transcript was absent or unreadable for this
+    # agent, whatever the capability flag claims.
+    #
+    # Both non-default agents land here for different reasons — Codex with
+    # eight domains of activity and no countable reads, Backboard with a
+    # parse that yielded nothing — and both were recorded as under-explored
+    # picks that were nothing of the sort.
+    signals = (
+        coverage.get("searches"), coverage.get("file_reads"),
+        coverage.get("visible_lines"), structure.get("domains"),
+        structure.get("turns"),
+    )
+    unmeasurable = (
+        not _BACKEND.can(Capability.STREAM_TRANSCRIPT)
+        or not any(signals)
+        or (bool(structure.get("domains") or structure.get("turns"))
+            and not any(coverage.get(k) for k in
+                        ("searches", "file_reads", "visible_lines")))
+    )
+    if unmeasurable:
+        coverage["basis"] = "unavailable"
+        # Not "under-explored": that asserts something this run cannot see.
+        coverage.pop("under_explored", None)
+        log.info(
+            "  selection coverage: unmeasurable on %s (basis=unavailable) — "
+            "%s. Not treated as under-explored.",
+            _BACKEND.name,
+            "no tool transcript"
+            if not _BACKEND.can(Capability.STREAM_TRANSCRIPT)
+            else ("its transcript parsed to nothing at all"
+                  if not any(signals)
+                  else "its transcript carries no countable reads or searches"),
+        )
+        if mode == "enforce":
+            log.warning(
+                "⚠ selection coverage gate: coverage can't be measured for "
+                "%s, so this run stays in observe mode instead of "
+                "downgrading every pick.", _BACKEND.name,
+            )
         return data
     if higher_floor:
         floor = int(os.environ.get(
@@ -9707,7 +9992,7 @@ def _render_risky_surface_note(files: list[str]) -> str:
 
 
 def _file_is_new(workdir: Path, path: str) -> bool:
-    """True if `path` did not exist at HEAD (i.e. Claude created it)."""
+    """True if `path` did not exist at HEAD (i.e. the agent created it)."""
     result = subprocess.run(
         ["git", "ls-tree", "HEAD", "--", path],
         cwd=workdir, capture_output=True, text=True, check=False,
@@ -10302,6 +10587,23 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
         title = "Remyx Recommendation: paper needs team discussion"
     body = "\n".join(lines[body_start:]).strip()
     return title, body
+
+
+def _authenticated_remote(repo: str) -> str:
+    """A one-shot push/fetch URL carrying the current token, or ``origin``.
+
+    ``prepare_workdir`` rewrites origin token-less after cloning, so the token
+    never lands in ``.git/config`` where a coding agent with shell access
+    could read it. Every git operation that needs credentials therefore has to
+    re-authenticate through a URL argument rather than reaching for origin —
+    ``_github_token()`` also re-mints when a long session has outlasted the
+    token's TTL. Falls back to ``origin`` when there is no token, so the
+    caller's own error handling stays in charge.
+    """
+    token = _github_token()
+    if not token:
+        return "origin"
+    return f"https://x-access-token:{token}@github.com/{repo}.git"
 
 
 def commit_and_push(
@@ -11998,9 +12300,23 @@ def process_target(target: Target) -> dict:
             # bumped timeout and forced research to fail-best-effort on
             # any run where turns took >75s on average, dropping paper
             # context from the coding session for no gain.
-            research_ok, research_log = invoke_research_phase(
-                workdir, timeout_s=target.claude_timeout_s,
-            )
+            # The staged research phase is a web-research task. An agent
+            # routed somewhere without a usable search tool (Codex off
+            # OpenAI, where the action pins web_search="disabled") would burn
+            # a full timeout on a prompt it cannot satisfy and then soft-fail
+            # on the missing findings file. Skipping is the documented
+            # degradation; running it anyway was the bug.
+            if not should_stage_research():
+                log.info(
+                    "  ↷ staged research skipped: %s has no web-research tool "
+                    "on this routing; continuing with the single-pass flow",
+                    _BACKEND.display_name,
+                )
+                research_ok, research_log = False, "web research unavailable"
+            else:
+                research_ok, research_log = invoke_research_phase(
+                    workdir, timeout_s=target.claude_timeout_s,
+                )
             result["research_phase_ok"] = research_ok
             result["research_log_tail"] = research_log[-1000:]
 
@@ -12117,7 +12433,7 @@ def process_target(target: Target) -> dict:
         # 6.5. Claude may have elected Issue-mode instead of writing code.
         issue_file = workdir / ISSUE_FALLBACK_FILENAME
         if issue_file.exists():
-            log.info(f"  → Claude elected Issue-mode "
+            log.info(f"  → {_BACKEND.display_name} elected Issue-mode "
                      f"({ISSUE_FALLBACK_FILENAME} present); opening Issue")
             issue_title_inner, issue_body_inner = parse_issue_fallback_file(issue_file)
             issue_title = f"{PR_TITLE_PREFIX} {issue_title_inner}"
@@ -12532,9 +12848,19 @@ def process_target(target: Target) -> dict:
                 # Without the explicit refspec this consistently 500s on the
                 # reset with "ambiguous argument 'origin/<branch>': unknown
                 # revision or path not in the working tree."
+                # `origin` is deliberately token-less: prepare_workdir
+                # rewrites it after cloning so the token never sits in
+                # .git/config where the coding agent could read it, and every
+                # sanctioned push re-authenticates through a one-shot URL
+                # instead (see commit_and_push). This block reached for
+                # `origin` directly, so its fetch prompted for a username and
+                # died — meaning the remediation commit could never land and
+                # every run that tripped the fidelity gate ended as a skip,
+                # whatever the patch had fixed. Observed on a real run.
+                authed = _authenticated_remote(target.repo)
                 try:
                     subprocess.run(
-                        ["git", "fetch", "origin",
+                        ["git", "fetch", authed,
                          f"+{branch}:refs/remotes/origin/{branch}"],
                         cwd=workdir, check=True, capture_output=True, text=True,
                     )
@@ -12547,7 +12873,7 @@ def process_target(target: Target) -> dict:
                         cwd=workdir, check=True, capture_output=True, text=True,
                     )
                     subprocess.run(
-                        ["git", "push", "origin", branch],
+                        ["git", "push", authed, f"HEAD:refs/heads/{branch}"],
                         cwd=workdir, check=True, capture_output=True, text=True,
                     )
                     log.info(f"  ✓ pushed patch commit on {branch}")
@@ -12862,6 +13188,10 @@ def build_pr_body(
         else:
             license_section = _render_license_section(rec)
         return _ensure_coauthor_trailer(_PR_BODY_TEMPLATE_BRIEF.format(
+            # The PR is published on someone else's repo; attributing the
+            # work to an agent that never ran is a claim, not a cosmetic
+            # label.
+            agent_name=_BACKEND.display_name,
             suggested_experiment=rec.suggested_experiment or "(no brief provided)",
             test_section=test_section,
             license_section=license_section,
@@ -12869,6 +13199,7 @@ def build_pr_body(
             attribution_url=CANONICAL_ATTRIBUTION_URL,
         ))
     return _ensure_coauthor_trailer(_PR_BODY_TEMPLATE.format(
+        agent_name=_BACKEND.display_name,
         paper_title=rec.paper_title,
         arxiv_id=rec.arxiv_id,
         interest_name=rec.interest_name or "(unnamed)",
@@ -12978,7 +13309,14 @@ def build_target_from_env() -> Target:
     # staged-synthesis routinely reach 15-20 min, and users triggering
     # runs without prior tuning were hitting the 15-min ceiling. Opus
     # refinement runs sit comfortably under 25 min at the new default.
-    timeout_raw = _optional_env("INPUT_CLAUDE_TIMEOUT", "1500")
+    # `agent-timeout` is the generalized input; `claude-timeout` is the
+    # original and keeps working indefinitely. Prefer the new name when both
+    # are set, so a caller migrating one workflow at a time is never
+    # surprised by the old value winning.
+    timeout_raw = (
+        _optional_env("INPUT_AGENT_TIMEOUT", "").strip()
+        or _optional_env("INPUT_CLAUDE_TIMEOUT", "1500")
+    )
     try:
         claude_timeout_s = int(timeout_raw)
     except ValueError:
@@ -14959,7 +15297,7 @@ def _run_pre_pr_fidelity_check(
         scoped_out=scoped_out,
     )
     log.info(
-        f"  → pre-PR fidelity Claude one-shot "
+        f"  → pre-PR fidelity {_BACKEND.display_name} one-shot "
         f"({verdict['mode_cited']}, subs={len(substitutions)}, "
         f"scoped_out={len(scoped_out)}, timeout={target.claude_timeout_s}s)"
     )
@@ -14968,8 +15306,8 @@ def _run_pre_pr_fidelity_check(
     )
     if not ok:
         verdict["status"] = "pre_pr_fidelity_failed_claude"
-        verdict["error"] = f"Claude non-zero: {raw[-500:]}"
-        log.warning(f"  ⚠ pre-PR fidelity Claude failed")
+        verdict["error"] = f"{_BACKEND.display_name} non-zero: {raw[-500:]}"
+        log.warning(f"  ⚠ pre-PR fidelity {_BACKEND.display_name} failed")
         return verdict
 
     matrix = _extract_json_object(raw)
@@ -15149,7 +15487,7 @@ def _run_mode3_insight_preservation_check(
     if not reframed_insight:
         log.info(
             "  → pre-PR fidelity (mode-3): no reframed_insight in self-review; "
-            "skipping (Claude may have omitted the field)"
+            f"skipping ({_BACKEND.display_name} may have omitted the field)"
         )
         verdict["status"] = "pre_pr_fidelity_mode3_skipped_no_insight"
         return verdict
@@ -15169,7 +15507,8 @@ def _run_mode3_insight_preservation_check(
         arxiv_id=rec.arxiv_id,
     )
     log.info(
-        f"  → pre-PR fidelity (mode-3) insight-preservation Claude one-shot "
+        f"  → pre-PR fidelity (mode-3) insight-preservation "
+            f"{_BACKEND.display_name} one-shot "
         f"(timeout={target.claude_timeout_s}s)"
     )
     audit_workdir = Path(tempfile.mkdtemp(prefix="outrider-mode3-fidelity-"))
@@ -15178,8 +15517,8 @@ def _run_mode3_insight_preservation_check(
     )
     if not ok:
         verdict["status"] = "pre_pr_fidelity_failed_claude"
-        verdict["error"] = f"Claude non-zero: {raw[-500:]}"
-        log.warning("  ⚠ pre-PR fidelity (mode-3) Claude failed")
+        verdict["error"] = f"{_BACKEND.display_name} non-zero: {raw[-500:]}"
+        log.warning(f"  ⚠ pre-PR fidelity (mode-3) {_BACKEND.display_name} failed")
         return verdict
 
     matrix = _extract_json_object(raw)
@@ -15802,17 +16141,20 @@ def run_fidelity_audit(target: Target) -> dict:
         audit_anchor = "paper"
         log.info(f"  → paper-anchored audit (arxiv:{arxiv_id}, no reference impl)")
 
-    log.info(f"  → Claude one-shot audit (timeout={target.claude_timeout_s}s)")
+    log.info(f"  → {_BACKEND.display_name} one-shot audit "
+             f"(timeout={target.claude_timeout_s}s)")
     ok, raw = _run_claude_oneshot(workdir, prompt, target.claude_timeout_s, max_turns=20)
     if not ok:
         result["status"] = "fidelity_failed_claude"
-        result["error"] = f"Claude returned non-zero: {raw[-500:]}"
+        result["error"] = f"{_BACKEND.display_name} returned non-zero: {raw[-500:]}"
         return result
 
     matrix = _extract_json_object(raw)
     if not matrix or "items" not in matrix:
         result["status"] = "fidelity_failed_claude"
-        result["error"] = f"Claude returned unparseable JSON: {raw[-500:]}"
+        result["error"] = (
+            f"{_BACKEND.display_name} returned unparseable JSON: {raw[-500:]}"
+        )
         return result
 
     coverage_section = _render_coverage_matrix(matrix, audit_anchor=audit_anchor)
@@ -16040,7 +16382,7 @@ def _fetch_recent_merged_prs(repo: str, limit: int) -> list[dict]:
 def _build_convention_extraction_prompt(
     upstream_repo: str, recent_prs: list[dict]
 ) -> str:
-    """Compose the prompt for the convention-extraction Claude one-shot."""
+    """Compose the prompt for the convention-extraction agent one-shot."""
     pr_blocks = []
     for pr in recent_prs:
         files_summary = "\n".join(
@@ -16370,7 +16712,7 @@ def _apply_pr_body_convention_update(
     )
     ok, raw = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=4)
     if not ok:
-        return False, "", f"body-rewrite Claude call failed: {raw[-300:]}"
+        return False, "", f"body-rewrite {_BACKEND.display_name} call failed: {raw[-300:]}"
     rewrite = _extract_json_object(raw)
     if not rewrite or "updated_body" not in rewrite:
         return False, "", f"body-rewrite returned unparseable JSON: {raw[-300:]}"
@@ -16691,7 +17033,8 @@ def run_convention_pass(target: Target) -> dict:
         (bundle_dir / "INVOCATION.md").write_text(invocation)
 
         # Run the agentic patch loop
-        log.info(f"  → invoking Claude Code patch session (timeout={target.claude_timeout_s}s)")
+        log.info(f"  → invoking {_BACKEND.display_name} patch session "
+                 f"(timeout={target.claude_timeout_s}s)")
         ok, patch_output = invoke_claude_code(clone_workdir, timeout_s=target.claude_timeout_s)
         if not ok:
             result["status"] = "convention_failed_patch"
@@ -17213,7 +17556,7 @@ def _apply_issue_body_convention_update(
     )
     ok, raw = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=4)
     if not ok:
-        return False, "", "", f"issue-body-rewrite Claude call failed: {raw[-300:]}"
+        return False, "", "", f"issue-body-rewrite {_BACKEND.display_name} call failed: {raw[-300:]}"
     rewrite = _parse_issue_rewrite_response(raw)
     if not rewrite:
         return False, "", "", (
@@ -17911,29 +18254,49 @@ def run_test_gate(target: Target) -> dict:
 
 
 def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[str]:
-    """Render a list of step_summary markdown lines for a ``claude_failed``
-    status, dispatching on the agent's log tail.
+    """Render step_summary markdown for an agent-failure status.
 
-    Currently agent-specific to Claude Code (Anthropic). When alternative
-    agent CLIs land (Aider, Goose, Copilot, Codex), this helper grows a
-    per-agent patterns + URLs lookup keyed on ``agent`` — the call site
-    in ``_write_step_summary`` doesn't change.
+    Dispatches on the agent's log tail. The recognizable causes — exhausted
+    credit, a rejected key, a rate limit — are common across vendors, but the
+    *remedy* is not: the console to top up at, the secret to rotate, and the
+    provider's name all differ per agent. Those come from the active backend
+    rather than being hardcoded, so a Backboard failure no longer tells the
+    operator to visit Anthropic's billing page.
     """
     tail = (log_tail or "").lower()
+    # Two different names matter here. The *credit* and the rate limit belong
+    # to whoever served the tokens (Anthropic, z.ai, Moonshot…), which is what
+    # model_backend records; the failure *tail* is the agent's own output.
+    vendor = _RUN_COST.get("model_backend") or _BACKEND.display_name
+    # The secret to rotate is the *provider's*, not the agent's: a z.ai-routed
+    # Claude Code run authenticates with ZAI_API_KEY, so telling the operator
+    # to reset ANTHROPIC_API_KEY sends them to the wrong secret.
+    secret = _BACKEND.key_env or "ANTHROPIC_API_KEY"
+    provider_id = (os.environ.get("INPUT_PROVIDER") or "").strip().lower()
+    if provider_id:
+        from agents.providers import PROVIDERS as _PROVIDERS
+        provider = _PROVIDERS.get(provider_id)
+        if provider is not None and provider.secret_env:
+            secret = provider.secret_env
+    billing = _BACKEND.billing_url
+    keys = _BACKEND.keys_url
     lines: list[str] = []
-    if "credit balance is too low" in tail:
-        lines.append("\n> ### 🪙 Action required: Anthropic credit balance exhausted\n>")
+    if "credit balance is too low" in tail or "no credits remaining" in tail:
         lines.append(
-            f"> All {claude_calls} Claude calls this run failed with "
-            "\"Credit balance is too low\"."
+            f"\n> ### 🪙 Action required: {vendor} credit balance exhausted\n>"
         )
         lines.append(
-            "> The `ANTHROPIC_API_KEY` secret authenticated — the account "
-            "just has no remaining credits."
+            f"> All {claude_calls} {_BACKEND.display_name} calls this run "
+            "failed for lack of credit."
+        )
+        lines.append(
+            f"> The `{secret}` secret authenticated — the account just has no "
+            "remaining credits."
         )
         lines.append(">")
-        lines.append(f"> **Top up at:** {_ANTHROPIC_BILLING_URL}")
-        lines.append(">")
+        if billing:
+            lines.append(f"> **Top up at:** {billing}")
+            lines.append(">")
         lines.append(
             "> The next scheduled run will retry automatically once "
             "credits are available.\n"
@@ -17943,27 +18306,117 @@ def _agent_failure_blocks(agent: str, log_tail: str, claude_calls: int) -> list[
         or "invalid api key" in tail
         or "invalid x-api-key" in tail
     ):
-        lines.append("\n> ### 🔑 Action required: ANTHROPIC_API_KEY secret invalid\n>")
+        lines.append(f"\n> ### 🔑 Action required: {secret} secret invalid\n>")
         lines.append(
-            "> The key configured as the `ANTHROPIC_API_KEY` repo secret "
-            "didn't authenticate."
+            f"> The key configured as the `{secret}` repo secret didn't "
+            "authenticate."
         )
-        lines.append(
-            f"> Check the key at {_ANTHROPIC_KEYS_URL} and update the "
-            "secret via"
-        )
-        lines.append("> `gh secret set ANTHROPIC_API_KEY --repo <this-repo>`.\n")
+        if keys:
+            lines.append(f"> Check the key at {keys} and update the secret via")
+        else:
+            lines.append("> Check the key with your provider and update it via")
+        lines.append(f"> `gh secret set {secret} --repo <this-repo>`.\n")
     elif "429" in tail or "rate_limit" in tail or "too many requests" in tail:
         lines.append("\n> ### ⏱️ Rate limited — no action needed\n>")
         lines.append(
-            "> The Anthropic API rate-limited this run. The next "
-            "scheduled run will retry.\n"
+            f"> {vendor} rate-limited this run. The next scheduled run will "
+            "retry.\n"
         )
     elif tail:
-        lines.append("\n<details><summary>Claude agent failure tail</summary>\n")
+        lines.append(
+        f"\n<details><summary>{_BACKEND.display_name} failure tail</summary>\n"
+    )
         lines.append(f"\n```\n{log_tail[:1500]}\n```\n")
         lines.append("\n</details>\n")
     return lines
+
+
+# Status values are stored data: the engine persists them and existing
+# queries group on them, so `claude_failed` cannot be renamed from this side
+# without orphaning rows. What it *can* do is stop displaying a Claude-
+# specific name for a run that used another agent — a Backboard failure
+# rendering as "claude_failed" is exactly the kind of misleading breadcrumb
+# the log sweep removed everywhere else.
+#
+# Display-only mapping. The posted value is untouched; generalizing the
+# stored value needs a server-side normalize-on-read first.
+_DISPLAY_STATUS = {
+    "claude_failed": "agent_failed",
+    "fidelity_failed_claude": "fidelity_failed_agent",
+    "pre_pr_fidelity_failed_claude": "pre_pr_fidelity_failed_agent",
+    "issue_convention_failed_claude": "issue_convention_failed_agent",
+}
+
+
+def _display_status(status: str) -> str:
+    """Human-facing form of a stored status value."""
+    return _DISPLAY_STATUS.get(status, status)
+
+
+def run_agent_smoke(target: "Target") -> dict:
+    """Verify one (agent, provider, model) configuration in seconds.
+
+    A full dispatch is the only way to know a run *works*, but it costs 10-80
+    minutes and real tokens, which makes it a terrible way to answer "did I
+    wire my secret correctly?". Six of the defects on this branch were found
+    by dispatches that spent an hour before failing on a one-line
+    misconfiguration — a wrong provider name, a stale token, a model id from
+    another vendor's vocabulary.
+
+    This does the smallest thing that exercises the whole configuration path:
+    resolve routing, run the backend's preflight, then make ONE agent call
+    with a trivial prompt and a tight turn cap. It reaches the vendor for
+    real, so it catches auth, endpoint, model-id and quota problems — the
+    things a unit test cannot — without doing any work.
+
+    Never opens a PR, never clones the target, never touches git.
+    """
+    log.info("  mode=smoke — verifying the agent/provider/model wiring only")
+    result: dict = {
+        "status": "smoke_failed",
+        "agent": _BACKEND.display_name,
+        "mode": "smoke",
+    }
+
+    ok, messages = (
+        _validate_claude_auth_env() if _BACKEND.name == "claude"
+        else _BACKEND.preflight()
+    )
+    for message in messages:
+        log.warning("  ⚠ %s", message)
+    if not ok:
+        result["error"] = "preflight failed: " + "; ".join(messages)
+        log.error("  ✗ preflight failed — the credential or model is wrong")
+        return result
+
+    workdir = Path(tempfile.mkdtemp(prefix="outrider-smoke-"))
+    prompt = (
+        "Reply with exactly the word OK and nothing else. "
+        "Do not use any tools."
+    )
+    log.info("  → one-shot probe against %s", _BACKEND.display_name)
+    answered, text = _run_claude_oneshot(
+        workdir, prompt, min(target.claude_timeout_s, 300), max_turns=1
+    )
+
+    result["reply"] = (text or "")[:200]
+    for key in ("cost_usd", "input_tokens", "output_tokens", "claude_calls",
+                "cost_basis", "model_backend"):
+        result[key] = _RUN_COST.get(key)
+
+    if not answered:
+        result["error"] = (text or "")[:500]
+        log.error("  ✗ the agent did not answer: %s", (text or "")[:300])
+        return result
+
+    result["status"] = "smoke_ok"
+    log.info(
+        "  ✓ %s answered via %s (cost_basis=%s, %s in / %s out)",
+        _BACKEND.display_name, result.get("model_backend"),
+        result.get("cost_basis"), result.get("input_tokens"),
+        result.get("output_tokens"),
+    )
+    return result
 
 
 def _write_step_summary(result: dict) -> None:
@@ -18032,6 +18485,8 @@ def _write_step_summary(result: dict) -> None:
         "issue_opened_substitution": "🔁",
         "skipped_test_failure":    "⏭️",
         "claude_failed":           "❌",
+        "smoke_ok":                "✅",
+        "smoke_failed":            "❌",
         "rejected_path_violations":"❌",
         "error":                   "❌",
         "aborted_secret_in_payload": "🛑",
@@ -18041,7 +18496,7 @@ def _write_step_summary(result: dict) -> None:
     }.get(status, "ℹ️")
 
     lines: list[str] = []
-    lines.append(f"## {emoji} Remyx Recommendation — `{status}`\n")
+    lines.append(f"## {emoji} Remyx Recommendation — `{_display_status(status)}`\n")
 
     if paper and arxiv:
         tier_str = f" ({tier})" if tier else ""
@@ -18208,7 +18663,7 @@ def _write_step_summary(result: dict) -> None:
     token_line = f"{in_tok:,} in / {out_tok:,} out"
     if cache_in_tok:
         token_line += f" ({cache_in_tok:,} cache-read)"
-    agent = result.get("agent", "Claude Code")
+    agent = result.get("agent") or _BACKEND.display_name
     backend = result.get("model_backend", "Anthropic")
     cost_basis = result.get("cost_basis", "claude_code_envelope")
     # Annotate the cost line when the figure is the CLI's
@@ -18218,6 +18673,12 @@ def _write_step_summary(result: dict) -> None:
     # the dollars are authoritative for that rate sheet.
     if cost_basis == "backend_rate_table":
         cost_note = f" *(computed from {backend} PAYG rates)*"
+    elif cost_basis == "backend_rate_table_approx":
+        # The named model has no rate row, so this used the host's default
+        # model's card. Saying "computed from PAYG rates" for that would
+        # dress an approximation as the vendor's own arithmetic.
+        cost_note = (f" *(approximated from {backend} rates — no rate card "
+                     f"for this model yet)*")
     elif backend != "Anthropic":
         cost_note = (" *(Anthropic-rate estimate on backend tokens; "
                      "see provider billing for the real number)*")
@@ -18228,7 +18689,7 @@ def _write_step_summary(result: dict) -> None:
     lines.append(f"- **Cost**: `${cost:.4f}`{cost_note}")
     lines.append(f"- **Tokens**: {token_line}")
     if claude_calls:
-        lines.append(f"- **Claude calls**: {claude_calls}")
+        lines.append(f"- **{agent} calls**: {claude_calls}")
     lines.append("")
 
     if rejected:
@@ -18252,7 +18713,7 @@ def _write_step_summary(result: dict) -> None:
 
     if status == "claude_failed":
         lines.extend(_agent_failure_blocks(
-            agent="claude",
+            agent=_BACKEND.name,
             log_tail=result.get("claude_log_tail") or "",
             claude_calls=claude_calls,
         ))
@@ -18365,6 +18826,17 @@ def _post_run_telemetry(result: dict, target: "Target") -> None:
         "output_tokens": result.get("output_tokens"),
         "cache_read_input_tokens": result.get("cache_read_input_tokens"),
         "claude_calls": result.get("claude_calls"),
+        # Agent-neutral alias, dual-written so the engine can migrate its
+        # column without a flag day: the ingest reads named keys only, so
+        # this is inert until the server adds it, and `claude_calls` stays
+        # until its dashboards have moved.
+        #
+        # Deliberately NOT aliasing `claude_log_tail`: it is not posted to
+        # the engine today and there is no column for it. Adding one here
+        # would start shipping agent log output over the wire as a side
+        # effect of a rename — a new data flow that needs its own scrubbing
+        # review, not a compatibility shim.
+        "agent_calls": result.get("claude_calls"),
         "num_turns": result.get("num_turns"),
         # Coding-agent identity + backend / cost-basis annotations. These
         # let SQL slice telemetry by which backend served a run (Anthropic
@@ -18536,6 +19008,15 @@ def run_refinement_chain(target: Target, pr_number: int) -> dict:
     return chain
 
 
+#: Every mode ``main()`` accepts, and the single source for both the
+#: allowlist and its error message. Keep in step with the dispatch in
+#: ``main()`` — ``tests/test_agent_smoke_mode.py`` asserts they agree.
+_MODES = (
+    "recommend", "weekly-summary", "fidelity", "convention", "test",
+    "issue-convention", "brief", "smoke",
+)
+
+
 def main():
     # Mode dispatch: "recommend" is the classic
     # scout-and-implement run; "weekly-summary" aggregates the past week
@@ -18546,13 +19027,13 @@ def main():
         or os.environ.get("INPUT_MODE")
         or "recommend"
     ).strip().lower().replace("_", "-")
-    if mode not in (
-        "recommend", "weekly-summary", "fidelity", "convention", "test",
-        "issue-convention", "brief",
-    ):
-        log.error(f"Unknown mode {mode!r}; must be 'recommend', "
-                  f"'weekly-summary', 'fidelity', 'convention', 'test', "
-                  f"'issue-convention', or 'brief'.")
+    if mode not in _MODES:
+        # Built from the same tuple the dispatch below reads, so a new mode
+        # can never be accepted by one and unlisted by the other. "smoke"
+        # shipped with a dispatch branch but no allowlist entry, and was
+        # rejected here before ever reaching it.
+        log.error("Unknown mode %r; must be one of %s.", mode,
+                  ", ".join(repr(m) for m in _MODES))
         sys.exit(2)
 
     target = build_target_from_env()
@@ -18570,28 +19051,76 @@ def main():
     # in the workflow `env:` block (the pre-input workaround) still works;
     # this input is the documented surface.
     if target.model_base_url:
-        os.environ["ANTHROPIC_BASE_URL"] = target.model_base_url
+        # Point the *configured* agent at the endpoint. Writing
+        # ANTHROPIC_BASE_URL unconditionally is right for Claude Code and
+        # inert for anything else, which would leave a `model-base-url` run
+        # on another agent silently talking to the vendor default instead of
+        # the endpoint the caller named.
+        #
+        # Two cases it must NOT do that in, because routing already refused
+        # the override and applying it here would win anyway:
+        #
+        #   a named provider  — the registry owns that vendor's endpoint. A
+        #     leftover `model-base-url` from the pre-provider era would send
+        #     the provider's key to a different vendor's host and 401.
+        #   a native router   — its base_url_env is the router's own control
+        #     plane, not a model endpoint. Repointing it aims R-CLI at the
+        #     wrong service entirely.
+        applied, warning = endpoint_override(
+            target.model_base_url,
+            provider_id=os.environ.get("INPUT_PROVIDER") or "",
+        )
+        if warning:
+            log.warning("  ⚠ %s", warning)
+        target.model_base_url = applied
+    if target.model_base_url:
+        base_url_var = _BACKEND.base_url_env or "ANTHROPIC_BASE_URL"
+        os.environ[base_url_var] = target.model_base_url
         backend_name, backend_rates = _detect_backend(target.model_base_url)
         if backend_rates is not None:
             cost_note = f"cost computed from {backend_name} rate table"
         else:
             cost_note = (f"cost telemetry is Anthropic-rate estimate "
                          f"(no rate table for {backend_name})")
-        log.info(f"  routing Claude Code via {target.model_base_url} "
-                 f"({cost_note})")
+        log.info(f"  routing {_BACKEND.display_name} via "
+                 f"{target.model_base_url} ({cost_note}, {base_url_var})")
     # Validate the auth env shape before any agent call. Catches the
     # common misconfigurations (missing var, literal '-' from
     # gh-secret-set ambiguity, whitespace, mutual-exclusion on non-
     # default backends) that otherwise surface as opaque 401s after a
     # full run's worth of clone + spec-bundle work.
-    auth_ok, auth_warnings = _validate_claude_auth_env()
-    for w in auth_warnings:
-        log.warning("  ⚠ auth check: %s", w)
+    if _BACKEND.name == "claude":
+        auth_ok, auth_warnings = _validate_claude_auth_env()
+    else:
+        # Each backend knows its own credential. Checking here, before any
+        # clone or prompt build, keeps a missing key from costing a full
+        # dispatch's setup before failing.
+        auth_ok, auth_warnings = _BACKEND.preflight()
+    # Level follows the verdict. These same messages are advisory when the
+    # check passes and fatal when it doesn't, and reporting a fatal one as
+    # "⚠ auth check: ..." left the run exiting 2 with nothing saying it had
+    # stopped — the last line the user saw looked like a warning it had
+    # carried on past.
+    for message in auth_warnings:
+        if auth_ok:
+            log.warning("  ⚠ auth check: %s", message)
+        else:
+            log.error("  ✗ auth check: %s", message)
     if not auth_ok:
+        log.error(
+            "  ✗ stopping before any %s call — fix the configuration above "
+            "and re-run. Nothing was cloned, and no tokens were spent.",
+            _BACKEND.display_name,
+        )
         sys.exit(2)
+    log.info("  agent=%s (%s)", _BACKEND.name, _BACKEND.display_name)
     log.info(f"=== {target.repo} ===")
     log.info(f"  interest_id={target.interest_id}")
-    if mode == "weekly-summary":
+    if mode == "smoke":
+        log.info("  mode=smoke")
+        runner = run_agent_smoke
+        failure_status = "smoke_failed"
+    elif mode == "weekly-summary":
         log.info("  mode=weekly-summary")
         runner = run_weekly_summary
         failure_status = "weekly_summary_failed"
@@ -18691,7 +19220,7 @@ def main():
     # Bedrock" / etc. when ANTHROPIC_BASE_URL routes elsewhere. cost_basis
     # tells the step summary whether cost was computed from a known rate
     # card or trusted from the CLI's envelope.
-    result["agent"] = "Claude Code"
+    result["agent"] = _BACKEND.display_name
     result["model_backend"] = _RUN_COST.get("model_backend", "Anthropic")
     result["cost_basis"] = _RUN_COST.get("cost_basis", "claude_code_envelope")
     result["envelopes_without_usage"] = _RUN_COST.get(
