@@ -168,7 +168,24 @@ def test_the_cocoindex_input_still_gates_both_steps_it_names():
     ]
     assert len(gated) == 2
     for step in gated:
-        assert step.get("if") == "${{ inputs.enable-cocoindex == 'true' }}", step["name"]
+        assert "inputs.enable-cocoindex == 'true'" in step.get("if", ""), step["name"]
+
+
+def test_the_tool_is_advertised_only_when_it_actually_installed():
+    """Observed on a real run: the install failed (non-fatal, by design) and
+    the next step wrote the file telling the agent the tool was there. An
+    agent sent after a binary that does not exist reads as the model ignoring
+    instructions — the exact failure the tooling module exists to prevent."""
+    steps = _action_steps()
+    install = next(s for s in steps
+                   if "cocoindex" in (s.get("name") or "").lower())
+    advertise = next(s for s in steps
+                     if "ENVIRONMENTS.md" in (s.get("name") or ""))
+    assert install.get("id"), "the install step must be referenceable"
+    assert f"steps.{install['id']}.outputs.installed == 'true'" in advertise["if"]
+    # And the install has to publish that verdict either way.
+    assert "installed=true" in install["run"]
+    assert "installed=false" in install["run"]
 
 
 def test_the_run_step_receives_both_axes():
@@ -235,3 +252,144 @@ def test_a_native_routers_control_plane_is_not_a_model_endpoint(monkeypatch):
                                              provider_id="custom")
     assert applied == ""
     assert "control plane" in warning
+
+
+# ─── a malformed engine key says which secret to fix ───────────────────────
+
+
+def test_a_key_with_a_line_break_names_the_secret_instead_of_crashing(monkeypatch):
+    """A secret pasted with a stray newline is a legal repo secret and an
+    illegal HTTP header. The run died inside urllib on "Invalid header value
+    b'***'" — masked, with nothing pointing at the secret. Hit for real on a
+    live runner when a restore command concatenated two values."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    monkeypatch.setenv("REMYX_API_KEY", "rmxu_first\nrmxu_second")
+    with pytest.raises(RuntimeError) as excinfo:
+        run._engine_api_key()
+    assert "REMYX_API_KEY" in str(excinfo.value)
+    assert "gh secret set" in str(excinfo.value)
+
+
+def test_a_padded_key_is_used_rather_than_refused(monkeypatch):
+    """Trailing whitespace is a paste artifact, not a different key."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    monkeypatch.setenv("REMYX_API_KEY", "  rmxu_padded\t")
+    assert run._engine_api_key() == "rmxu_padded"
+
+
+def test_no_key_at_all_is_still_the_empty_string(monkeypatch):
+    """The callers raise their own "REMYX_API_KEY is required" message; this
+    must not pre-empt it with a confusing one."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    monkeypatch.delenv("REMYX_API_KEY", raising=False)
+    monkeypatch.delenv("REMYXAI_API_KEY", raising=False)
+    assert run._engine_api_key() == ""
+
+
+def test_the_bot_token_mint_degrades_instead_of_raising(monkeypatch):
+    """That path falls back to GITHUB_TOKEN by design, so a malformed key
+    must not become an exception there — but it should say which secret is
+    wrong rather than degrading silently."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    monkeypatch.setenv("REMYX_API_KEY", "rmxu_first\nrmxu_second")
+    monkeypatch.setenv("TARGET_REPO", "owner/name")
+    run._BOT_TOKEN.update(attempted=False, token="", minted_at=0.0)
+    assert run._mint_bot_token() == ""
+
+
+# ─── a coverage metric calibrated to one agent must not judge another ──────
+
+
+def _coverage(run, **over):
+    base = {"searches": 0, "file_reads": 0, "visible_lines": 0,
+            "exploration_structure": {"domains": 8, "structure": "branching"}}
+    base.update(over)
+    return base
+
+
+def test_a_transcript_that_parsed_to_nothing_is_not_an_unexplored_pick(monkeypatch):
+    """The shape a real Backboard run produced: every signal zero, including
+    the exploration structure. An agent that genuinely explored nothing still
+    leaves some trace — it ran, it edited files — so an all-zero parse means
+    the transcript was absent or unreadable, not that the pick was baseless."""
+    run = _run_module(monkeypatch, INPUT_AGENT="backboard", BACKBOARD_API_KEY="k")
+    coverage = _coverage(run, exploration_structure={"domains": 0,
+                                                     "domain_list": []})
+    run._apply_coverage_gate({}, coverage, higher_floor=False)
+    assert coverage["basis"] == "unavailable"
+    assert "under_explored" not in coverage
+
+
+def test_a_transcript_this_parser_cannot_read_is_not_an_unexplored_pick(monkeypatch):
+    """Observed on a real Codex run: eight domains of tool activity, and
+    searches, file reads and visible lines all zero — recorded as
+    `under_explored: true` for a pick that was nothing of the sort. The floor
+    is calibrated to one agent's transcript vocabulary, so a zero from another
+    agent is a measurement gap until proven otherwise. Under `enforce` this
+    would have downgraded every Codex pick to a skip."""
+    run = _run_module(monkeypatch, INPUT_AGENT="codex", CODEX_API_KEY="k")
+    coverage = _coverage(run)
+    data = run._apply_coverage_gate({}, coverage, higher_floor=False)
+    assert coverage["basis"] == "unavailable"
+    assert "under_explored" not in coverage
+    assert data.get("chosen_index") != -1
+
+
+def test_real_coverage_is_still_judged(monkeypatch):
+    """The gate must keep working where it can measure: a transcript with
+    reads and lines is judged against the floor as before."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    thin = _coverage(run, searches=1, file_reads=1, visible_lines=10)
+    run._apply_coverage_gate({}, thin, higher_floor=False)
+    assert thin["under_explored"] is True
+    assert thin.get("basis") != "unavailable"
+
+    deep = _coverage(run, searches=4, file_reads=9, visible_lines=900)
+    run._apply_coverage_gate({}, deep, higher_floor=False)
+    assert deep["under_explored"] is False
+
+
+def test_enforce_mode_never_downgrades_what_it_cannot_measure(monkeypatch):
+    """The whole point: enforcing a floor against an unmeasurable transcript
+    turns every pick into "the model found nothing worth doing"."""
+    run = _run_module(monkeypatch, INPUT_AGENT="codex", CODEX_API_KEY="k")
+    monkeypatch.setenv("REMYX_SELECTION_COVERAGE_GATE", "enforce")
+    data = {"chosen_index": 3}
+    out = run._apply_coverage_gate(data, _coverage(run), higher_floor=False)
+    assert out["chosen_index"] == 3
+
+
+# ─── every push has to re-authenticate, because origin is token-less ───────
+
+
+def test_a_git_remote_that_needs_credentials_carries_them(monkeypatch):
+    """`prepare_workdir` rewrites origin token-less after cloning, so the
+    token never sits in .git/config where a coding agent with shell access
+    could read it. Anything needing credentials must re-authenticate through a
+    one-shot URL."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    monkeypatch.setattr(run, "_github_token", lambda: "ghs_testtoken")
+    url = run._authenticated_remote("owner/name")
+    assert url == "https://x-access-token:ghs_testtoken@github.com/owner/name.git"
+
+
+def test_it_falls_back_to_origin_when_there_is_no_token(monkeypatch):
+    """So the caller's own error handling stays in charge rather than this
+    helper inventing a broken URL."""
+    run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
+    monkeypatch.setattr(run, "_github_token", lambda: "")
+    assert run._authenticated_remote("owner/name") == "origin"
+
+
+def test_the_fidelity_remediation_push_does_not_reach_for_origin():
+    """It did, and origin has no credentials — so the fetch prompted for a
+    username and died. The remediation commit could never land, and every run
+    that tripped the fidelity gate ended as a skip whatever the patch had
+    fixed. Seen on a real run: "could not read Username for
+    'https://github.com'" right after "patch attempt applied edits"."""
+    src = (ROOT / "src" / "run.py").read_text()
+    block = src[src.index("Fidelity remediation") - 2000:
+                src.index("Fidelity remediation") + 1200]
+    assert '"git", "fetch", authed' in block
+    assert '"git", "push", authed' in block
+    assert '"git", "push", "origin", branch' not in block

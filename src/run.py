@@ -85,8 +85,11 @@ from agents import ApiFamily, Capability, resolve as _resolve_agent
 # Mirror REMYX_API_KEY → REMYXAI_API_KEY so the `remyxai` CLI authenticates
 # in subprocesses spawned by the selection pass (Claude Code shell-out). The
 # CLI reads REMYXAI_API_KEY; the action canonically uses REMYX_API_KEY.
+# Stripped on the way across: a secret pasted with a trailing newline is a
+# legal repo secret and an illegal HTTP header, and the CLI would hit the
+# same wall this action now guards against.
 if os.environ.get("REMYX_API_KEY") and not os.environ.get("REMYXAI_API_KEY"):
-    os.environ["REMYXAI_API_KEY"] = os.environ["REMYX_API_KEY"]
+    os.environ["REMYXAI_API_KEY"] = os.environ["REMYX_API_KEY"].strip()
 
 REMYX_API_BASE = os.environ.get("REMYX_API_BASE", "https://engine.remyx.ai")
 REMYX_RECOMMENDATION_PERIOD = os.environ.get("REMYX_RECOMMENDATION_PERIOD", "week")
@@ -2220,9 +2223,15 @@ def _mint_bot_token() -> str:
         log.info(f"  bot token stale (age {int(age_s)}s > "
                  f"{_BOT_TOKEN_MAX_AGE_S}s); re-minting")
     _BOT_TOKEN["attempted"] = True
-    api_key = (
-        os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
-    )
+    # Same validation as every other engine call, but never fatal here: this
+    # path degrades to GITHUB_TOKEN by design. Without it a malformed secret
+    # surfaced as a masked urllib error — "Invalid header value b'***'" —
+    # which says nothing about which secret is wrong.
+    try:
+        api_key = _engine_api_key()
+    except RuntimeError as e:
+        log.warning(f"  ⚠ {e}")
+        return ""
     repo = (os.environ.get("TARGET_REPO") or "").strip()
     repo = repo.split("github.com/")[-1].strip("/")
     if not api_key or "/" not in repo:
@@ -2673,6 +2682,28 @@ def _apply_branch_collision_suffix(
     return fallback
 
 
+def _engine_api_key() -> str:
+    """The engine credential, validated before it becomes a header.
+
+    A secret pasted with a stray newline — two values concatenated, a copied
+    line break — is a legal repo secret and an illegal HTTP header, so the
+    run died on `Invalid header value b'***'` from inside urllib, with the
+    value masked and nothing pointing at the secret. Whitespace is stripped
+    and a value that still cannot be a header fails with the name of the
+    secret to fix.
+    """
+    raw = os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY") or ""
+    api_key = raw.strip()
+    if api_key and (len(api_key.split()) > 1 or "\n" in api_key or "\r" in api_key):
+        raise RuntimeError(
+            "REMYX_API_KEY contains whitespace or a line break, so it cannot "
+            "be sent as an HTTP header. It usually means the secret was "
+            "pasted with a newline or holds more than one value. Re-set it: "
+            "gh secret set REMYX_API_KEY"
+        )
+    return api_key
+
+
 def strip_html(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
@@ -2683,7 +2714,7 @@ def strip_html(s: str) -> str:
 def _remyx_get(path: str, *, params: dict | None = None) -> dict:
     """GET against the Remyx engine API with the configured API key.
     Raises RuntimeError on non-2xx response."""
-    api_key = os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
+    api_key = _engine_api_key()
     if not api_key:
         raise RuntimeError(
             "REMYX_API_KEY (or REMYXAI_API_KEY) is required. Generate one "
@@ -2714,7 +2745,7 @@ def _remyx_get(path: str, *, params: dict | None = None) -> dict:
 def _remyx_post(path: str, body: dict) -> dict:
     """POST against the Remyx engine API with the configured API key.
     Raises RuntimeError on non-2xx response. Mirrors ``_remyx_get``."""
-    api_key = os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
+    api_key = _engine_api_key()
     if not api_key:
         raise RuntimeError(
             "REMYX_API_KEY (or REMYXAI_API_KEY) is required. Generate one "
@@ -5582,8 +5613,13 @@ def prepare_workdir(target: Target) -> Path:
         # Explicit refspec so ``origin/<ref>`` remote-tracking exists too —
         # commit_and_push's sanity check resolves ``origin/<start-from-ref>``,
         # and a plain ``git fetch origin <ref>`` only updates FETCH_HEAD.
+        # Same re-authentication as every other credentialed git call: origin
+        # was rewritten token-less a few lines up, so this fetch carries the
+        # token in a one-shot URL. On a public repo it worked anonymously,
+        # which is exactly why the gap survived — a private install would have
+        # failed here with "could not read Username".
         subprocess.run(
-            ["git", "fetch", "--depth", "20", "origin",
+            ["git", "fetch", "--depth", "20", _authenticated_remote(target.repo),
              f"{start_from_ref}:refs/remotes/origin/{start_from_ref}"],
             cwd=workdir, check=True, env=clone_env,
         )
@@ -8955,17 +8991,62 @@ def _apply_coverage_gate(
     ).lower().strip()
     if mode == "off":
         return data
-    if not _BACKEND.can(Capability.STREAM_TRANSCRIPT):
-        # No transcript means visible_lines is 0, which is below every floor —
-        # enforcing here would downgrade *every* pick to a skip and the run
-        # would read as "the model found nothing worth doing" rather than
-        # "this agent can't report coverage". Degrade to observe and say why.
+    # Two ways coverage can be unmeasurable, and neither means the agent
+    # explored nothing:
+    #
+    #   no transcript at all — the capability says so up front;
+    #   a transcript this parser cannot read for coverage — the agent
+    #     streamed tool activity (exploration_structure saw domains) but none
+    #     of it in the vocabulary the floor counts. Observed on a real Codex
+    #     run: 8 domains of activity, and searches / file_reads /
+    #     visible_lines all zero, which recorded `under_explored: true` for a
+    #     pick that was nothing of the sort — and under `enforce` would have
+    #     downgraded every Codex pick to a skip.
+    #
+    # The floor is calibrated to one agent's transcript vocabulary, so a zero
+    # from another agent is a measurement gap until proven otherwise.
+    structure = coverage.get("exploration_structure") or {}
+    # Every signal at zero means the parse produced nothing at all, which is
+    # a measurement gap rather than evidence. An agent that genuinely
+    # explored nothing still leaves *some* trace: it ran, it edited files. So
+    # an all-zero parse says the transcript was absent or unreadable for this
+    # agent, whatever the capability flag claims.
+    #
+    # Both non-default agents land here for different reasons — Codex with
+    # eight domains of activity and no countable reads, Backboard with a
+    # parse that yielded nothing — and both were recorded as under-explored
+    # picks that were nothing of the sort.
+    signals = (
+        coverage.get("searches"), coverage.get("file_reads"),
+        coverage.get("visible_lines"), structure.get("domains"),
+        structure.get("turns"),
+    )
+    unmeasurable = (
+        not _BACKEND.can(Capability.STREAM_TRANSCRIPT)
+        or not any(signals)
+        or (bool(structure.get("domains") or structure.get("turns"))
+            and not any(coverage.get(k) for k in
+                        ("searches", "file_reads", "visible_lines")))
+    )
+    if unmeasurable:
         coverage["basis"] = "unavailable"
+        # Not "under-explored": that asserts something this run cannot see.
+        coverage.pop("under_explored", None)
+        log.info(
+            "  selection coverage: unmeasurable on %s (basis=unavailable) — "
+            "%s. Not treated as under-explored.",
+            _BACKEND.name,
+            "no tool transcript"
+            if not _BACKEND.can(Capability.STREAM_TRANSCRIPT)
+            else ("its transcript parsed to nothing at all"
+                  if not any(signals)
+                  else "its transcript carries no countable reads or searches"),
+        )
         if mode == "enforce":
             log.warning(
-                "⚠ selection coverage gate: %s reports no tool transcript, so "
-                "coverage can't be measured; running in observe mode instead "
-                "of downgrading every pick.", _BACKEND.name,
+                "⚠ selection coverage gate: coverage can't be measured for "
+                "%s, so this run stays in observe mode instead of "
+                "downgrading every pick.", _BACKEND.name,
             )
         return data
     if higher_floor:
@@ -10477,6 +10558,23 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
         title = "Remyx Recommendation: paper needs team discussion"
     body = "\n".join(lines[body_start:]).strip()
     return title, body
+
+
+def _authenticated_remote(repo: str) -> str:
+    """A one-shot push/fetch URL carrying the current token, or ``origin``.
+
+    ``prepare_workdir`` rewrites origin token-less after cloning, so the token
+    never lands in ``.git/config`` where a coding agent with shell access
+    could read it. Every git operation that needs credentials therefore has to
+    re-authenticate through a URL argument rather than reaching for origin —
+    ``_github_token()`` also re-mints when a long session has outlasted the
+    token's TTL. Falls back to ``origin`` when there is no token, so the
+    caller's own error handling stays in charge.
+    """
+    token = _github_token()
+    if not token:
+        return "origin"
+    return f"https://x-access-token:{token}@github.com/{repo}.git"
 
 
 def commit_and_push(
@@ -12721,9 +12819,19 @@ def process_target(target: Target) -> dict:
                 # Without the explicit refspec this consistently 500s on the
                 # reset with "ambiguous argument 'origin/<branch>': unknown
                 # revision or path not in the working tree."
+                # `origin` is deliberately token-less: prepare_workdir
+                # rewrites it after cloning so the token never sits in
+                # .git/config where the coding agent could read it, and every
+                # sanctioned push re-authenticates through a one-shot URL
+                # instead (see commit_and_push). This block reached for
+                # `origin` directly, so its fetch prompted for a username and
+                # died — meaning the remediation commit could never land and
+                # every run that tripped the fidelity gate ended as a skip,
+                # whatever the patch had fixed. Observed on a real run.
+                authed = _authenticated_remote(target.repo)
                 try:
                     subprocess.run(
-                        ["git", "fetch", "origin",
+                        ["git", "fetch", authed,
                          f"+{branch}:refs/remotes/origin/{branch}"],
                         cwd=workdir, check=True, capture_output=True, text=True,
                     )
@@ -12736,7 +12844,7 @@ def process_target(target: Target) -> dict:
                         cwd=workdir, check=True, capture_output=True, text=True,
                     )
                     subprocess.run(
-                        ["git", "push", "origin", branch],
+                        ["git", "push", authed, f"HEAD:refs/heads/{branch}"],
                         cwd=workdir, check=True, capture_output=True, text=True,
                     )
                     log.info(f"  ✓ pushed patch commit on {branch}")

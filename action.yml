@@ -660,6 +660,7 @@ runs:
       # to every run, which the input exists to let a caller opt out of. The
       # guard was lost when this step was rewritten to be agent-aware, which
       # made the input a no-op and the opt-out a lie.
+      id: cocoindex
       if: ${{ inputs.enable-cocoindex == 'true' }}
       shell: bash
       # The `ccc` binary is the portable surface: every agent has a shell
@@ -687,12 +688,24 @@ runs:
         # `ccc --version` needs a flag the typer app doesn't expose (it
         # raises a red "No such option" box that scares readers even when
         # suppressed). `command -v` is quiet and definitive.
-        command -v ccc >/dev/null 2>&1 && echo "ccc on PATH" || echo "WARNING: ccc missing"
+        if command -v ccc >/dev/null 2>&1; then
+          echo "ccc on PATH"
+          echo "installed=true" >> "$GITHUB_OUTPUT"
+        else
+          # Non-fatal by design, but it has to be *recorded*: the next step
+          # writes the file that tells the agent this tool exists, and an
+          # agent sent after a binary that is not there reads as the model
+          # ignoring instructions. Seen on a real run, where the install
+          # failed and ENVIRONMENTS.md advertised ccc anyway.
+          echo "WARNING: ccc missing"
+          echo "installed=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Write ENVIRONMENTS.md so the selection agent knows ccc is available
-      # Same gate: advertising a tool the previous step was told not to
-      # install sends the agent after a binary that is not there.
-      if: ${{ inputs.enable-cocoindex == 'true' }}
+      # Same gate, plus the install's own verdict: advertising a tool that was
+      # not installed — because the caller opted out, or because the install
+      # failed — sends the agent after a binary that is not there.
+      if: ${{ inputs.enable-cocoindex == 'true' && steps.cocoindex.outputs.installed == 'true' }}
       shell: bash
       # The surface text names the invocation path the ACTIVE agent actually
       # has. Telling Codex or R-CLI about a "/ccc slash command" sends them
