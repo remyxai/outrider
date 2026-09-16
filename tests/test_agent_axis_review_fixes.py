@@ -233,15 +233,19 @@ def test_an_override_reaches_an_endpoint_the_caller_owns(monkeypatch):
     assert applied == "https://proxy.internal/v1" and warning == ""
 
 
-def test_a_named_providers_endpoint_is_not_overridable(monkeypatch):
-    """Routing discards the override for a named provider, but this is applied
-    after routing, so it won. A leftover `model-base-url` from the
-    pre-provider era sent the provider's key to a different vendor's host."""
+def test_a_named_providers_endpoint_override_is_honored_and_warned(monkeypatch):
+    """An explicit `model-base-url` is the caller naming an endpoint, and
+    installs generated before the provider axis pass a provider AND a base URL
+    together — a self-hosted gateway, a proxy in front of the vendor.
+    Discarding it silently sent those runs to the vendor's public endpoint,
+    which is a behavior change they never asked for. It is honored, with a
+    warning, because the same pairing is how a leftover URL sends one vendor's
+    key to another vendor's host."""
     run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
-    applied, warning = run.endpoint_override("https://api.z.ai/api/anthropic",
+    applied, warning = run.endpoint_override("https://gateway.internal/v1",
                                              provider_id="moonshot")
-    assert applied == ""
-    assert "provider=moonshot" in warning
+    assert applied == "https://gateway.internal/v1"
+    assert "provider=moonshot" in warning and "credential will be sent" in warning
 
 
 def test_a_native_routers_control_plane_is_not_a_model_endpoint(monkeypatch):

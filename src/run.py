@@ -8352,10 +8352,21 @@ def endpoint_override(base_url: str, backend=None, provider_id: str = "") -> tup
         )
     provider_id = (provider_id or "").strip()
     if provider_id and provider_id != "custom":
-        return "", (
-            f"model-base-url is ignored for provider={provider_id}: the "
-            f"action resolves that vendor's endpoint itself. Use "
-            f"provider=custom to point at your own."
+        # Honored, not discarded: an explicit `model-base-url` is the caller
+        # asking for a specific endpoint, and installs generated before the
+        # provider axis pass a provider AND a base URL together — a
+        # self-hosted gateway, a proxy in front of the vendor. Ignoring it
+        # would silently send those runs to the vendor's public endpoint
+        # instead, which is a behavior change they never asked for.
+        #
+        # It still deserves a warning, because the pairing is also how a
+        # leftover URL from the pre-provider era sends one vendor's key to
+        # another vendor's host and 401s.
+        return base_url, (
+            f"model-base-url overrides the endpoint the registry holds for "
+            f"provider={provider_id}; that provider's credential will be sent "
+            f"to {base_url}. Intended for a proxy or self-hosted gateway — if "
+            f"it is a leftover from an older setup, clear it."
         )
     return base_url, ""
 
