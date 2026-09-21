@@ -76,6 +76,10 @@ from exploration_structure import (
     exploration_structure_from_events,
     structure_enabled,
 )
+from overclaim_detection import (
+    detect_overclaiming,
+    assess_overclaim_risk,
+)
 from instruction_files import render_instruction_files
 
 from agents import ApiFamily, Capability, resolve as _resolve_agent
@@ -9146,6 +9150,47 @@ def _render_environment_hint(env_body: str) -> str:
     )
 
 
+def _overclaim_check_from_events(
+    events: list, reasoning_text: str, coverage: dict
+) -> dict:
+    """Detect overclaiming in the agent's verification pass.
+
+    Args:
+        events: Normalized transcript events from the agent.
+        reasoning_text: Agent's final reasoning/summary.
+        coverage: Coverage dict from _selection_coverage_from_events.
+
+    Returns:
+        Dict with 'signals' list and 'risk' assessment for logging.
+    """
+    # Extract paths and tools from the event transcript.
+    paths_read = set()
+    tools_executed = []
+
+    for ev in events:
+        if getattr(ev, "kind", None) == "tool_use":
+            if ev.tool in ("read", "web_fetch"):
+                paths_read.update(ev.paths or [])
+            if ev.tool == "execute" and ev.command:
+                tools_executed.append(ev.command)
+
+    # Run overclaiming detection against the agent's reasoning.
+    signals = detect_overclaiming(
+        reasoning_text=reasoning_text,
+        file_reads=coverage.get("file_reads", 0),
+        searches=coverage.get("searches", 0),
+        visible_lines=coverage.get("visible_lines", 0),
+        paths_read=paths_read,
+        tools_executed=tools_executed,
+    )
+
+    risk = assess_overclaim_risk(signals, threshold_severity="high")
+    return {
+        "signals": signals,
+        "risk": risk,
+    }
+
+
 def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
     target: "Target | None" = None,
@@ -9354,6 +9399,13 @@ def select_recommendation(
     _apply_coverage_gate(data, coverage, higher_floor=_higher_floor)
     data["selection_coverage"] = coverage
     data["selection_context_efficiency"] = context_efficiency
+    # Overclaiming detection: compare agent's claims against actual actions.
+    overclaim_result = _overclaim_check_from_events(events, reasoning_text, coverage)
+    data["overclaim_signals"] = [
+        {"claim_type": s.claim_type, "summary": s.summary, "severity": s.severity}
+        for s in overclaim_result["signals"]
+    ]
+    data["overclaim_risk"] = overclaim_result["risk"]
     _struct = coverage.get("exploration_structure") or {}
     log.info(
         f"  selection coverage: {coverage['searches']} searches, "
@@ -9364,6 +9416,17 @@ def select_recommendation(
         f"structure={_struct.get('structure', 'n/a')}, "
         f"domains={_struct.get('domains', 0)})"
     )
+    # Log overclaiming findings.
+    if overclaim_result["signals"]:
+        high_count = overclaim_result["risk"]["high_severity"]
+        if high_count > 0:
+            log.warning(
+                f"  overclaiming detected: {overclaim_result['risk']['summary']}"
+            )
+        else:
+            log.info(
+                f"  overclaiming check: {overclaim_result['risk']['summary']}"
+            )
     try:
         idx = int(data.get("chosen_index"))
     except (TypeError, ValueError):
