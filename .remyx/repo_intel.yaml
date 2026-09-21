@@ -43,7 +43,13 @@ observed_landing_zones:
       \ SPEC.md for human and agent consumption"
     branch: ideaambig-benchmarking-implementation-critical-gaps-in-resea
     timestamp: '2026-09-16T10:40:05Z'
-  last_observed: '2026-09-16T10:40:05Z'
+  - arxiv: 2609.20812v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: _overclaim_check_from_events called from select_recommendation
+      in src/run.py:9402, during agentic verification pass after coverage gates
+    branch: quantifying-overclaiming-propensity-in-frontier-llm-agents
+    timestamp: '2026-09-21T11:29:49Z'
+  last_observed: '2026-09-21T11:29:49Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -60,4 +66,4 @@ rejected_shapes:
   - arxiv: 2609.20625v1
     timestamp: '2026-09-20T10:20:14Z'
 coordination_signals: []
-last_updated: '2026-09-20T10:20:14Z'
+last_updated: '2026-09-21T11:29:49Z'
