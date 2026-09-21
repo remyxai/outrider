@@ -9182,6 +9182,7 @@ def _overclaim_check_from_events(
         visible_lines=coverage.get("visible_lines", 0),
         paths_read=paths_read,
         tools_executed=tools_executed,
+        under_explored=coverage.get("under_explored"),
     )
 
     risk = assess_overclaim_risk(signals, threshold_severity="high")
