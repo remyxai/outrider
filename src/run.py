@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from context_compactor import compact_experiment_history, get_compaction_note
 from diff_risk_score import (
     DIFF_RISK_ISSUE_THRESHOLD,
     render_risk_detail,
@@ -7383,10 +7384,17 @@ def write_spec_bundle(
     # fetched from the research-interests endpoint. Skipped entirely
     # when no history is linked, so INVOCATION.md's "if Remyx returned
     # any" caveat continues to hold.
+    # Apply cost-efficient compaction (inspired by CliffCompaction) to truncate
+    # older entries and reduce token cost while maintaining semantic faithfulness.
     if rec.experiment_history:
-        (bundle / "CONTEXT.md").write_text(_CONTEXT_MD_TEMPLATE.format(
-            experiment_history=rec.experiment_history,
-        ))
+        compacted_history = compact_experiment_history(rec.experiment_history)
+        context_body = _CONTEXT_MD_TEMPLATE.format(
+            experiment_history=compacted_history,
+        )
+        # Append a note only if history was actually compacted (shortened).
+        if len(compacted_history) < len(rec.experiment_history):
+            context_body += get_compaction_note()
+        (bundle / "CONTEXT.md").write_text(context_body)
 
     allowlist = effective_allowlist(target, package)
     (bundle / "GUARDRAILS.md").write_text(_GUARDRAILS_MD_TEMPLATE.format(
