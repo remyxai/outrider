@@ -77,6 +77,11 @@ from exploration_structure import (
     structure_enabled,
 )
 from instruction_files import render_instruction_files
+from runtime_policy import (
+    inject_policies_into_prompt,
+    policies_from_failure,
+    format_policies_for_log,
+)
 
 from agents import ApiFamily, Capability, resolve as _resolve_agent
 
@@ -860,7 +865,7 @@ Still distinguish "intentionally out of scope" (expected) from
 "stubbed / incomplete" (TODO-dominated bodies) — the latter still routes
 to an Issue per the honesty rules above.
 
-{canary_directive}
+{runtime_policies_section}{canary_directive}
 """
 
 
@@ -952,7 +957,7 @@ If you need to back out an edit, use the file-edit tools to restore
 the file's content. Look up the original content via standard read
 tools — do not invoke git.
 
-{canary_directive}
+{runtime_policies_section}{canary_directive}
 """
 
 
@@ -7451,6 +7456,21 @@ def write_spec_bundle(
     )
     canary_directive = _canary_directive_text(canary_token)
 
+    # Runtime policies: if prior run(s) detected failure patterns, inject
+    # targeted instructions to address them (FIRE: arxiv:2609.26048v1).
+    # Policies improve repeated success by converting reachable solutions
+    # into dependable delivery at runtime without changing model weights.
+    runtime_policies_section = ""
+    failure_history = (os.environ.get("INPUT_FAILURE_HISTORY") or "").strip()
+    if failure_history:
+        policies = policies_from_failure(failure_history)
+        if policies:
+            runtime_policies_section = inject_policies_into_prompt("", policies)
+            log.info(
+                "  ✓ runtime policies injected: %s",
+                format_policies_for_log(policies),
+            )
+
     if not rec.arxiv_id:
         # Brief-mode invocation: no PAPER.md reference, no Mode 1/2/3
         # framing, no "research findings" (there wasn't a research
@@ -7462,6 +7482,7 @@ def write_spec_bundle(
             issue_fallback_filename=ISSUE_FALLBACK_FILENAME,
             environment_file_ref=environment_file_ref,
             repo_intel_ref=repo_intel_ref,
+            runtime_policies_section=runtime_policies_section,
             canary_directive=canary_directive,
         ))
     else:
@@ -7472,6 +7493,7 @@ def write_spec_bundle(
             environment_file_ref=environment_file_ref,
             research_findings_ref=research_findings_ref,
             repo_intel_ref=repo_intel_ref,
+            runtime_policies_section=runtime_policies_section,
             canary_directive=canary_directive,
         ))
 
