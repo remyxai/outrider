@@ -55,7 +55,13 @@ observed_landing_zones:
       \ is linked (src/run.py:7390)"
     branch: cliffcompaction-cost-efficient-compaction-for-long-horizon-c
     timestamp: '2026-09-25T10:57:31Z'
-  last_observed: '2026-09-25T10:57:31Z'
+  - arxiv: 2609.26048v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: write_spec_bundle() in src/run.py, which populates INVOCATION.md
+      templates used by the Claude Code invocation harness
+    branch: fire-failure-informed-runtime-engineering-for-reliable-langu
+    timestamp: '2026-09-26T10:36:04Z'
+  last_observed: '2026-09-26T10:36:04Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -74,4 +80,4 @@ rejected_shapes:
   - arxiv: 2609.24974v1
     timestamp: '2026-09-24T10:48:23Z'
 coordination_signals: []
-last_updated: '2026-09-25T10:57:31Z'
+last_updated: '2026-09-26T10:36:04Z'
