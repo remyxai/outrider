@@ -84,7 +84,7 @@ jobs:
     env:
       REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Mint a remyx[bot] token from Remyx so the PR / Issue is authored by
       # the Remyx GitHub App (not github-actions[bot]). The App private key
       # stays on Remyx's side; this uses the REMYX_API_KEY already in secrets.
