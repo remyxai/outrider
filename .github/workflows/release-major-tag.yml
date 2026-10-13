@@ -1,0 +1,40 @@
+name: Move major tag on release
+
+# Consumers pin `remyxai/outrider@v1`. That tag only ever moved by hand
+# (`git tag -f v1 <sha> && git push -f origin v1`), and forgetting it
+# stranded releases invisibly: v1 sat at 1.7.52 for three weeks once.
+# Now a published release vX.Y.Z moves vX to the same commit, so a merged
+# dependency bump or fix reaches every install at the next release
+# without anyone remembering a second step.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  move-major-tag:
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Point vMAJOR at the released commit
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::notice::'$TAG' is not vX.Y.Z; nothing to move"; exit 0 ;;
+          esac
+          MAJOR="${TAG%%.*}"
+          SHA="$(git rev-list -n 1 "$TAG")"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f -a "$MAJOR" "$SHA" -m "$MAJOR -> $TAG"
+          git push -f origin "refs/tags/$MAJOR"
+          echo "$MAJOR -> $TAG ($SHA)" >> "$GITHUB_STEP_SUMMARY"

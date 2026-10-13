@@ -1,0 +1,9 @@
+{
+  "name": "outrider-agent-clis",
+  "private": true,
+  "description": "Pinned versions of the coding-agent CLIs the action installs globally on the runner. Not an installable package: action.yml reads these versions and runs `npm install -g <pkg>@<version>`. Exact pins on purpose (#128); Dependabot bumps them, tests/test_action_install_surface.py refuses ranges.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.296",
+    "@openai/codex": "0.162.1"
+  }
+}

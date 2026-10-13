@@ -3063,10 +3063,62 @@ def _fetch_arxiv_html_urls(arxiv_id: str) -> list[str]:
 _ARXIV_PDF_CACHE: dict[str, list[str]] = {}
 
 
+def _pdf_bytes_to_text(pdf_bytes: bytes) -> str:
+    """Extract body text from an in-memory PDF. Returns ``""`` on any
+    failure. Never raises.
+
+    Two extractors, tried in order:
+
+      1. ``pdftotext`` (poppler) when it happens to be on PATH — fastest
+         and best at preserving layout, but a system package we do not
+         install ourselves (see #128: an ``apt-get install`` in the
+         action died on a stale runner index and took every run with it).
+      2. ``pypdf`` — pure Python, pip-installed alongside the CLI in the
+         action, so it is always present in CI and never depends on the
+         runner image's package mirror.
+
+    Good enough for the one thing callers need from the text: github
+    URLs the authors advertise in the paper body.
+    """
+    if not pdf_bytes:
+        return ""
+    if shutil.which("pdftotext"):
+        try:
+            result = subprocess.run(
+                ["pdftotext", "-layout", "-", "-"],
+                input=pdf_bytes,
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.decode("utf-8", errors="replace")
+            log.debug(f"  pdftotext exit={result.returncode}; trying pypdf")
+        except Exception as e:
+            log.debug(f"  pdftotext failed: {e}; trying pypdf")
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        log.debug("  pypdf unavailable; skipping PDF-text discovery")
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception as e:  # one bad page must not sink the rest
+                log.debug(f"  pypdf page extract failed: {e}")
+        return "\n".join(pages)
+    except Exception as e:
+        log.debug(f"  pypdf failed: {e}")
+        return ""
+
+
 def _fetch_arxiv_pdf_text(arxiv_id: str, timeout_s: int = 20) -> str:
     """Fetch ``https://arxiv.org/pdf/<arxiv_id>`` and extract body text
-    via ``pdftotext``. Returns ``""`` on any failure — network, missing
-    binary, decode error, oversized PDF. Never raises.
+    via :func:`_pdf_bytes_to_text`. Returns ``""`` on any failure —
+    network, no extractor available, decode error, oversized PDF.
+    Never raises.
 
     Papers that arxiv hasn't rendered to HTML (endpoint returns 404) are
     still available as PDF. The PDF body reliably contains github URLs
@@ -3092,23 +3144,10 @@ def _fetch_arxiv_pdf_text(arxiv_id: str, timeout_s: int = 20) -> str:
     except Exception as e:
         log.debug(f"  arxiv PDF fetch for {arxiv_id} failed: {e}")
         return ""
-    try:
-        result = subprocess.run(
-            ["pdftotext", "-layout", "-", "-"],
-            input=pdf_bytes,
-            capture_output=True,
-            timeout=30,
-        )
-    except FileNotFoundError:
-        log.debug("  pdftotext binary unavailable; skipping PDF-text discovery")
-        return ""
-    except Exception as e:
-        log.debug(f"  pdftotext for {arxiv_id} failed: {e}")
-        return ""
-    if result.returncode != 0:
-        log.debug(f"  pdftotext for {arxiv_id} exit={result.returncode}")
-        return ""
-    return result.stdout.decode("utf-8", errors="replace")
+    text = _pdf_bytes_to_text(pdf_bytes)
+    if not text:
+        log.debug(f"  no text extracted from arxiv PDF for {arxiv_id}")
+    return text
 
 
 def _fetch_arxiv_pdf_github_slugs(arxiv_id: str) -> list[str]:
@@ -3699,7 +3738,7 @@ def _gather_arxiv_html_candidate_slugs(arxiv_id: str, paper_title: str) -> list[
          contains title-word substrings, e.g. ``moonmath.ai/hyperquant/``
          for a paper titled "HyperQuant..." — fetched one hop, then
          github URLs extracted from each
-      3. github URLs extracted from the PDF body via ``pdftotext`` —
+      3. github URLs extracted from the PDF body (pdftotext or pypdf) —
          only invoked when 1 and 2 both came up empty (the arxiv-HTML-
          404 case), so the common path never spends the PDF fetch.
 

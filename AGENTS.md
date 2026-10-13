@@ -51,7 +51,8 @@ Sequence when `recommend` mode opens a PR: **fidelity audit → convention pass 
 - **No co-author line on commits *to this repo*.** Repo convention omits `Co-Authored-By: Claude …`; the maintainers don't use it. This does not apply to outbound PR bodies: those carry `BOT_COAUTHOR_TRAILER` as their final line so a squash-merge preserves the bot's contributor credit. Don't strip it.
 - **PR body:** terse on this public repo. No Linear IDs, no customer names, no dollar figures from internal trials. `test_*.py` names are fine.
 - **Version discipline:** `@v1` is a moving tag; ship additive changes on `@v1` without a version bump. New input + new provider values + new rate table rows are all additive. **Breaking changes (rename, remove, semantic change) require reviewing every caller.**
-- **Release convention:** every version bump = `git tag vX.Y.Z <sha>` + `git push origin vX.Y.Z` + `git tag -f v1 <sha>` + `git push -f v1` + `gh release create vX.Y.Z --notes ...`. The `gh release create` step is easy to forget; the git tag push alone does NOT surface in the GitHub UI.
+- **Release convention:** every version bump = `git tag vX.Y.Z <sha>` + `git push origin vX.Y.Z` + `gh release create vX.Y.Z --notes ...`. Publishing the release is what ships it: `.github/workflows/release-major-tag.yml` moves `v1` to the released commit automatically, so never move `v1` by hand. The git tag push alone does NOT surface in the GitHub UI and does NOT move `v1`.
+- **Dependency pins:** everything the action installs on the runner is pinned exactly in `requirements-action.txt`, `requirements-action-optional.txt` and `package.json`; Dependabot bumps them weekly. Never add a bare `pip install <pkg>`, `npm install -g <pkg>` or any `apt-get` to `action.yml` — `tests/test_action_install_surface.py` rejects them (#128).
 
 ## Guardrails — do not do these
 

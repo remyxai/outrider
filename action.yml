@@ -597,13 +597,18 @@ runs:
         INPUT_AGENT: ${{ inputs.agent }}
       run: |
         set -eu
+        # Exact versions come from package.json so Dependabot can bump them
+        # (#128). A floating `npm install -g <pkg>` would pull whatever
+        # shipped overnight into every scheduled run at once.
+        PKG="${{ github.action_path }}/package.json"
+        pin() { node -p "require(process.argv[1]).dependencies[process.argv[2]]" "$PKG" "$1"; }
         case "${INPUT_AGENT:-}" in
           ''|claude)
-            npm install -g @anthropic-ai/claude-code
+            npm install -g "@anthropic-ai/claude-code@$(pin @anthropic-ai/claude-code)"
             claude --version
             ;;
           codex)
-            npm install -g @openai/codex
+            npm install -g "@openai/codex@$(pin @openai/codex)"
             codex --version
             ;;
           backboard)
@@ -635,15 +640,24 @@ runs:
 
     - name: Install pytest + remyxai CLI + pyyaml (validation + selection-pass tool-use + repo-intel loader)
       shell: bash
-      run: pip install pytest remyxai pyyaml
+      # Required: the run cannot do its job without these. Everything the
+      # action installs comes from pip or npm at an exact pinned version,
+      # never a system package manager: an apt-get install against the
+      # runner image's cached index 404s whenever Ubuntu rotates a build out
+      # of the mirror, and took every scheduled run down for five days
+      # before the agent started (#128). Pins live in requirements-action.txt
+      # so Dependabot can bump them; tests/test_action_install_surface.py
+      # enforces both rules.
+      run: pip install -r "${{ github.action_path }}/requirements-action.txt"
 
-    - name: Install poppler-utils (pdftotext for arxiv PDF license retry)
+    - name: Install pypdf (optional, arxiv PDF license retry)
       shell: bash
-      # pdftotext is the last-resort discovery source when arxiv HTML 404s
-      # for a paper. Not shipped by default on ubuntu-latest runners as of
-      # 2026; installing it here keeps the license-retry path from silently
-      # returning empty on HTML-less arxiv papers.
-      run: sudo apt-get install -y --no-install-recommends poppler-utils
+      # Optional: the pure-Python extractor behind the arxiv PDF text
+      # fallback. src/run.py degrades to "" without it, so a pip hiccup here
+      # must not fail the run. Steps that only improve the agent's inputs
+      # are best-effort by rule; the same test checks this flag is set.
+      continue-on-error: true
+      run: pip install "$(grep -E '^pypdf' "${{ github.action_path }}/requirements-action-optional.txt")"
 
     - name: Install gh-graph selection-pass tool on PATH
       shell: bash
@@ -662,6 +676,10 @@ runs:
       # made the input a no-op and the opt-out a lie.
       id: cocoindex
       if: ${{ inputs.enable-cocoindex == 'true' }}
+      # Optional: a pipx or clone failure here ends the step, not the run.
+      # The next step keys off `outputs.installed`, which this step only
+      # writes on success, so a failed install is still recorded honestly.
+      continue-on-error: true
       shell: bash
       # The `ccc` binary is the portable surface: every agent has a shell
       # tool, so a binary on PATH works for all of them. The skill wrapper is
@@ -672,7 +690,7 @@ runs:
       run: |
         set -eu
         if ! command -v ccc >/dev/null 2>&1; then
-          pipx install 'cocoindex-code[full]'
+          pipx install "$(grep -E '^cocoindex-code' "${{ github.action_path }}/requirements-action-optional.txt")"
         fi
         SKILLS_HOME=$(python "${{ github.action_path }}/src/agent_tooling.py" --skills-home)
         if [ -n "$SKILLS_HOME" ]; then
