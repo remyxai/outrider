@@ -1,0 +1,32 @@
+# Keeps the action's pinned runtime dependencies fresh (#128). Every pin
+# lives in a manifest Dependabot can read; action.yml only ever installs
+# from these files. Bumps arrive as PRs, tests gate them, and the next
+# release moves @v1 (see .github/workflows/release-major-tag.yml).
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      action-python-deps:
+        patterns: ["*"]
+    labels: [dependencies]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      agent-clis:
+        patterns: ["*"]
+    labels: [dependencies]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]

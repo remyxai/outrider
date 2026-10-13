@@ -1,0 +1,11 @@
+# Runtime dependencies the action installs on the runner. REQUIRED: the
+# run cannot do its job without these, so the install step is fatal.
+#
+# Exact pins on purpose (#128): every scheduled run across every install
+# resolves these fresh, so an unpinned breaking release lands everywhere
+# at once with nobody watching. Dependabot (.github/dependabot.yml) opens
+# a PR per bump; tests gate it; a release moves @v1 to ship it.
+# tests/test_action_install_surface.py refuses anything that is not ==.
+remyxai==0.5.0
+pytest==9.1.1
+pyyaml==6.0.3
