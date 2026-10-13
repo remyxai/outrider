@@ -245,14 +245,25 @@ def test_release_moves_major_tag_automatically():
     assert 'git push -f origin "refs/tags/$MAJOR"' in body
 
 
-def test_node_version_satisfies_pinned_agent_cli_engine_floor():
-    """@anthropic-ai/claude-code 2.1.x declares engines.node >=22. The
-    runner's Node comes from setup-node in action.yml; if that falls below
-    the floor, npm installs with EBADENGINE today and may refuse later.
-    Bump this floor when a Dependabot CLI bump raises the engine."""
-    CLAUDE_CODE_NODE_FLOOR = 22
-    step = next(s for s in STEPS if "setup-node" in str(s.get("uses", "")))
-    node = str(step["with"]["node-version"])
-    assert int(node.split(".")[0]) >= CLAUDE_CODE_NODE_FLOOR, (
-        f"setup-node pins node {node}; pinned claude-code needs >={CLAUDE_CODE_NODE_FLOOR}"
+def test_runner_node_line_comes_from_package_json_engines():
+    """The Node the runner uses is declared once, in package.json beside
+    the agent-CLI pins it must satisfy, and action.yml derives
+    setup-node's version from it rather than carrying its own literal."""
+    engines = json.loads(PKG_JSON.read_text()).get("engines", {})
+    assert re.match(r"^\d+(\.x)?$", str(engines.get("node", ""))), (
+        f"package.json engines.node must name one Node line like '22.x': {engines}"
     )
+    setup = next(s for s in STEPS if "setup-node" in str(s.get("uses", "")))
+    assert setup["with"]["node-version"] == "${{ steps.node-line.outputs.spec }}", setup["with"]
+    resolver = next(s for s in STEPS if s.get("id") == "node-line")
+    assert '["engines"]["node"]' in resolver["run"]
+
+
+def test_agent_cli_install_enforces_its_engine_floor():
+    """npm downgrades an unmet engines.node to a warning. The install step
+    must turn it into a named failure for every CLI it installs."""
+    step = next(s for s in STEPS if s.get("name") == "Install the coding-agent CLI")
+    run = step["run"]
+    assert "engine_check()" in run
+    for dep in json.loads(PKG_JSON.read_text())["dependencies"]:
+        assert f"engine_check {dep}" in run, f"{dep} installed without an engine check"

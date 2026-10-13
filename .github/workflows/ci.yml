@@ -1,0 +1,52 @@
+name: CI
+
+# Pins only help if a bad bump is caught before it ships (#128). Two jobs:
+#   tests — the suite, including the install-surface rules, on every PR.
+#   smoke — the action itself, end to end on a real runner: setup steps,
+#           pinned installs, engine floor, one 1-turn agent call. Runs on
+#           PRs from this repo and on every push to main, so a merged
+#           Dependabot bump is exercised before the next release moves v1.
+#           Dependabot PRs cannot see Actions secrets, hence the guard.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install the pinned runtime deps (without cocoindex) + test deps
+        run: |
+          pip install -r requirements-action.txt
+          pip install "$(grep -E '^pypdf' requirements-action-optional.txt)" requests
+      - run: python -m pytest -q
+
+  smoke:
+    if: github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the action in smoke mode
+        uses: ./
+        env:
+          REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        with:
+          interest-id: '29ca03e7-454d-446c-9941-32c96c53d95d'
+          provider: zai
+          model: glm-5.3
+          mode: smoke
+          enable-cocoindex: 'true'

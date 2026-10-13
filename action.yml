@@ -561,7 +561,7 @@ runs:
   using: 'composite'
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: '3.11'
 
@@ -584,14 +584,22 @@ runs:
         INPUT_MODEL_BASE_URL: ${{ inputs.model-base-url }}
       run: python ${{ github.action_path }}/src/configure_backend.py
 
+    - name: Resolve the Node line from package.json
+      id: node-line
+      shell: bash
+      # The runner's Node comes from `engines.node` in the action's
+      # package.json, beside the agent-CLI pins it has to satisfy, so the
+      # two cannot drift apart in separate files. The install step below
+      # refuses a CLI whose declared engine floor this line does not meet.
+      run: |
+        spec="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["engines"]["node"])' "${{ github.action_path }}/package.json")"
+        echo "spec=$spec" >> "$GITHUB_OUTPUT"
+        echo "node line: $spec"
+
     - name: Set up Node (for the agent CLI)
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
-        # Must satisfy the engine floor of the pinned agent CLIs in
-        # package.json: @anthropic-ai/claude-code 2.1.x requires node >=22.
-        # On 20 npm installs it with an EBADENGINE warning today and may
-        # refuse tomorrow. tests/test_action_install_surface.py pins the floor.
-        node-version: '22'
+        node-version: ${{ steps.node-line.outputs.spec }}
 
     - name: Install the coding-agent CLI
       shell: bash
@@ -606,13 +614,30 @@ runs:
         # shipped overnight into every scheduled run at once.
         PKG="${{ github.action_path }}/package.json"
         pin() { node -p "require(process.argv[1]).dependencies[process.argv[2]]" "$PKG" "$1"; }
+        # npm only *warns* (EBADENGINE) when a package's engines.node is
+        # not met and installs anyway; the CLI then works until it does
+        # not. Make the mismatch a hard, named failure instead, so a CLI
+        # bump that raises its floor is caught by CI smoke on the PR and
+        # fixed by bumping engines.node in package.json.
+        engine_check() {
+          floor="$(node -p "(require(process.argv[1] + '/' + process.argv[2] + '/package.json').engines || {}).node || ''" "$(npm root -g)" "$1")"
+          want="$(printf '%s' "$floor" | grep -oE '[0-9]+' | head -1)"
+          have="$(node -p 'process.versions.node.split(".")[0]')"
+          echo "$1 declares engines.node '$floor'; runner has node $(node --version)"
+          if [ -n "$want" ] && [ "$have" -lt "$want" ]; then
+            echo "::error::$1 needs node >=$want but the runner has $have — raise engines.node in package.json" >&2
+            exit 1
+          fi
+        }
         case "${INPUT_AGENT:-}" in
           ''|claude)
             npm install -g "@anthropic-ai/claude-code@$(pin @anthropic-ai/claude-code)"
+            engine_check @anthropic-ai/claude-code
             claude --version
             ;;
           codex)
             npm install -g "@openai/codex@$(pin @openai/codex)"
+            engine_check @openai/codex
             codex --version
             ;;
           backboard)
