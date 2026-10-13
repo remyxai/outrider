@@ -1,16 +1,18 @@
 name: CI
 
 # Pins only help if a bad bump is caught before it ships (#128). Two jobs:
-#   tests — the suite, including the install-surface rules, on every PR.
+#   tests — the suite, including the install-surface rules. Every push and
+#           every PR, so fork PRs are covered too.
 #   smoke — the action itself, end to end on a real runner: setup steps,
-#           pinned installs, engine floor, one 1-turn agent call. Runs on
-#           PRs from this repo and on every push to main, so a merged
-#           Dependabot bump is exercised before the next release moves v1.
-#           Dependabot PRs cannot see Actions secrets, hence the guard.
+#           pinned installs, engine floor, one 1-turn agent call. Every
+#           push to any branch of this repo, so a branch is exercised the
+#           moment it exists and a merged Dependabot bump is exercised on
+#           main before the next release moves v1. Pushes by dependabot
+#           skip it (its branches cannot read Actions secrets); the merge
+#           to main runs it.
 on:
-  pull_request:
   push:
-    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -32,7 +34,7 @@ jobs:
       - run: python -m pytest -q
 
   smoke:
-    if: github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name != 'pull_request' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
