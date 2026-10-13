@@ -243,3 +243,16 @@ def test_release_moves_major_tag_automatically():
     assert wf["permissions"]["contents"] == "write"
     body = (ROOT / ".github" / "workflows" / "release-major-tag.yml").read_text()
     assert 'git push -f origin "refs/tags/$MAJOR"' in body
+
+
+def test_node_version_satisfies_pinned_agent_cli_engine_floor():
+    """@anthropic-ai/claude-code 2.1.x declares engines.node >=22. The
+    runner's Node comes from setup-node in action.yml; if that falls below
+    the floor, npm installs with EBADENGINE today and may refuse later.
+    Bump this floor when a Dependabot CLI bump raises the engine."""
+    CLAUDE_CODE_NODE_FLOOR = 22
+    step = next(s for s in STEPS if "setup-node" in str(s.get("uses", "")))
+    node = str(step["with"]["node-version"])
+    assert int(node.split(".")[0]) >= CLAUDE_CODE_NODE_FLOOR, (
+        f"setup-node pins node {node}; pinned claude-code needs >={CLAUDE_CODE_NODE_FLOOR}"
+    )

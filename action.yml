@@ -587,7 +587,11 @@ runs:
     - name: Set up Node (for the agent CLI)
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        # Must satisfy the engine floor of the pinned agent CLIs in
+        # package.json: @anthropic-ai/claude-code 2.1.x requires node >=22.
+        # On 20 npm installs it with an EBADENGINE warning today and may
+        # refuse tomorrow. tests/test_action_install_surface.py pins the floor.
+        node-version: '22'
 
     - name: Install the coding-agent CLI
       shell: bash
