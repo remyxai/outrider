@@ -92,6 +92,16 @@ def _rec(title="A Fancy New Method for Widgets", arxiv_id="2606.99999v1"):
     )
 
 
+def _route_to_bare(cmd, bare):
+    """Rewrite any ``https://`` remote in a git command to the local bare
+    repo. ``prepare_workdir`` names the remote by URL twice: the clone, and
+    the ``fetch --depth 20 <url> <ref>:refs/remotes/origin/<ref>`` that
+    re-authenticates instead of using the configured origin."""
+    if list(cmd[:1]) != ["git"]:
+        return cmd
+    return [str(bare) if isinstance(a, str) and a.startswith("https://") else a for a in cmd]
+
+
 def test_format_branch_name_no_suffix_when_unset(monkeypatch):
     """Default flow (no start-from-ref) preserves the paper-title slug verbatim."""
     monkeypatch.delenv("INPUT_START_FROM_REF", raising=False)
@@ -134,13 +144,10 @@ def test_prepare_workdir_checks_out_start_from_ref(fake_remote, tmp_path, monkey
     original_run = subprocess.run
 
     def routed_run(cmd, *args, **kwargs):
-        # Redirect the initial `git clone <https-url> <dir>` to the local bare.
-        if cmd[:2] == ["git", "clone"] and len(cmd) >= 4 and cmd[-2].startswith("https://"):
-            cmd = list(cmd)
-            cmd[-2] = str(bare)
-        # And the follow-up `git fetch origin <ref>` also works against the
-        # local bare (already the configured origin), no rewrite needed.
-        return original_run(cmd, *args, **kwargs)
+        # Redirect every credentialed https remote (the initial clone and
+        # the explicit-refspec fetch, which re-authenticates with a one-shot
+        # URL rather than using the configured origin) to the local bare.
+        return original_run(_route_to_bare(cmd, bare), *args, **kwargs)
 
     with patch.object(run, "_github_token", fake_github_token), \
          patch.object(run.tempfile, "mkdtemp", fake_mkdtemp), \
@@ -179,10 +186,10 @@ def test_detect_default_branch_after_ref_checkout(fake_remote, tmp_path, monkeyp
     original_run = subprocess.run
 
     def routed_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["git", "clone"] and len(cmd) >= 4 and cmd[-2].startswith("https://"):
-            cmd = list(cmd)
-            cmd[-2] = str(bare)
-        return original_run(cmd, *args, **kwargs)
+        # Redirect every credentialed https remote (the initial clone and
+        # the explicit-refspec fetch, which re-authenticates with a one-shot
+        # URL rather than using the configured origin) to the local bare.
+        return original_run(_route_to_bare(cmd, bare), *args, **kwargs)
 
     with patch.object(run, "_github_token", fake_github_token), \
          patch.object(run.tempfile, "mkdtemp", fake_mkdtemp), \
@@ -213,10 +220,10 @@ def test_prepare_workdir_default_flow_stays_on_main(fake_remote, tmp_path, monke
     original_run = subprocess.run
 
     def routed_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["git", "clone"] and len(cmd) >= 4 and cmd[-2].startswith("https://"):
-            cmd = list(cmd)
-            cmd[-2] = str(bare)
-        return original_run(cmd, *args, **kwargs)
+        # Redirect every credentialed https remote (the initial clone and
+        # the explicit-refspec fetch, which re-authenticates with a one-shot
+        # URL rather than using the configured origin) to the local bare.
+        return original_run(_route_to_bare(cmd, bare), *args, **kwargs)
 
     with patch.object(run, "_github_token", fake_github_token), \
          patch.object(run.tempfile, "mkdtemp", fake_mkdtemp), \

@@ -26,6 +26,7 @@ Coverage:
 
 Run with: pytest tests/test_brief_mode.py -q
 """
+import subprocess
 import sys
 from pathlib import Path
 
@@ -99,6 +100,17 @@ def test_factory_rejects_empty_brief():
 
 
 # ─── run_brief_mode dispatch ────────────────────────────────────────
+
+
+def _git_workdir(tmp_path):
+    """A clone-shaped workdir: an empty git repo, because the brief path
+    now runs the same risky-surface detector as the paper path, and that
+    shells out to ``git status`` inside the workdir. A bare directory made
+    every composition test die on exit 128 before the first assertion."""
+    workdir = tmp_path / "clone"
+    workdir.mkdir()
+    subprocess.run(["git", "init", "-q", str(workdir)], check=True)
+    return workdir
 
 
 def _minimal_target():
@@ -216,8 +228,7 @@ def test_run_brief_mode_composes_leaves(monkeypatch, tmp_path):
     carries the expected keys."""
     monkeypatch.setenv("INPUT_LEAD_CONTENT", "# Add exp backoff\n\nDetails.")
 
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     calls = []
 
     def fake_prepare_workdir(target):
@@ -296,8 +307,7 @@ def test_run_brief_mode_composes_leaves(monkeypatch, tmp_path):
 def test_run_brief_mode_short_circuits_on_claude_failure(monkeypatch, tmp_path):
     """Agent CLI failure → status=claude_failed, no push, no PR."""
     monkeypatch.setenv("INPUT_LEAD_CONTENT", "brief text here")
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     push_ran = {"v": False}
     open_pr_ran = {"v": False}
 
@@ -329,8 +339,7 @@ def test_run_brief_mode_routes_to_issue_fallback(monkeypatch, tmp_path):
     Issue-open plumbing itself is not wired yet in this draft; the
     branch is left un-pushed for manual review."""
     monkeypatch.setenv("INPUT_LEAD_CONTENT", "add a whole subsystem end to end")
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     (workdir / run.BUNDLE_DIR_NAME).mkdir()
     (workdir / run.ISSUE_FALLBACK_FILENAME).write_text(
         "The brief spans too many surfaces for a single PR."
@@ -375,8 +384,7 @@ def test_run_brief_mode_fetches_interest_context_when_id_set(monkeypatch, tmp_pa
     def fake_write_spec_bundle(w, target, rec, package, **kw):
         bundle_seen["rec"] = rec
 
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     monkeypatch.setattr(run, "prepare_workdir", lambda t: workdir)
     monkeypatch.setattr(run, "detect_package_name", lambda w: "pkg")
     monkeypatch.setattr(run, "detect_default_branch", lambda w: "main")
@@ -414,8 +422,7 @@ def test_run_brief_mode_skips_interest_fetch_when_no_id(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "_fetch_interest_context",
                         lambda i: fetch_calls.append(i) or ("", "", ""))
 
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     monkeypatch.setattr(run, "prepare_workdir", lambda t: workdir)
     monkeypatch.setattr(run, "detect_package_name", lambda w: "pkg")
     monkeypatch.setattr(run, "detect_default_branch", lambda w: "main")
@@ -448,8 +455,7 @@ def test_run_brief_mode_survives_interest_fetch_failure(monkeypatch, tmp_path):
     # here.
     monkeypatch.setattr(run, "_fetch_interest_context", lambda i: ("", "", ""))
 
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     monkeypatch.setattr(run, "prepare_workdir", lambda t: workdir)
     monkeypatch.setattr(run, "detect_package_name", lambda w: "pkg")
     monkeypatch.setattr(run, "detect_default_branch", lambda w: "main")
@@ -833,8 +839,7 @@ def test_run_brief_mode_honors_publish_branch(monkeypatch, tmp_path):
     the wire."""
     monkeypatch.setenv("INPUT_LEAD_CONTENT", "brief")
     monkeypatch.setenv("INPUT_PUBLISH", "branch")
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     open_pr_ran = {"v": False}
 
     monkeypatch.setattr(run, "prepare_workdir", lambda t: workdir)
@@ -863,8 +868,7 @@ def test_run_brief_mode_rejects_path_violations(monkeypatch, tmp_path):
     """Diff touches out-of-bounds paths → status=rejected_path_violations,
     no push, no PR. Same gate the paper-anchored path uses."""
     monkeypatch.setenv("INPUT_LEAD_CONTENT", "brief")
-    workdir = tmp_path / "clone"
-    workdir.mkdir()
+    workdir = _git_workdir(tmp_path)
     push_ran = {"v": False}
 
     monkeypatch.setattr(run, "prepare_workdir", lambda t: workdir)
