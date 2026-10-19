@@ -6,7 +6,7 @@
     "node": "22.x"
   },
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.296",
-    "@openai/codex": "0.162.1"
+    "@anthropic-ai/claude-code": "2.1.301",
+    "@openai/codex": "0.163.0"
   }
 }
