@@ -7,5 +7,5 @@
 # a PR per bump; tests gate it; a release moves @v1 to ship it.
 # tests/test_action_install_surface.py refuses anything that is not ==.
 remyxai==0.5.0
-pytest==9.1.1
+pytest==9.2.0
 pyyaml==6.0.3
