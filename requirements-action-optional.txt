@@ -2,5 +2,5 @@
 # that src/ degrades gracefully without. Their install steps are
 # continue-on-error, so a bad release or a flaky index here never ends a
 # run (#128). Same exact-pin rule as requirements-action.txt.
-pypdf==6.20.1
+pypdf==6.21.4
 cocoindex-code[full]==0.2.42
