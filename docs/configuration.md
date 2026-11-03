@@ -15,23 +15,25 @@ Inputs, outputs, and status codes for the Outrider action.
 
 | Input | Default | Description |
 |---|---|---|
-| `interest-id` | *(required)* | Remyx ResearchInterest UUID |
+| `interest-id` | `''` | Remyx ResearchInterest UUID. Required in every mode except `brief`, which takes its spec from `lead-content` and uses the interest (when set) only for repo context |
 | `github-token` | `${{ github.token }}` | Override only for cross-repo controller patterns |
 | `min-confidence` | `moderate` | Tier gate: `high` / `moderate` / `low` |
 | `draft-mode` | `always` | `always` / `on_test_failure` / `never` |
 | `rate-limit-days` | `7` | Cadence guard. Any value > 0 enables: skip the run if any **open** Remyx PR or Issue exists on the target. Engagement (merge or close) releases the gate. Set `0` to disable. The numeric value is otherwise ignored — kept as an on/off bit for compatibility with workflow files written for the prior sliding-window semantics. |
 | `guardrails-allowlist` | `''` | Extra path globs Claude Code may modify, **added on top of** the defaults (`*.py`, `.remyx-recommendation/**`, `**/*.md`). Most repos won't need this. |
 | `test-integration-policy` | `strict` | `strict` (demote to Issue if new tests don't import an existing module) / `soft` (open draft PR with warning) / `off` (skip the gate). Use `soft` for layer/component repos where standalone modules are the contribution. |
+| `lead-content` | `''` | Markdown the agent reads as leading context. In `recommend` mode it replaces the paper's suggested experiment in SPEC.md (LEAD Issue → PR); in `brief` mode it is the whole spec. |
 | `lookback` | `week` | Candidate pool window: `today` / `week` / `month` |
 | `candidate-pool` | `25` | How many candidates the selection pass picks from |
 | `agent` | `''` | Which coding-agent CLI runs the implementation: `''`/`claude` (Claude Code — the default and existing behavior), `codex` (OpenAI Codex), `backboard` (Backboard R-CLI). A separate axis from `provider`, which picks the *model*. Not every agent/provider pair is valid; the action rejects an impossible one up front and names the agent that does serve your provider. See [backends.md](backends.md) for the generated pair table. |
 | `provider` | `''` | Model backend for the selected agent. `''` leaves the caller's own auth untouched; a named provider (`anthropic`, `openai`, `zai`, `moonshot`, `openrouter`) makes the action resolve that vendor's credential and endpoint; `custom` uses `model-base-url` with caller-supplied auth. An impossible agent/provider pair is refused up front — pair table in [backends.md](backends.md) |
 | `model` | `''` | Model id for the selected agent. Use the id your provider lists; `mode: smoke` verifies one in seconds. Empty lets the agent pick its own default |
-| `model-base-url` | `''` | Endpoint override for `provider: custom`, or for a caller wiring auth themselves. Ignored with a warning for a named provider, and for a native router, whose base-URL variable addresses its control plane rather than a model |
+| `model-base-url` | `''` | Endpoint override. With `provider: custom` it is the endpoint; with a named provider an explicit URL still wins over the provider's default, with a warning in the log so the override is visible. Ignored, with a warning, for a native router, whose base-URL variable addresses its control plane rather than a model |
 | `agent-timeout` | *(falls back to `claude-timeout`)* | Wall-clock seconds for each agent phase. Generalized name for `claude-timeout`, which still works — pass either; this one wins if both are set. Only Claude Code has a round-limit flag, so on `codex` and `backboard` this is the **only** spend bound: keep it tight on cron-driven installs, and well under the job's own `timeout-minutes`. |
 | `claude-timeout` | `1500` | Wall-clock seconds for the agent calls. Raised from `900` in v1.7.24 — GLM sessions with staged synthesis routinely reach 15–20 min. Bump for very large repos; lower to cap cost. Superseded in name by `agent-timeout`; both are supported. |
-| `pin-arxiv` | `''` | Optional `arxiv_id`. When set and present in the candidate pool, the action implements that exact paper and skips the selection pass — use it for reproducible eval re-runs. Empty = normal selection. |
-| `mode` | `recommend` | `recommend` (classic per-run flow) / `smoke` (verify the `agent`/`provider`/`model` wiring against the vendor in seconds and exit — no clone, no PR, no work; use it after changing a secret or a model id) / `weekly-summary` (post a weekly digest — see [weekly-summary.md](weekly-summary.md)) / `brief` / `fidelity` / `convention` / `test` / `issue-convention` (standalone chain phases, for re-running a single phase against an existing PR or Issue) |
+| `pin-arxiv` | `''` | Optional `arxiv_id`. When set, the action implements that exact paper and skips the selection pass — use it for reproducible eval re-runs. The paper need not be in the candidate pool: it is looked up in the Remyx catalog, then on arxiv.org. Empty = normal selection. |
+| `mode` | `recommend` | `recommend` (classic per-run flow) / `smoke` (verify the `agent`/`provider`/`model` wiring against the vendor in seconds and exit — no clone, no PR, no work; use it after changing a secret or a model id) / `weekly-summary` (post a weekly digest — see [weekly-summary.md](weekly-summary.md)) / `brief` (draft a PR from the design brief in `lead-content`, no arXiv anchor — `remyxai outrider trigger --brief` dispatches it) / `fidelity` / `convention` / `test` / `issue-convention` (standalone chain phases, for re-running a single phase against an existing PR or Issue) |
+| `publish` | `pr` | `pr` pushes the branch, opens a draft PR and runs the inline chain; `branch` pushes the branch only — no PR, no chain — and leaves the evidence in the step summary and workflow artifact for the team to review via `gh` or the GitHub UI. |
 | `chain` | `true` | When `true`, `recommend` mode continues into the refinement chain (fidelity audit → convention pass → test gate for PRs, or convention pass alone for Issues) within the same run. Set `false` for cost-sensitive runs. |
 | `pr-number` | `''` | PR number for standalone chain phases (`fidelity` / `convention` / `test`). Empty in `recommend` mode — the inline chain reads it automatically. |
 | `issue-number` | `''` | Issue number for `mode: issue-convention`. Empty in `recommend` mode — the inline chain reads it automatically. |
@@ -47,12 +49,12 @@ Inputs, outputs, and status codes for the Outrider action.
 | `pr_number` | `pr_opened*` | Number of the opened PR (handed to the inline refinement chain) |
 | `issue_url` | `issue_opened*` | URL of the opened Issue |
 | `issue_number` | `issue_opened*` | Number of the opened Issue (handed to the inline Issue-route pass) |
-| `chain_fidelity_status` / `chain_convention_status` / `chain_test_status` | chain ran (PR route) | Per-phase outcome of the inline refinement chain |
-| `chain_issue_convention_status` | chain ran (Issue route) | Outcome of the Issue-route convention pass |
-| `chain_draft_dropped` | chain ran | `true` if the test gate flipped the draft to ready-for-review |
+| `chain_fidelity_status` / `chain_convention_status` / `chain_test_status` | chain ran (PR route) | Per-phase outcome of the inline refinement chain. Declared as action outputs, so a downstream step can gate on `steps.<id>.outputs.chain_test_status` |
+| `chain_draft_dropped` | chain ran | `true` when the test gate passed and moved the draft PR to ready-for-review; `false` when it stayed a draft |
+| `candidates_considered` / `selection_rejected` | recommend mode | How many candidates the selection pass weighed, and how many it rejected |
 | `arxiv` | when a paper was picked | arxiv_id |
 | `tier` | when a paper was picked | `high` / `moderate` / `low` / `noise` |
-| `cost_usd` | always | Claude spend for this run |
+| `cost_usd` | always | Model spend for this run, on whichever backend ran it (vendor rate card when the model has a row, else the agent CLI's own figure) |
 | `input_tokens` / `output_tokens` | always | Token usage |
 | `discussion_comment_url` | `weekly_summary_posted` | URL of the posted weekly digest comment |
 
@@ -105,6 +107,30 @@ Inputs, outputs, and status codes for the Outrider action.
 |  | `issue_convention_aligned_no_fitting_template` | Templates exist but all bug/question kinds (e.g. bug-only repo); body still folded with scaffolding collapsed |
 |  | `issue_convention_skipped_no_templates` | No `.github/ISSUE_TEMPLATE/` directory; body folded with scaffolding collapsed |
 |  | `issue_convention_failed_claude` / `issue_convention_failed_patch` | Claude call or body PATCH failed |
+
+### Brief mode (`mode: brief`)
+
+| Status | Meaning |
+|---|---|
+| `pr_opened_brief` | PR opened from the design brief in `lead-content` |
+| `brief_declined_open_as_issue` | The agent judged the brief too broad for a PR and wrote `OPEN_AS_ISSUE.md` instead. The branch is left unpushed for manual review; no Issue is opened |
+| `skipped_brief_missing_lead_content` | `mode: brief` ran with an empty `lead-content` — the brief is the spec in this mode |
+| `brief_failed` | Brief mode hit an unhandled error |
+
+### `publish: branch` and the canary check (recommend and brief modes)
+
+| Status | Meaning |
+|---|---|
+| `branch_pushed_no_pr` | Branch pushed, no PR object created (`publish: branch`) |
+| `branch_pushed_canary_missing` | Branch pushed, but the final commit lacked the SPEC-acknowledgment canary trailer — a prompt-injection signal, flagged for review |
+| `issue_opened_canary_missing` | Canary trailer missing with `publish: pr`: no PR is opened; an Issue points a human at the branch for review before promotion |
+
+### Smoke mode (`mode: smoke`)
+
+| Status | Meaning |
+|---|---|
+| `smoke_ok` | The `agent` / `provider` / `model` wiring answered a one-line prompt |
+| `smoke_failed` | The wiring could not complete a call — the log names the failing credential, endpoint, or model id |
 
 ### Weekly summary mode
 

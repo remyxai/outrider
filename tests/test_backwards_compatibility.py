@@ -78,15 +78,18 @@ def test_no_input_was_removed():
 def test_no_input_became_required():
     """An older workflow cannot supply an input it has never heard of.
 
-    `interest-id` was already required before this branch; the set must not
-    grow.
+    `interest-id` was the only required input at the baseline; the set must
+    not grow. It may shrink: `interest-id` became optional so `mode: brief`
+    can run without one, and an older workflow that still passes it is
+    unaffected.
     """
     required = sorted(
         name for name, spec in ACTION["inputs"].items()
         if spec.get("required") is True
     )
-    assert required == BASELINE["required"], (
-        f"required inputs changed from {BASELINE['required']} to {required}"
+    grew = sorted(set(required) - set(BASELINE["required"]))
+    assert not grew, (
+        f"inputs newly required (older workflows cannot supply them): {grew}"
     )
 
 

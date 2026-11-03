@@ -9,7 +9,11 @@ inputs:
     description: |
       Remyx ResearchInterest UUID. Get it from engine.remyx.ai → your
       interest's detail page → "Workflow snippet" tab.
-    required: true
+      Required for every mode except `brief`, which takes its spec from
+      `lead-content` and only uses the interest (when set) for repo
+      context.
+    required: false
+    default: ''
   mode:
     description: |
       Run mode:
@@ -24,6 +28,14 @@ inputs:
           waiting on a full dispatch to find out.
         - "recommend" (default): scout a paper, draft a PR or open an
           Issue — the classic per-run flow.
+        - "brief": draft a PR from a design brief you supply in
+          `lead-content` — an issue body, a hand-written spec, a notebook
+          — with no arXiv anchor. The brief IS the spec: no ranking,
+          selection or paper preflight, and no refinement chain. Ends in
+          "pr_opened_brief" (or "branch_pushed_no_pr" with
+          `publish: branch`); "skipped_brief_missing_lead_content" when
+          the brief is empty. `remyxai outrider trigger --brief` dispatches
+          this mode.
         - "weekly-summary": aggregate the past 7 days of Outrider runs
           on this repo and post a digest comment to the Discussion named
           by `weekly-discussion-id`. Opt-in; customers add a second
@@ -282,9 +294,11 @@ inputs:
     default: ''
   pin-arxiv:
     description: |
-      Optional arxiv_id. When set and present in the candidate pool, the
-      action implements that exact paper and skips the LLM selection pass —
-      use it for reproducible eval re-runs. Empty = normal selection.
+      Optional arxiv_id. When set, the action implements that exact paper
+      and skips the LLM selection pass — use it for reproducible eval
+      re-runs. The paper does not have to be in the candidate pool: it is
+      looked up in the Remyx catalog first, then on arxiv.org, so any
+      published arXiv paper works. Empty = normal selection.
     required: false
     default: ''
   search-method:
@@ -521,40 +535,86 @@ inputs:
 outputs:
   status:
     description: |
-      Run outcome: "pr_opened" | "pr_opened_draft" | "issue_opened" |
+      Run outcome. Recommend mode: "pr_opened" | "pr_opened_draft" |
+      "issue_opened" | "issue_opened_preflight" |
+      "issue_opened_no_integration" | "issue_opened_stub_density" |
+      "issue_opened_no_test_integration" | "issue_opened_self_review" |
+      "issue_opened_substitution" | "issue_opened_high_risk" |
       "skipped_low_confidence" | "skipped_open_artifact" |
       "skipped_issues_disabled" | "skipped_pr_exists" |
-      "skipped_issue_exists" | "skipped_test_failure" | "claude_failed" |
-      "skipped_no_method_match" | "rejected_path_violations" |
-      "aborted_secret_in_payload" | "error". In weekly-summary mode:
-      "weekly_summary_posted" | "weekly_summary_skipped_no_discussion_id" |
-      "weekly_summary_failed".
+      "skipped_issue_exists" | "skipped_external_issue_exists" |
+      "skipped_by_selection_verification" | "skipped_no_method_match" |
+      "skipped_test_failure" | "rejected_path_violations" |
+      "aborted_secret_in_payload" | "claude_failed" | "error".
+      Brief mode: "pr_opened_brief" | "brief_declined_open_as_issue" |
+      "skipped_brief_missing_lead_content" | "brief_failed".
+      With `publish: branch`: "branch_pushed_no_pr" |
+      "branch_pushed_canary_missing" | "issue_opened_canary_missing".
+      Smoke mode: "smoke_ok" | "smoke_failed".
+      Weekly-summary mode: "weekly_summary_posted" |
+      "weekly_summary_skipped_no_discussion_id" | "weekly_summary_failed".
+      Standalone chain phases report their own phase status
+      (fidelity_* / convention_* / test_* / issue_convention_*).
+      The full table with meanings is in docs/configuration.md.
     value: ${{ steps.recommend.outputs.status }}
+  pr_url:
+    description: 'URL of the opened PR (set when status starts with "pr_opened").'
+    value: ${{ steps.recommend.outputs.pr_url }}
+  pr_number:
+    description: 'Number of the opened PR (set when status starts with "pr_opened").'
+    value: ${{ steps.recommend.outputs.pr_number }}
+  issue_url:
+    description: 'URL of the opened Issue (set when status starts with "issue_opened").'
+    value: ${{ steps.recommend.outputs.issue_url }}
+  issue_number:
+    description: 'Number of the opened Issue (set when status starts with "issue_opened").'
+    value: ${{ steps.recommend.outputs.issue_number }}
   discussion_comment_url:
     description: |
       URL of the posted weekly-summary Discussion comment (set when
       status == "weekly_summary_posted").
     value: ${{ steps.recommend.outputs.discussion_comment_url }}
-  pr_url:
-    description: 'URL of the opened PR (set when status starts with "pr_opened").'
-    value: ${{ steps.recommend.outputs.pr_url }}
-  issue_url:
-    description: 'URL of the opened Issue (set when status == "issue_opened").'
-    value: ${{ steps.recommend.outputs.issue_url }}
   arxiv:
-    description: 'arxiv_id of the recommended paper.'
+    description: 'arxiv_id of the recommended paper (empty in brief mode).'
     value: ${{ steps.recommend.outputs.arxiv }}
   tier:
     description: 'Confidence tier of the recommendation (high / moderate / low / noise).'
     value: ${{ steps.recommend.outputs.tier }}
+  candidates_considered:
+    description: 'How many candidates the selection pass weighed (recommend mode).'
+    value: ${{ steps.recommend.outputs.candidates_considered }}
+  selection_rejected:
+    description: 'How many candidates the selection pass rejected (recommend mode).'
+    value: ${{ steps.recommend.outputs.selection_rejected }}
+  chain_fidelity_status:
+    description: |
+      Outcome of the inline fidelity audit (set when `chain: true` and a
+      PR was opened). Gate downstream steps on it, e.g.
+      `if: steps.outrider.outputs.chain_fidelity_status == 'fidelity_done'`.
+    value: ${{ steps.recommend.outputs.chain_fidelity_status }}
+  chain_convention_status:
+    description: 'Outcome of the inline convention pass (set when the chain ran on a PR).'
+    value: ${{ steps.recommend.outputs.chain_convention_status }}
+  chain_test_status:
+    description: 'Outcome of the inline test gate (set when the chain ran on a PR).'
+    value: ${{ steps.recommend.outputs.chain_test_status }}
+  chain_draft_dropped:
+    description: |
+      "true" when the inline test gate passed and moved the draft PR to
+      ready-for-review; "false" when it stayed a draft.
+    value: ${{ steps.recommend.outputs.chain_draft_dropped }}
   cost_usd:
-    description: 'Total Anthropic cost (USD) across all Claude passes this run.'
+    description: |
+      Total model spend (USD) across every agent call this run, on
+      whichever backend the run used. Priced from the vendor's published
+      per-token rates when the model has a rate row, otherwise from the
+      agent CLI's own figure (see `cost_basis` in the step summary).
     value: ${{ steps.recommend.outputs.cost_usd }}
   input_tokens:
-    description: 'Total input tokens across all Claude passes this run.'
+    description: 'Total input tokens across every agent call this run.'
     value: ${{ steps.recommend.outputs.input_tokens }}
   output_tokens:
-    description: 'Total output tokens across all Claude passes this run.'
+    description: 'Total output tokens across every agent call this run.'
     value: ${{ steps.recommend.outputs.output_tokens }}
 
 runs:

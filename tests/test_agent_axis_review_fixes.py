@@ -412,10 +412,11 @@ def test_a_fallback_rate_card_is_not(monkeypatch):
     """`_detect_backend` falls back to the host's default model when the exact
     id is missing. Reporting that as `backend_rate_table` renders in the step
     summary as "computed from PAYG rates" — authoritative — for a number
-    computed from a different model's prices. This branch makes `glm-5.3` the
-    z.ai default, and the table has rows only for glm-5.2 and glm-4.6."""
+    computed from a different model's prices. glm-5.1 is a real z.ai model
+    with no row in the table (glm-5.3, the default, has one now)."""
     run = _run_module(monkeypatch, INPUT_AGENT="claude", ANTHROPIC_API_KEY="k")
-    assert run._rate_basis("https://api.z.ai/api/anthropic", "glm-5.3") == \
+    assert "glm-5.1" not in run._BACKEND_RATES["api.z.ai"]
+    assert run._rate_basis("https://api.z.ai/api/anthropic", "glm-5.1") == \
         "backend_rate_table_approx"
     # Tokens stay exact either way; only the dollars are approximate.
     assert run._rate_basis("https://api.moonshot.ai/anthropic", "kimi-k3") == \

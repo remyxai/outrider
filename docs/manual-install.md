@@ -42,7 +42,7 @@ The [`remyxai` CLI](https://github.com/remyxai/remyxai-cli) sets Outrider up in 
          claude-timeout:
            description: 'Wall-clock seconds for the Claude Code agent (preflight + implementation).'
            required: false
-           default: '900'
+           default: '1500'
    jobs:
      recommend:
        runs-on: ubuntu-latest
