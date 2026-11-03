@@ -90,7 +90,7 @@ remyxai outrider trigger --repo owner/name --brief "add exponential backoff to t
 remyxai outrider trigger --repo owner/name --brief @design.md
 ```
 
-`--pin-arxiv` implements the exact paper; `--search-method` searches for the top hit; `--brief` runs the paper-less flow where the design brief you supply IS the spec. See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install and per-dispatch routing.
+`--pin-arxiv` implements the exact paper; `--search-method` searches for the top hit; `--brief` runs the paper-less flow where the design brief you supply IS the spec (it dispatches the action with `mode: brief` and the brief as `lead-content`; needs remyxai-cli 0.5.1+). See [`remyxai-cli`](https://github.com/remyxai/remyxai-cli) for bulk-install and per-dispatch routing.
 
 Setting up by hand instead of via the CLI? See [`docs/manual-install.md`](docs/manual-install.md).
 

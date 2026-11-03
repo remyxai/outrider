@@ -7622,7 +7622,11 @@ def _reset_run_cost() -> None:
 # indicator.
 _BACKEND_RATES: dict[str, dict[str, tuple[float, float, float]]] = {
     "api.z.ai": {
-        # PAYG rates per docs.z.ai/guides/overview/pricing.md
+        # PAYG rates per docs.z.ai/guides/overview/pricing (checked
+        # 2026-11-02). glm-5.3 is the z.ai default in
+        # src/agents/providers.py, so it needs its own row or every
+        # default-model run is priced off another model's card.
+        "glm-5.3": (1.40, 4.40, 0.26),
         "glm-5.2": (1.40, 4.40, 0.26),
         "glm-4.6": (0.60, 2.20, 0.11),
     },
@@ -7638,7 +7642,7 @@ _BACKEND_RATES: dict[str, dict[str, tuple[float, float, float]]] = {
 # have rates for — pick the model most callers are actually likely to be
 # running so the estimate is closer than "no idea".
 _BACKEND_DEFAULT_MODEL: dict[str, str] = {
-    "api.z.ai": "glm-5.2",
+    "api.z.ai": "glm-5.3",
     "api.moonshot.ai": "kimi-k3",
 }
 
@@ -7822,9 +7826,9 @@ def _rate_basis(base_url: str, model: str) -> str:
     id is missing, which is closer than nothing but is not the rate card the
     run actually paid. Reporting that as `backend_rate_table` renders in the
     step summary as "computed from <vendor> PAYG rates", i.e. authoritative,
-    for a number computed from a different model's prices. Live case: this
-    branch makes `glm-5.3` the z.ai default and the table has rows only for
-    glm-5.2 and glm-4.6.
+    for a number computed from a different model's prices. Live case until
+    the glm-5.3 row landed: `glm-5.3` was the z.ai default while the table
+    had rows only for glm-5.2 and glm-4.6.
 
     The tokens stay exact either way; only the dollars are an approximation,
     and now they say so.
@@ -13293,7 +13297,16 @@ def build_target_from_env() -> Target:
     portable across composite / Docker / JavaScript action types.
     """
     repo = _require_env("TARGET_REPO")
-    interest_id = _require_env("INPUT_INTEREST_ID")
+    # Brief mode takes its spec from INPUT_LEAD_CONTENT; the interest is
+    # optional repo context there (see run_brief_mode), so a brief-only
+    # install need not configure one. Every other mode ranks against it.
+    mode = (
+        os.environ.get("REMYX_MODE") or os.environ.get("INPUT_MODE") or ""
+    ).strip().lower().replace("_", "-")
+    if mode == "brief":
+        interest_id = (os.environ.get("INPUT_INTEREST_ID") or "").strip()
+    else:
+        interest_id = _require_env("INPUT_INTEREST_ID")
 
     draft_mode = _optional_env("INPUT_DRAFT_MODE", "always")
     if draft_mode not in DRAFT_MODES:
@@ -19296,6 +19309,8 @@ def main():
                     f.write(f"pr_url={result['pr_url']}\n")
                 if "pr_number" in result:
                     f.write(f"pr_number={result['pr_number']}\n")
+                if "issue_number" in result:
+                    f.write(f"issue_number={result['issue_number']}\n")
                 # Inline refinement-chain phase outcomes (recommend mode with
                 # chain enabled). Lets downstream steps branch on whether the
                 # draft was dropped to ready, etc.
