@@ -1,11 +1,11 @@
 """The harness must not die of signals raised inside the agent session.
 
-Three openpi dispatches ended with ``Process completed with exit code
-143`` 15–27 minutes into the implementation phase, with nothing logged
-after "→ invoking Claude Code". The step's ``python run.py`` received a
-SIGTERM. Runner resources, the harness's own timeout path and Claude
-Code's Bash-timeout teardown were each ruled out on the runner; the only
-consistent source was a signal sent from inside the agent session.
+Dispatches have ended with ``Process completed with exit code 143``
+15–27 minutes into the implementation phase, with nothing logged after
+"→ invoking Claude Code": the step's ``python run.py`` received a
+SIGTERM. Runner resources, the harness's own timeout path and the
+agent's Bash-timeout teardown were each ruled out on the runner; the
+only consistent source was a signal sent from inside the agent session.
 
 Three layers close that:
 

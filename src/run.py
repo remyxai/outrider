@@ -5585,9 +5585,9 @@ _REQUIREMENTS_FILES = (
     "requirements/test.txt",
 )
 
-#: Seconds allowed per pre-install command. The CUDA stacks the robotics
-#: repos pin take ~3 min on a hosted runner; the budget leaves headroom
-#: without letting one wedged resolver eat the agent's wall clock.
+#: Seconds allowed per pre-install command. A pinned CUDA stack takes
+#: ~3 min on a hosted runner; the budget leaves headroom without letting
+#: one wedged resolver eat the agent's wall clock.
 _PREINSTALL_CMD_TIMEOUT_S = 600
 
 
@@ -5715,7 +5715,14 @@ def _preinstall_target_deps(workdir: Path) -> dict[str, Any]:
             cmds.append([*pip, "-r", req])
 
     started = time.monotonic()
+    export_failed = False
     for cmd in cmds:
+        if export_failed and exported is not None and (
+            str(exported) in cmd or cmd == [*pip, "--no-deps", "-e", "."]
+        ):
+            # Nothing to install from a file that was never written; the
+            # manifest fallback appended below covers the project itself.
+            continue
         shown = " ".join(cmd)
         t0 = time.monotonic()
         try:
@@ -5741,6 +5748,7 @@ def _preinstall_target_deps(workdir: Path) -> dict[str, Any]:
             if exported is not None and cmd[0] == uv:
                 # Export failed: fall back to the manifest install so the
                 # agent still gets the base deps.
+                export_failed = True
                 cmds.append([*pip, "-e", f".{extras_suffix}"])
         except (subprocess.TimeoutExpired, OSError) as exc:
             summary["failed"].append(shown)
