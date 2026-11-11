@@ -1,9 +1,9 @@
 """``_preinstall_target_deps``: the test env the agent gets before it runs.
 
 Before this, the step ran ``pip install -e .`` and nothing else, swallowed
-the failure output, and named only the executable in the warning. On
-openpi that left ``pytest`` collection failing on the first missing test
-dep; on lerobot (``requires-python >=3.12`` on a 3.11 runner) the install
+the failure output, and named only the executable in the warning. On one
+target that left ``pytest`` collection failing on the first missing test
+dep; on another (``requires-python >=3.12`` on a 3.11 runner) the install
 died in two seconds with no visible reason. Every draft PR then shipped
 with "Tests could not run in CI".
 
@@ -168,7 +168,11 @@ def test_failed_export_falls_back_to_the_manifest_install(tmp_path, ci_env, monk
     with caplog.at_level(logging.WARNING, logger=run.log.name):
         summary = run._preinstall_target_deps(tmp_path)
     assert [*PIP, "-e", "."] in rec.calls
-    assert summary["failed"] and summary["failed"][0].startswith("/opt/bin/uv export")
+    # The two commands that needed the exported file are skipped, not run
+    # against a file that was never written.
+    assert not any("-r" in c and c[0] == sys.executable for c in rec.calls)
+    assert [*PIP, "--no-deps", "-e", "."] not in rec.calls
+    assert summary["failed"] == [" ".join(rec.calls[0])]
     assert "lockfile needs update" in caplog.text
 
 
@@ -181,7 +185,7 @@ def test_failure_output_reaches_the_log(tmp_path, ci_env, monkeypatch, caplog):
     _no_uv(monkeypatch)
     rec = _Recorder(
         fail_prefix=PIP,
-        stderr="ERROR: Package 'lerobot' requires a different Python: 3.11.18 not in '>=3.12'",
+        stderr="ERROR: Package 'target' requires a different Python: 3.11.18 not in '>=3.12'",
     )
     monkeypatch.setattr(run.subprocess, "run", rec)
     with caplog.at_level(logging.WARNING, logger=run.log.name):
