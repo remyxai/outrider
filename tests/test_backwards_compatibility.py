@@ -95,7 +95,9 @@ def test_no_input_became_required():
 
 def test_the_port_only_added_inputs():
     added = sorted(set(ACTION["inputs"]) - set(BASELINE["inputs"]))
-    assert added == ["agent", "agent-timeout"], (
+    # Additive only: each entry here was added with a default, so a
+    # workflow that never heard of it dispatches unchanged.
+    assert added == ["agent", "agent-timeout", "python-version"], (
         f"unexpected input changes: {added}"
     )
 

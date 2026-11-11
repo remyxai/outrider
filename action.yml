@@ -254,6 +254,16 @@ inputs:
       a larger pool just widens the window the selection pass sees).
     required: false
     default: '25'
+  python-version:
+    description: |
+      Python version actions/setup-python installs on the runner. The
+      harness, the target's dependency pre-install and the agent's
+      `python -m pytest` all use it. Set it to satisfy the target's
+      `requires-python` (e.g. `'3.12'` for a repo that declares `>=3.12`);
+      otherwise the pre-install fails on the spot and the agent cannot run
+      the repo's tests. The run logs the mismatch when it sees one.
+    required: false
+    default: '3.11'
   agent-timeout:
     description: |
       Wall-clock seconds for each coding-agent phase (selection, deep-search,
@@ -623,7 +633,7 @@ runs:
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
-        python-version: '3.11'
+        python-version: ${{ inputs.python-version }}
 
     - name: Configure the model backend
       shell: bash

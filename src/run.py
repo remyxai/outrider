@@ -52,6 +52,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -5567,32 +5568,200 @@ def open_remyx_artifact_exists(target: Target) -> bool:
 # ─── Workdir + spec bundle ─────────────────────────────────────────────────
 
 
-def _preinstall_target_deps(workdir: Path) -> None:
+#: Extras that hold a repo's test tooling, by the names projects actually
+#: use. Installed on top of the base deps so `pytest` collection has what
+#: the repo's own CI has.
+_TEST_EXTRA_NAMES = ("dev", "test", "tests", "testing")
+
+#: Requirements files a repo keeps its test deps in, in the order they are
+#: installed. Base first, then the dev/test files.
+_REQUIREMENTS_FILES = (
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements_dev.txt",
+    "requirements-test.txt",
+    "requirements_test.txt",
+    "requirements/dev.txt",
+    "requirements/test.txt",
+)
+
+#: Seconds allowed per pre-install command. The CUDA stacks the robotics
+#: repos pin take ~3 min on a hosted runner; the budget leaves headroom
+#: without letting one wedged resolver eat the agent's wall clock.
+_PREINSTALL_CMD_TIMEOUT_S = 600
+
+
+def _load_pyproject(workdir: Path) -> dict:
+    """The target's parsed ``pyproject.toml``, or ``{}`` if absent/unparseable."""
+    path = workdir / "pyproject.toml"
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    for mod in ("tomllib", "tomli"):
+        try:
+            return __import__(mod).loads(text)
+        except ImportError:
+            continue
+        except Exception:  # noqa: BLE001 — malformed manifest = no manifest
+            return {}
+    # No TOML parser (Python < 3.11 without tomli): read just the two
+    # fields the pre-install needs with a line scanner. Good enough for the
+    # common manifest shapes; anything odd degrades to "not declared".
+    project: dict[str, Any] = {}
+    extras: dict[str, list] = {}
+    section = None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            section = line.strip("[]").strip()
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = (part.strip() for part in line.partition("="))
+        if section == "project" and key == "requires-python":
+            project["requires-python"] = value.strip("\"'")
+        elif section == "project.optional-dependencies":
+            extras[key.strip("\"'")] = []
+    if extras:
+        project["optional-dependencies"] = extras
+    return {"project": project} if project else {}
+
+
+def _declared_test_extras(pyproject: dict) -> list[str]:
+    """Names in ``[project.optional-dependencies]`` that hold test tooling."""
+    extras = (pyproject.get("project") or {}).get("optional-dependencies") or {}
+    return [k for k in extras if str(k).lower() in _TEST_EXTRA_NAMES]
+
+
+def _requires_python_floor(pyproject: dict) -> tuple[int, int] | None:
+    """The ``(major, minor)`` lower bound of ``project.requires-python``.
+
+    Only the ``>=`` / ``~=`` / ``==`` forms are read; anything else returns
+    None. The point is the common failure (``>=3.12`` on a 3.11 runner),
+    not a full specifier parser.
+    """
+    spec = str((pyproject.get("project") or {}).get("requires-python") or "")
+    m = re.search(r"(?:>=|~=|==)\s*(\d+)\.(\d+)", spec)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _preinstall_target_deps(workdir: Path) -> dict[str, Any]:
     """Best-effort install of the target's declared deps, from the pristine
     clone, before the agent runs — so it can run the repo's tests to verify its
     work (which it otherwise can't remedy mid-session, installs being denied).
     Installs from the committed manifest, which an issue-body attacker can't have
     touched. Gated to CI / explicit opt-in so it can't clobber a shared local
     env. Never fatal.
+
+    Everything lands in the interpreter running this harness — the one
+    `run_tests` and the agent's `python -m pytest` use. A `uv.lock` is
+    honoured by exporting it to a requirements file and installing that
+    with pip, not by `uv sync`, which would build a `.venv` nobody on the
+    runner activates. Test extras (`dev`/`test`) and dev requirements
+    files are installed too, since a base install alone leaves collection
+    failing on the first missing test import.
+
+    Returns a summary dict (``ran``, ``failed``, ``pytest_importable``,
+    ``python_floor_unmet``) for the log and for callers that want to say
+    "no test env" up front instead of letting the agent discover it.
     """
+    summary: dict[str, Any] = {
+        "ran": [], "failed": [], "pytest_importable": None,
+        "python_floor_unmet": None,
+    }
     if not (os.environ.get("INPUT_PREINSTALL") or os.environ.get("GITHUB_ACTIONS")):
-        return
+        return summary
+
+    pyproject = _load_pyproject(workdir)
+    floor = _requires_python_floor(pyproject)
+    if floor and sys.version_info[:2] < floor:
+        summary["python_floor_unmet"] = f"{floor[0]}.{floor[1]}"
+        log.warning(
+            "  ⚠ pre-install: the target requires Python >=%s.%s but the "
+            "runner has %s.%s; the install will fail. Set the action's "
+            "`python-version` input to match.",
+            floor[0], floor[1], sys.version_info[0], sys.version_info[1],
+        )
+    extras = _declared_test_extras(pyproject)
+    extras_suffix = f"[{','.join(extras)}]" if extras else ""
+    pip = [sys.executable, "-m", "pip", "install"]
+
     cmds: list[list[str]] = []
-    if (workdir / "uv.lock").exists() and shutil.which("uv"):
-        cmds.append(["uv", "sync", "--frozen"])
+    exported: Path | None = None
+    uv = shutil.which("uv")
+    if (workdir / "uv.lock").exists() and uv:
+        # Locked versions, dev group included by default, straight into the
+        # runner interpreter. `--no-emit-project` leaves the root out so the
+        # editable install below owns it.
+        exported = Path(tempfile.mkdtemp(prefix="rr-uv-export-")) / "requirements.txt"
+        export = [uv, "export", "--frozen", "--no-hashes", "--no-emit-project",
+                  "-o", str(exported)]
+        for extra in extras:
+            export += ["--extra", extra]
+        cmds.append(export)
+        cmds.append([*pip, "-r", str(exported)])
+        cmds.append([*pip, "--no-deps", "-e", "."])
     elif (workdir / "poetry.lock").exists() and shutil.which("poetry"):
         cmds.append(["poetry", "install", "--no-interaction", "--no-root"])
     elif (workdir / "pyproject.toml").exists() or (workdir / "setup.py").exists():
-        cmds.append([sys.executable, "-m", "pip", "install", "-e", "."])
-    for req in ("requirements.txt", "requirements-dev.txt"):
+        cmds.append([*pip, "-e", f".{extras_suffix}"])
+    for req in _REQUIREMENTS_FILES:
         if (workdir / req).exists():
-            cmds.append([sys.executable, "-m", "pip", "install", "-r", req])
+            cmds.append([*pip, "-r", req])
+
+    started = time.monotonic()
     for cmd in cmds:
+        shown = " ".join(cmd)
+        t0 = time.monotonic()
         try:
-            log.info("  → pre-installing target deps: %s", " ".join(cmd))
-            subprocess.run(cmd, cwd=workdir, check=True, capture_output=True, timeout=600)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            log.warning("  ⚠ pre-install step failed (non-fatal): %s", cmd[0])
+            log.info("  → pre-installing target deps: %s", shown)
+            subprocess.run(
+                cmd, cwd=workdir, check=True, capture_output=True, text=True,
+                timeout=_PREINSTALL_CMD_TIMEOUT_S,
+            )
+            summary["ran"].append(shown)
+            log.info("  ✓ pre-install ok in %.0fs: %s", time.monotonic() - t0, cmd[0])
+        except subprocess.CalledProcessError as exc:
+            summary["failed"].append(shown)
+            tail = ((exc.stderr or exc.stdout or "").strip().splitlines() or [""])[-6:]
+            # The reason was invisible before: `capture_output` swallowed it
+            # and the warning named only the executable. A 2-second failure
+            # on a `requires-python` mismatch looked the same as a 10-minute
+            # resolver crash.
+            log.warning(
+                "  ⚠ pre-install step failed (non-fatal, exit %s, %.0fs): %s\n%s",
+                exc.returncode, time.monotonic() - t0, shown,
+                textwrap.indent("\n".join(tail), "      "),
+            )
+            if exported is not None and cmd[0] == uv:
+                # Export failed: fall back to the manifest install so the
+                # agent still gets the base deps.
+                cmds.append([*pip, "-e", f".{extras_suffix}"])
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            summary["failed"].append(shown)
+            log.warning(
+                "  ⚠ pre-install step failed (non-fatal, %s, %.0fs): %s",
+                type(exc).__name__, time.monotonic() - t0, shown,
+            )
+
+    if cmds:
+        check = subprocess.run(
+            [sys.executable, "-c", "import pytest"], cwd=workdir,
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        summary["pytest_importable"] = check.returncode == 0
+        log.info(
+            "  pre-install summary: %d ok, %d failed, %.0fs; pytest importable: %s",
+            len(summary["ran"]), len(summary["failed"]),
+            time.monotonic() - started,
+            "yes" if summary["pytest_importable"] else "NO",
+        )
+    return summary
 
 
 def prepare_workdir(target: Target) -> Path:
@@ -8128,9 +8297,18 @@ def _run_agent(
         else {"input": stdin_text}
     )
     try:
+        # `start_new_session=True`: the agent runs in its own session and
+        # process group. Without it the agent inherits the harness's group
+        # (which on hosted runners is also the step shell's and the runner
+        # worker's), so any group-wide signal from inside the session
+        # (`kill 0`, `kill -- -PGID`, a tool's own process-group teardown)
+        # reaches the harness. Observed as `exit code 143` with no log line
+        # after "→ invoking Claude Code". The Bash gate denies by-name kills
+        # (`pkill python`) for the same reason; this closes the other half.
         proc = subprocess.run(
             cmd, cwd=cwd, env=_claude_subprocess_env(),
             capture_output=True, text=True, timeout=timeout_s,
+            start_new_session=True,
             **delivery,
         )
     except subprocess.TimeoutExpired:
@@ -19080,7 +19258,39 @@ _MODES = (
 )
 
 
+def _install_harness_signal_handler() -> bool:
+    """Log a SIGTERM before the harness dies of it.
+
+    The runner only sends SIGTERM to a step on job cancellation or job
+    timeout, and both are visible in the Actions UI. Any other SIGTERM came
+    from inside the job: a by-name kill in the agent session (`pkill
+    python`) or a group-wide signal. Python's default disposition exits
+    silently with 143, which leaves a log ending at "→ invoking Claude
+    Code" and nothing to say why. This names the cause in the log, then
+    exits with the same status so nothing downstream changes.
+
+    Returns False where a handler cannot be installed (non-main thread,
+    platforms without SIGTERM); the run proceeds exactly as before.
+    """
+    def _on_sigterm(signum, frame):  # noqa: ARG001 — signal API shape
+        log.error(
+            "harness (pid %d) received SIGTERM. If the job was not cancelled "
+            "or timed out, something inside the agent session signalled the "
+            "harness (e.g. `pkill python`, `kill 0`); the Bash gate denies "
+            "those, so check the agent transcript. Exiting 143.",
+            os.getpid(),
+        )
+        sys.exit(143)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):
+        return False
+    return True
+
+
 def main():
+    _install_harness_signal_handler()
     # Mode dispatch: "recommend" is the classic
     # scout-and-implement run; "weekly-summary" aggregates the past week
     # and posts a digest comment to the configured Discussion. Customers
