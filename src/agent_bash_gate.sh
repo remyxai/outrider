@@ -59,6 +59,23 @@ if echo "$cmd" | grep -qE '(^|[|;&[:space:]])git[[:space:]]+push([[:space:]]|$)'
   deny "git push. The orchestrator handles pushing after validation."
 fi
 
+# ── Process signals (the agent must never signal outside its own session) ──
+# The harness (`python run.py`), the step shell and the runner worker share
+# one process group on hosted runners. A by-name kill from the session
+# (`pkill python`, `killall python3`) takes the harness down with exit 143
+# and no log line; a group kill (`kill 0`, `kill -- -PGID`) would take the
+# runner too. Nothing the agent legitimately needs requires signalling:
+# `timeout <s> <cmd>` bounds a hung command without reaching outside it.
+if echo "$cmd" | grep -qE '(^|[|;&[:space:]])(kill|pkill|killall)([[:space:]]|$)'; then
+  deny "process signal (kill/pkill/killall). The agent shares a process group with the harness; use \`timeout <seconds> <command>\` to bound a hung command instead."
+fi
+if echo "$cmd" | grep -qE '(^|[|;&[:space:]])fuser[[:space:]]+.*-[a-zA-Z]*k'; then
+  deny "fuser -k signals processes by resource. Use \`timeout <seconds> <command>\` instead."
+fi
+if echo "$cmd" | grep -qE '(^|[|;&[:space:]])xargs[[:space:]]+([^|;&]*[[:space:]])?kill([[:space:]]|$)'; then
+  deny "xargs kill signals processes by list. Use \`timeout <seconds> <command>\` instead."
+fi
+
 # ── Inherited destructive-op guards (from the dev-time pre-bash-gate) ───────
 if echo "$cmd" | grep -qE 'git[[:space:]]+(commit|push)[[:space:]].*(--no-verify)'; then
   deny "--no-verify skips hooks. Fix the underlying failure instead."
