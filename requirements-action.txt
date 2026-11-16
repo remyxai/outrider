@@ -6,11 +6,11 @@
 # at once with nobody watching. Dependabot (.github/dependabot.yml) opens
 # a PR per bump; tests gate it; a release moves @v1 to ship it.
 # tests/test_action_install_surface.py refuses anything that is not ==.
-remyxai==0.5.0
-pytest==9.1.1
+remyxai==0.5.1
+pytest==9.2.0
 pyyaml==6.0.3
 # `uv export` turns a target repo's uv.lock into a requirements file the
 # runner's pip can install, so the agent gets the repo's locked test deps
 # in the interpreter it (and run_tests) actually uses. `uv sync` would put
 # them in a .venv nobody on the runner activates.
-uv==0.13.7
+uv==0.13.8
